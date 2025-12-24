@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Debug
+*.pdb
+
+# Cargo lock (included for binaries, excluded for libraries)
+# Since this is a binary crate, we include Cargo.lock
+# Cargo.lock

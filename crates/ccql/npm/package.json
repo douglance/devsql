@@ -1,0 +1,32 @@
+{
+  "name": "ccql",
+  "version": "0.1.0",
+  "description": "SQL query engine for Claude Code data",
+  "author": "Doug Lance",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/douglance/ccql.git"
+  },
+  "homepage": "https://github.com/douglance/ccql",
+  "keywords": [
+    "claude",
+    "sql",
+    "cli",
+    "query",
+    "anthropic"
+  ],
+  "bin": {
+    "ccql": "./bin/ccql"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "files": [
+    "bin",
+    "scripts"
+  ],
+  "engines": {
+    "node": ">=14"
+  }
+}

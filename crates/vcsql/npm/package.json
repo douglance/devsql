@@ -1,0 +1,43 @@
+{
+  "name": "vcsql",
+  "version": "0.1.0",
+  "description": "SQL query engine for Git repository data",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/douglance/vcsql.git"
+  },
+  "homepage": "https://github.com/douglance/vcsql",
+  "bugs": {
+    "url": "https://github.com/douglance/vcsql/issues"
+  },
+  "keywords": [
+    "git",
+    "sql",
+    "cli",
+    "query",
+    "vcs"
+  ],
+  "bin": {
+    "vcsql": "bin/vcsql"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "files": [
+    "bin",
+    "scripts"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

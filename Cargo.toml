@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ccql",
+    "crates/vcsql",
+    "crates/devsql",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/douglance/devsql"
+
+[workspace.dependencies]
+# SQL engines
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+gluesql = "0.16"
+gluesql-json-storage = "0.16"
+
+# Git
+git2 = "0.19"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.3"
+
+# Async
+tokio = { version = "1.41", features = ["full"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2.5"
+regex = "1.11"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Output
+tabled = "0.17"
+comfy-table = "7.1"
+colored = "2.1"

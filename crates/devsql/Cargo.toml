@@ -1,0 +1,57 @@
+[package]
+name = "devsql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified SQL queries across Claude Code + Git data"
+repository = "https://github.com/douglance/devsql"
+keywords = ["claude", "git", "sql", "productivity", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# Workspace crates
+ccql = { path = "../ccql" }
+vcsql = { path = "../vcsql" }
+
+# SQL engine - SQLite for unified queries
+rusqlite.workspace = true
+
+# Git access
+git2.workspace = true
+
+# CLI framework
+clap.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+
+# Date/time handling
+chrono.workspace = true
+
+# Table output
+tabled.workspace = true
+comfy-table.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Async
+tokio.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+dirs = "5.0"
+
+[[bin]]
+name = "devsql"
+path = "src/main.rs"
+
+[lib]
+name = "devsql"
+path = "src/lib.rs"

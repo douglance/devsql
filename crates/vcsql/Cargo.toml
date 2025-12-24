@@ -1,0 +1,56 @@
+[package]
+name = "vcsql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQL query engine for Git repository data"
+repository = "https://github.com/douglance/devsql"
+keywords = ["git", "sql", "cli", "query"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["target/"]
+
+[dependencies]
+# Git access - libgit2 bindings
+git2.workspace = true
+
+# SQL engine - full SQLite
+rusqlite.workspace = true
+
+# CLI framework
+clap.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+
+# Date/time handling
+chrono.workspace = true
+
+# Table output
+tabled.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Regex for query parsing
+regex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[[bin]]
+name = "vcsql"
+path = "src/main.rs"
+
+[lib]
+name = "vcsql"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

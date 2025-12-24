@@ -1,0 +1,4 @@
+# Don't include the downloaded binary in npm package
+# It gets downloaded during postinstall
+bin/vcsql
+bin/vcsql.exe

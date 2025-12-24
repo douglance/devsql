@@ -1,0 +1,73 @@
+[package]
+name = "ccql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Claude Code Query Language - SQL query engine for Claude Code data"
+authors = ["Doug Lance"]
+repository = "https://github.com/douglance/devsql"
+readme = "README.md"
+keywords = ["claude", "sql", "cli", "query", "anthropic"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# CLI
+clap.workspace = true
+
+# Async runtime
+tokio.workspace = true
+futures = "0.3"
+async-stream = "0.3"
+
+# JSON and serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Output formatting
+comfy-table.workspace = true
+colored.workspace = true
+
+# Path expansion
+shellexpand = "3.1"
+dirs = "5.0"
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Search
+regex.workspace = true
+
+# Fuzzy matching
+strsim = "0.11"
+
+# SQL query engine with JSON/JSONL storage
+gluesql.workspace = true
+gluesql-json-storage.workspace = true
+
+# File operations
+walkdir.workspace = true
+glob = "0.3"
+
+# Time handling
+chrono.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[[bin]]
+name = "ccql"
+path = "src/main.rs"
+
+[lib]
+name = "ccql"
+path = "src/lib.rs"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"

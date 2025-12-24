@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const binName = process.platform === 'win32' ? 'ccql.exe' : 'ccql';
+const binPath = path.join(__dirname, binName);
+
+if (!fs.existsSync(binPath)) {
+  console.error('ccql binary not found. Try reinstalling: npm install -g ccql');
+  process.exit(1);
+}
+
+const child = spawn(binPath, process.argv.slice(2), {
+  stdio: 'inherit',
+  shell: false,
+});
+
+child.on('close', (code) => {
+  process.exit(code || 0);
+});
