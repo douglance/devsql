@@ -45,3 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tabled = "0.17"
 comfy-table = "7.1"
 colored = "2.1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

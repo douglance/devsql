@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Unified SQL queries across Claude Code + Git data"
 repository = "https://github.com/douglance/devsql"
+homepage = "https://github.com/douglance/devsql"
 keywords = ["claude", "git", "sql", "productivity", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 

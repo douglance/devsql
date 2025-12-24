@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "SQL query engine for Git repository data"
 repository = "https://github.com/douglance/devsql"
+homepage = "https://github.com/douglance/devsql"
 keywords = ["git", "sql", "cli", "query"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["target/"]
@@ -50,7 +51,3 @@ path = "src/main.rs"
 name = "vcsql"
 path = "src/lib.rs"
 
-[profile.release]
-lto = true
-strip = true
-codegen-units = 1
