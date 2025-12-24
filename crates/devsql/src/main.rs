@@ -6,8 +6,20 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "devsql")]
-#[command(about = "Unified SQL queries across Claude Code + Git data")]
+#[command(about = "Query your AI coding history to become a better prompter.\n\nJoin Claude Code conversations with Git commits to find your most productive prompts,\nidentify struggle sessions, and learn what actually works for you.")]
 #[command(version)]
+#[command(after_help = r#"WHAT YOU CAN DISCOVER:
+  • Which prompts led to the most commits
+  • When you struggle (many messages, few commits)
+  • What tools Claude uses during productive sessions
+  • Patterns in your successful coding sessions
+
+EXAMPLE PROMPTS FOR YOUR AI AGENT:
+  "Use devsql to find my 10 most effective prompts from the past month"
+  "Query my history to find sessions where I struggled—many prompts, few commits"
+  "Analyze what my productive days have in common using devsql"
+
+Learn more: https://github.com/douglance/devsql"#)]
 struct Cli {
     /// SQL query to execute
     query: Option<String>,
@@ -195,39 +207,51 @@ fn print_table(results: &[serde_json::Value], show_header: bool) {
 
 fn print_help() {
     println!(
-        r#"devsql - Unified SQL queries across Claude Code + Git data
+        r#"devsql - Query your AI coding history to become a better prompter
+
+Join Claude Code conversations with Git commits to find your most productive
+prompts, identify struggle sessions, and learn what actually works for you.
 
 USAGE:
   devsql [OPTIONS] "SQL QUERY"
 
-OPTIONS:
-  -r, --repo PATH       Git repository path (default: current directory)
-  -d, --data-dir PATH   Claude data directory (default: ~/.claude)
-  -f, --format FORMAT   Output: table, json, jsonl, csv (default: table)
-  -H, --no-header       Omit header row
-  -h, --help            Show this help
+WHAT YOU CAN DISCOVER:
+  • Which prompts led to the most commits
+  • When you struggle (many messages, few commits)
+  • What tools Claude uses during productive sessions
+  • Patterns in your successful coding sessions
 
 TABLES:
-  Claude Code:  history, transcripts, todos
+  Claude Code:  history (prompts), transcripts (conversations), todos
   Git:          commits, diffs, diff_files, branches
 
 EXAMPLES:
-  # Claude messages per day
-  devsql "SELECT DATE(timestamp) as day, COUNT(*) FROM history GROUP BY day ORDER BY day DESC LIMIT 7"
 
-  # Git commits
-  devsql "SELECT short_id, author_name, summary FROM commits LIMIT 10"
+  Find your most productive prompts:
+  devsql "SELECT h.message, COUNT(c.id) as commits
+    FROM history h
+    LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
+    GROUP BY h.message HAVING commits > 0
+    ORDER BY commits DESC LIMIT 10"
 
-  # Cross-database: productivity ratio
-  devsql "SELECT
-    DATE(h.timestamp) as day,
-    COUNT(DISTINCT h.rowid) as msgs,
-    COUNT(DISTINCT c.id) as commits
-  FROM history h
-  LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
-  GROUP BY day
-  ORDER BY day DESC
-  LIMIT 14"
+  Identify struggle days (many prompts, few commits):
+  devsql "SELECT DATE(h.timestamp) as day,
+    COUNT(*) as prompts, COUNT(DISTINCT c.id) as commits
+    FROM history h
+    LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
+    GROUP BY day ORDER BY prompts DESC LIMIT 10"
+
+OPTIONS:
+  -r, --repo PATH       Git repository (default: current directory)
+  -d, --data-dir PATH   Claude data (default: ~/.claude)
+  -f, --format FORMAT   Output: table, json, jsonl, csv
+  -h, --help            Show full help with more examples
+
+TELL YOUR AI AGENT:
+  "Use devsql to find my most effective prompts from the past month"
+  "Query my history to find when I struggled most"
+
+Learn more: https://github.com/douglance/devsql
 "#
     );
 }
