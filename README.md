@@ -1,126 +1,96 @@
 # DevSQL
 
-Unified SQL queries across developer data: Claude Code conversations + Git commits.
+**Query your AI coding history to become a better prompter.**
 
-## Tools
+DevSQL lets you analyze your Claude Code conversations alongside your Git commits. Find your most productive prompts, identify patterns in successful coding sessions, and learn what actually works for you.
 
-| Tool | Description |
-|------|-------------|
-| `ccql` | SQL queries for Claude Code data (~/.claude/) |
-| `vcsql` | SQL queries for Git repository data |
-| `devsql` | **Unified queries** - join Claude + Git for productivity analysis |
+## Why?
+
+Your `~/.claude/` folder contains a goldmine of data: every prompt you've written, every tool Claude used, every conversation that led to shipped code. DevSQL turns that into queryable insights.
+
+**Ask questions like:**
+- "Which of my prompts led to the most commits?"
+- "What patterns do my successful coding sessions have?"
+- "When do I struggle most—and what prompts help me recover?"
+- "Which tools does Claude use most when I'm productive?"
+
+## What You Can Do
+
+### Find Your Most Productive Prompts
+```bash
+# See which prompts preceded commits
+devsql "SELECT h.message, COUNT(c.id) as commits_after
+FROM history h
+LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
+GROUP BY h.message
+HAVING commits_after > 0
+ORDER BY commits_after DESC
+LIMIT 20"
+```
+
+### Identify Struggle Sessions
+```bash
+# High message count + few commits = struggling
+devsql "SELECT
+  DATE(h.timestamp) as day,
+  COUNT(*) as prompts,
+  COUNT(DISTINCT c.id) as commits,
+  CAST(COUNT(*) AS FLOAT) / MAX(1, COUNT(DISTINCT c.id)) as struggle_ratio
+FROM history h
+LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
+GROUP BY day
+ORDER BY struggle_ratio DESC
+LIMIT 10"
+```
+
+### Analyze Your Prompting Patterns
+```bash
+# What tools correlate with productivity?
+ccql "SELECT tool_name, COUNT(*) as uses
+FROM transcripts
+WHERE type = 'tool_use'
+GROUP BY tool_name
+ORDER BY uses DESC"
+```
+
+### Train Your AI Agent
+Tell Claude Code to query your history:
+
+> "Use devsql to find my 10 most effective prompts from the past month—the ones that led to commits the same day. Then analyze what they have in common."
+
+> "Query my Claude history to find sessions where I used many prompts but made few commits. What was I struggling with?"
+
+> "Find patterns in my successful refactoring sessions using devsql."
 
 ## Installation
 
 ### Homebrew (macOS/Linux)
-
 ```bash
 brew install douglance/tap/devsql
 ```
 
-This installs all three binaries: `ccql`, `vcsql`, and `devsql`.
-
 ### Direct Download
-
-Download pre-built binaries from the [GitHub Releases](https://github.com/douglance/devsql/releases) page.
-
-Available platforms:
-- macOS (Apple Silicon): `aarch64-apple-darwin`
-- macOS (Intel): `x86_64-apple-darwin`
-- Linux (ARM64): `aarch64-unknown-linux-gnu`
-- Linux (x86_64): `x86_64-unknown-linux-gnu`
-- Windows (x86_64): `x86_64-pc-windows-msvc`
+Download from [GitHub Releases](https://github.com/douglance/devsql/releases) for macOS, Linux, or Windows.
 
 ### Build from Source
-
 ```bash
-# Clone the repository
 git clone https://github.com/douglance/devsql.git
-cd devsql
-
-# Build all binaries
-cargo build --release
-
-# Binaries are in target/release/
-./target/release/ccql --version
-./target/release/vcsql --version
-./target/release/devsql --version
-
-# Or install to ~/.cargo/bin
-cargo install --path crates/devsql
-cargo install --path crates/ccql
-cargo install --path crates/vcsql
+cd devsql && cargo install --path crates/devsql
 ```
 
-## Quick Start
+## The Three Tools
 
-```bash
-# Claude Code queries
-ccql "SELECT * FROM history LIMIT 5"
+| Tool | What It Queries |
+|------|-----------------|
+| `ccql` | Your Claude Code data (~/.claude/) |
+| `vcsql` | Your Git repositories |
+| `devsql` | Both together—join conversations with commits |
 
-# Git queries
-vcsql "SELECT short_id, summary FROM commits LIMIT 5"
+## Available Tables
 
-# Cross-database: productivity analysis
-devsql "SELECT
-  DATE(h.timestamp) as day,
-  COUNT(*) as claude_msgs,
-  COUNT(DISTINCT c.id) as commits
-FROM history h
-LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
-GROUP BY day
-ORDER BY day DESC
-LIMIT 14"
-```
+**Claude Code**: `history` (your prompts), `transcripts` (full conversations), `todos` (tasks)
 
-## Tables
-
-### Claude Code (ccql, devsql)
-- `history` - User prompts
-- `transcripts` - AI conversation logs
-- `todos` - Task tracking
-
-### Git (vcsql, devsql)
-- `commits` - Commit history
-- `diffs` - Per-commit diff stats
-- `diff_files` - Per-file changes
-- `branches` - Branch info
-- `tags` - Repository tags
-- `blame` - Per-line attribution
-
-## Key Queries
-
-### Struggle Ratio
-```sql
-SELECT
-  DATE(h.timestamp) as day,
-  COUNT(*) as msgs,
-  COUNT(DISTINCT c.id) as commits,
-  CAST(COUNT(*) AS FLOAT) / MAX(1, COUNT(DISTINCT c.id)) as ratio
-FROM history h
-LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
-GROUP BY day
-ORDER BY ratio DESC
-```
-*High ratio = days you struggled (many messages, few commits)*
-
-### Tool Usage
-```sql
-SELECT tool_name, COUNT(*) as uses
-FROM transcripts
-WHERE type = 'tool_use'
-GROUP BY tool_name
-ORDER BY uses DESC
-```
-
-### Hot Files
-```sql
-SELECT path, COUNT(*) as changes
-FROM diff_files
-GROUP BY path
-ORDER BY changes DESC
-LIMIT 20
-```
+**Git**: `commits`, `branches`, `tags`, `diffs`, `diff_files`, `blame`
 
 ## License
 
