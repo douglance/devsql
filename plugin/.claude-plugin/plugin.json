@@ -10,5 +10,5 @@
   "repository": "https://github.com/douglance/devsql",
   "license": "MIT",
   "keywords": ["sql", "claude-code", "history", "analytics", "productivity"],
-  "hooks": "../hooks/hooks.json"
+  "hooks": "./hooks/hooks.json"
 }
