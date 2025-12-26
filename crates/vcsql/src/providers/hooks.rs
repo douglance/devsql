@@ -3,6 +3,8 @@ use crate::git::GitRepo;
 use crate::providers::Provider;
 use rusqlite::Connection;
 use std::fs;
+
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 pub struct HooksProvider;
@@ -47,7 +49,10 @@ impl Provider for HooksProvider {
                         }
 
                         let metadata = fs::metadata(&file_path)?;
+                        #[cfg(unix)]
                         let is_executable = metadata.permissions().mode() & 0o111 != 0;
+                        #[cfg(not(unix))]
+                        let is_executable = !is_sample; // On Windows, assume non-sample hooks are executable
                         let size = metadata.len() as i64;
 
                         stmt.execute((
