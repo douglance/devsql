@@ -48,18 +48,26 @@ Claude will automatically use devsql to answer.
 
 ```sql
 -- Recent prompts
-SELECT * FROM history ORDER BY timestamp DESC LIMIT 10
+SELECT display as prompt, project
+FROM history ORDER BY timestamp DESC LIMIT 10
 
 -- Commits correlated with Claude sessions
 SELECT date(c.authored_at) as day, COUNT(*) as commits
 FROM commits c
-JOIN history h ON date(c.authored_at) = date(h.timestamp)
+JOIN history h ON date(c.authored_at) = date(datetime(h.timestamp/1000, 'unixepoch'))
 GROUP BY day
 
 -- Most active days
-SELECT date(timestamp) as day, COUNT(*) as prompts
+SELECT date(datetime(timestamp/1000, 'unixepoch')) as day, COUNT(*) as prompts
 FROM history
 GROUP BY day ORDER BY prompts DESC LIMIT 7
+
+-- Which prompts led to commits?
+SELECT h.display as prompt, COUNT(c.id) as commits_after
+FROM history h
+JOIN commits c ON date(datetime(h.timestamp/1000, 'unixepoch')) = date(c.authored_at)
+GROUP BY h.display
+ORDER BY commits_after DESC LIMIT 10
 ```
 
 ## License

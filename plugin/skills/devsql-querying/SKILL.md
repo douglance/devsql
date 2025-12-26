@@ -25,21 +25,19 @@ brew install douglance/tap/devsql
 ## Available Tables
 
 ### Claude Code Tables
-| Table | Description |
-|-------|-------------|
-| `conversations` | Chat sessions (id, timestamp, project, duration) |
-| `messages` | Messages in conversations (role, content, timestamp) |
+| Table | Columns |
+|-------|---------|
+| `history` | timestamp, display (prompt text), project, pastedContents |
+| `transcripts` | Full conversation data including tool_use, tool_name |
 | `todos` | Todo items tracked in sessions |
-| `projects` | Project contexts and settings |
 
 ### Git Tables
-| Table | Description |
-|-------|-------------|
-| `commits` | Commit history (hash, message, author, timestamp) |
-| `branches` | Branch information |
-| `files` | Files changed per commit |
+| Table | Columns |
+|-------|---------|
+| `commits` | id, message, summary, author_name, authored_at, short_id |
+| `branches` | name, is_head, commit_id |
+| `diffs` | Diff content per commit |
 | `blame` | Line-by-line attribution |
-| `hooks` | Git hooks configuration |
 
 ## Approach
 
@@ -48,37 +46,46 @@ brew install douglance/tap/devsql
 3. Execute with: `devsql "<query>"`
 4. Present results with insights
 
+Note: history.timestamp is in milliseconds. Use `datetime(timestamp/1000, 'unixepoch')` to convert.
+
 ## Example Queries
 
 ```sql
--- Sessions this week
-SELECT COUNT(*) as sessions, SUM(duration) as total_minutes
-FROM conversations
-WHERE timestamp > date('now', '-7 days');
+-- Recent prompts
+SELECT display as prompt, project
+FROM history ORDER BY timestamp DESC LIMIT 10;
 
--- Correlate sessions with commits
+-- Prompts this week
+SELECT COUNT(*) as prompts
+FROM history
+WHERE datetime(timestamp/1000, 'unixepoch') > date('now', '-7 days');
+
+-- Correlate prompts with commits
 SELECT
-  date(c.timestamp) as day,
-  COUNT(DISTINCT conv.id) as sessions,
-  COUNT(DISTINCT c.hash) as commits
+  date(c.authored_at) as day,
+  COUNT(DISTINCT h.timestamp) as prompts,
+  COUNT(DISTINCT c.id) as commits
 FROM commits c
-LEFT JOIN conversations conv
-  ON date(c.timestamp) = date(conv.timestamp)
+LEFT JOIN history h
+  ON date(c.authored_at) = date(datetime(h.timestamp/1000, 'unixepoch'))
 GROUP BY day
 ORDER BY day DESC
 LIMIT 14;
 
--- Most productive prompt patterns
-SELECT
-  substr(m.content, 1, 100) as prompt_start,
-  COUNT(DISTINCT c.hash) as resulting_commits
-FROM messages m
-JOIN conversations conv ON m.conversation_id = conv.id
-JOIN commits c ON date(conv.timestamp) = date(c.timestamp)
-WHERE m.role = 'user'
-GROUP BY prompt_start
-ORDER BY resulting_commits DESC
+-- Which prompts led to commits?
+SELECT h.display as prompt, COUNT(c.id) as commits_after
+FROM history h
+JOIN commits c ON date(datetime(h.timestamp/1000, 'unixepoch')) = date(c.authored_at)
+GROUP BY h.display
+ORDER BY commits_after DESC
 LIMIT 10;
+
+-- Tool usage
+SELECT tool_name, COUNT(*) as uses
+FROM transcripts
+WHERE type = 'tool_use'
+GROUP BY tool_name
+ORDER BY uses DESC;
 ```
 
 ## Output Formats

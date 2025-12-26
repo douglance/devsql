@@ -19,10 +19,10 @@ Your `~/.claude/` folder contains a goldmine of data: every prompt you've writte
 ### Find Your Most Productive Prompts
 ```bash
 # See which prompts preceded commits
-devsql "SELECT h.message, COUNT(c.id) as commits_after
+devsql "SELECT h.display as prompt, COUNT(c.id) as commits_after
 FROM history h
-LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
-GROUP BY h.message
+LEFT JOIN commits c ON DATE(datetime(h.timestamp/1000, 'unixepoch')) = DATE(c.authored_at)
+GROUP BY h.display
 HAVING commits_after > 0
 ORDER BY commits_after DESC
 LIMIT 20"
@@ -30,14 +30,14 @@ LIMIT 20"
 
 ### Identify Struggle Sessions
 ```bash
-# High message count + few commits = struggling
+# High prompt count + few commits = struggling
 devsql "SELECT
-  DATE(h.timestamp) as day,
+  DATE(datetime(h.timestamp/1000, 'unixepoch')) as day,
   COUNT(*) as prompts,
   COUNT(DISTINCT c.id) as commits,
   CAST(COUNT(*) AS FLOAT) / MAX(1, COUNT(DISTINCT c.id)) as struggle_ratio
 FROM history h
-LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
+LEFT JOIN commits c ON DATE(datetime(h.timestamp/1000, 'unixepoch')) = DATE(c.authored_at)
 GROUP BY day
 ORDER BY struggle_ratio DESC
 LIMIT 10"
