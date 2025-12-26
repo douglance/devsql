@@ -64,13 +64,28 @@ Tell Claude Code to query your history:
 
 ## Installation
 
+### Claude Code Plugin (Recommended)
+
+Install the plugin to use devsql directly within Claude Code:
+
+```
+/plugin marketplace add douglance/devsql
+/plugin install devsql@devsql
+```
+
+Restart Claude Code to load the plugin. The plugin auto-installs the devsql binary on first use.
+
+**Usage:**
+- `/devsql:query SELECT * FROM history LIMIT 10` - Direct SQL queries
+- Or just ask Claude: "Show my most productive prompts from last week"
+
 ### Homebrew (macOS/Linux)
 ```bash
 brew install douglance/tap/devsql
 ```
 
 ### Direct Download
-Download from [GitHub Releases](https://github.com/douglance/devsql/releases) for macOS, Linux, or Windows.
+Download from [GitHub Releases](https://github.com/douglance/devsql/releases) for macOS or Linux.
 
 ### Build from Source
 ```bash
