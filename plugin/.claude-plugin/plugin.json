@@ -1,0 +1,14 @@
+{
+  "name": "devsql",
+  "version": "0.1.2",
+  "description": "Query your Claude Code history with SQL. Analyze conversations, commits, and productivity patterns.",
+  "author": {
+    "name": "Doug Lance",
+    "url": "https://github.com/douglance"
+  },
+  "homepage": "https://github.com/douglance/devsql",
+  "repository": "https://github.com/douglance/devsql",
+  "license": "MIT",
+  "keywords": ["sql", "claude-code", "history", "analytics", "productivity"],
+  "hooks": "../hooks/hooks.json"
+}

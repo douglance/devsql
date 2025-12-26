@@ -1,0 +1,18 @@
+{
+  "name": "devsql",
+  "owner": {
+    "name": "Doug Lance",
+    "url": "https://github.com/douglance"
+  },
+  "plugins": [
+    {
+      "name": "devsql",
+      "source": "./plugin",
+      "description": "Query your Claude Code history with SQL. Analyze conversations, commits, and productivity patterns.",
+      "version": "0.1.2",
+      "author": {
+        "name": "Doug Lance"
+      }
+    }
+  ]
+}
