@@ -17,7 +17,7 @@
     "anthropic"
   ],
   "bin": {
-    "ccql": "./bin/ccql"
+    "ccql": "bin/ccql"
   },
   "scripts": {
     "postinstall": "node scripts/install.js"
