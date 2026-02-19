@@ -1,6 +1,9 @@
 use crate::cli::output::{create_table, truncate_string, OutputFormat, OutputWriter};
 use crate::config::Config;
-use crate::datasources::{HistoryDataSource, StatsDataSource, TodoDataSource, TranscriptDataSource};
+use crate::datasources::{
+    CodexHistoryDataSource, HistoryDataSource, StatsDataSource, TodoDataSource,
+    TranscriptDataSource,
+};
 use crate::error::Result;
 use crate::models::TodoStatus;
 use crate::query::QueryEngine;
@@ -21,23 +24,41 @@ pub async fn prompts(
     let mut entries = history.filter_prompts().await?;
 
     if let Some(ref proj) = project {
-        entries.retain(|e| e.project.as_ref().map(|p| p.contains(proj)).unwrap_or(false));
+        entries.retain(|e| {
+            e.project
+                .as_ref()
+                .map(|p| p.contains(proj))
+                .unwrap_or(false)
+        });
     }
 
     if let Some(ref sess) = session {
-        entries.retain(|e| e.session_id.as_ref().map(|s| s.contains(sess)).unwrap_or(false));
+        entries.retain(|e| {
+            e.session_id
+                .as_ref()
+                .map(|s| s.contains(sess))
+                .unwrap_or(false)
+        });
     }
 
     if let Some(ref since_str) = since {
         if let Ok(since_date) = chrono::NaiveDate::parse_from_str(since_str, "%Y-%m-%d") {
-            let since_ts = since_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+            let since_ts = since_date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
             entries.retain(|e| e.timestamp >= since_ts);
         }
     }
 
     if let Some(ref until_str) = until {
         if let Ok(until_date) = chrono::NaiveDate::parse_from_str(until_str, "%Y-%m-%d") {
-            let until_ts = until_date.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp_millis();
+            let until_ts = until_date
+                .and_hms_opt(23, 59, 59)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
             entries.retain(|e| e.timestamp <= until_ts);
         }
     }
@@ -93,6 +114,14 @@ pub async fn query(
             let ds = HistoryDataSource::new(config.clone());
             ds.load_raw().await?
         }
+        "jhistory" => {
+            let ds = CodexHistoryDataSource::new(config.clone());
+            ds.load_raw().await?
+        }
+        "codex_history" => {
+            let ds = CodexHistoryDataSource::new(config.clone());
+            ds.load_raw().await?
+        }
         "transcripts" => {
             let ds = TranscriptDataSource::new(config.clone());
             let sessions = ds.load_all_sessions().await?;
@@ -127,7 +156,7 @@ pub async fn query(
         }
         _ => {
             return Err(crate::error::Error::DataSource(format!(
-                "Unknown source: {}. Use: history, transcripts, stats, todos",
+                "Unknown source: {}. Use: history, jhistory, codex_history, transcripts, stats, todos",
                 source
             )));
         }
@@ -355,10 +384,7 @@ pub async fn search(
             for result in &results {
                 let source = result["source"].as_str().unwrap_or("-");
                 let location = if source == "history" {
-                    result["project"]
-                        .as_str()
-                        .unwrap_or("-")
-                        .to_string()
+                    result["project"].as_str().unwrap_or("-").to_string()
                 } else {
                     format!(
                         "{}:{}",

@@ -1,6 +1,6 @@
 # ccql
 
-**Claude Code Query Language** - SQL query engine for Claude Code data.
+**Claude Code Query Language** - SQL query engine for Claude Code and Codex CLI data.
 
 ## Installation
 
@@ -47,6 +47,7 @@ cargo install --path .
 ```bash
 # SQL is the default command - just pass a query
 ccql "SELECT display FROM history ORDER BY timestamp DESC LIMIT 5"
+ccql "SELECT session_id, text FROM jhistory ORDER BY ts DESC LIMIT 5"
 ccql "SELECT tool_name, COUNT(*) as n FROM transcripts WHERE type='tool_use' GROUP BY tool_name"
 ccql "SELECT content FROM todos WHERE status='pending'"
 
@@ -62,6 +63,8 @@ ccql examples        # Show query examples
 | Table | Source | Description |
 |-------|--------|-------------|
 | `history` | `history.jsonl` | User prompts |
+| `jhistory` | `~/.codex/history.jsonl` | Codex CLI prompt history (virtual) |
+| `codex_history` | Alias of `jhistory` | Codex CLI prompt history (virtual) |
 | `transcripts` | `transcripts/*.jsonl` | Conversation logs (virtual) |
 | `todos` | `todos/*.json` | Task items (virtual) |
 
@@ -73,6 +76,18 @@ ccql examples        # Show query examples
 | `timestamp` | INTEGER | Unix timestamp (ms) |
 | `project` | TEXT | Project directory |
 | `pastedContents` | OBJECT | Pasted content (JSON) |
+
+### jhistory
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `session_id` | TEXT | Codex session ID |
+| `ts` | INTEGER | Raw Unix timestamp (seconds) |
+| `text` | TEXT | Raw prompt text |
+| `display` | TEXT | Prompt text (normalized alias for `text`) |
+| `timestamp` | INTEGER | Unix timestamp (milliseconds) |
+
+`codex_history` exposes the exact same columns as `jhistory`.
 
 ### transcripts
 
@@ -130,6 +145,10 @@ ccql "SELECT project, COUNT(*) as n FROM history GROUP BY project ORDER BY n DES
 # Long prompts (likely pasted code)
 ccql "SELECT LENGTH(display) as len, SUBSTR(display, 1, 60) as preview
       FROM history ORDER BY len DESC LIMIT 10"
+
+# Recent Codex prompts
+ccql "SELECT datetime(timestamp/1000, 'unixepoch') as time, display
+      FROM jhistory ORDER BY timestamp DESC LIMIT 10"
 ```
 
 ### Transcript Queries
@@ -189,6 +208,8 @@ ccql todos --status pending   # List todos
 ccql stats                    # Usage statistics
 ccql duplicates               # Find repeated prompts
 ccql query '.[]' history      # jq-style queries
+ccql query '.[]' jhistory     # jq-style queries for Codex prompts
+ccql query '.[]' codex_history
 ```
 
 ## Configuration
@@ -196,6 +217,7 @@ ccql query '.[]' history      # jq-style queries
 ```bash
 # Set data directory
 export CLAUDE_DATA_DIR=~/.claude
+export CODEX_HOME=~/.codex
 
 # Or via flag
 ccql --data-dir ~/.claude "SELECT ..."

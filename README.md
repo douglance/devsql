@@ -2,11 +2,11 @@
 
 **Query your AI coding history to become a better prompter.**
 
-DevSQL lets you analyze your Claude Code conversations alongside your Git commits. Find your most productive prompts, identify patterns in successful coding sessions, and learn what actually works for you.
+DevSQL lets you analyze your Claude Code and Codex CLI conversations alongside your Git commits. Find your most productive prompts, identify patterns in successful coding sessions, and learn what actually works for you.
 
 ## Why?
 
-Your `~/.claude/` folder contains a goldmine of data: every prompt you've written, every tool Claude used, every conversation that led to shipped code. DevSQL turns that into queryable insights.
+Your `~/.claude/` and `~/.codex/` folders contain a goldmine of data: every prompt you've written, every tool used, every conversation that led to shipped code. DevSQL turns that into queryable insights.
 
 **Ask questions like:**
 - "Which of my prompts led to the most commits?"
@@ -77,6 +77,7 @@ Restart Claude Code to load the plugin. The plugin auto-installs the devsql bina
 
 **Usage:**
 - `/devsql:query SELECT * FROM history LIMIT 10` - Direct SQL queries
+- `/devsql:query SELECT * FROM jhistory LIMIT 10` - Codex CLI prompt history
 - Or just ask Claude: "Show my most productive prompts from last week"
 
 ### Homebrew (macOS/Linux)
@@ -97,13 +98,15 @@ cd devsql && cargo install --path crates/devsql
 
 | Tool | What It Queries |
 |------|-----------------|
-| `ccql` | Your Claude Code data (~/.claude/) |
+| `ccql` | Your Claude Code + Codex CLI data (`~/.claude/`, `~/.codex/`) |
 | `vcsql` | Your Git repositories |
 | `devsql` | Both together—join conversations with commits |
 
 ## Available Tables
 
 **Claude Code**: `history` (your prompts), `transcripts` (full conversations), `todos` (tasks)
+
+**Codex CLI**: `jhistory` (prompt history from `history.jsonl`), `codex_history` (alias)
 
 **Git**: `commits`, `branches`, `tags`, `diffs`, `diff_files`, `blame`
 

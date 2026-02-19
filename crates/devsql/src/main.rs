@@ -1,4 +1,4 @@
-//! DevSQL CLI - Unified SQL queries across Claude Code + Git data
+//! DevSQL CLI - Unified SQL queries across Claude/Codex + Git data
 
 use clap::{Parser, ValueEnum};
 use devsql::{engine::detect_tables, UnifiedEngine};
@@ -6,12 +6,15 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "devsql")]
-#[command(about = "Query your AI coding history to become a better prompter.\n\nJoin Claude Code conversations with Git commits to find your most productive prompts,\nidentify struggle sessions, and learn what actually works for you.")]
+#[command(
+    about = "Query your AI coding history to become a better prompter.\n\nJoin Claude/Codex conversations with Git commits to find your most productive prompts,\nidentify struggle sessions, and learn what actually works for you."
+)]
 #[command(version)]
 #[command(after_help = r#"WHAT YOU CAN DISCOVER:
   • Which prompts led to the most commits
   • When you struggle (many messages, few commits)
   • What tools Claude uses during productive sessions
+  • Which Codex prompts in jhistory correlate with commits
   • Patterns in your successful coding sessions
 
 EXAMPLE PROMPTS FOR YOUR AI AGENT:
@@ -209,7 +212,7 @@ fn print_help() {
     println!(
         r#"devsql - Query your AI coding history to become a better prompter
 
-Join Claude Code conversations with Git commits to find your most productive
+Join Claude/Codex conversations with Git commits to find your most productive
 prompts, identify struggle sessions, and learn what actually works for you.
 
 USAGE:
@@ -223,6 +226,7 @@ WHAT YOU CAN DISCOVER:
 
 TABLES:
   Claude Code:  history (prompts), transcripts (conversations), todos
+  Codex CLI:    jhistory / codex_history (session_id, ts, text, display, timestamp)
   Git:          commits, diffs, diff_files, branches
 
 EXAMPLES:
@@ -241,9 +245,14 @@ EXAMPLES:
     LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
     GROUP BY day ORDER BY prompts DESC LIMIT 10"
 
+  Recent Codex prompts:
+  devsql "SELECT datetime(timestamp/1000, 'unixepoch') as time, display
+    FROM jhistory ORDER BY timestamp DESC LIMIT 10"
+
 OPTIONS:
   -r, --repo PATH       Git repository (default: current directory)
   -d, --data-dir PATH   Claude data (default: ~/.claude)
+  CODEX_HOME            Codex data directory for jhistory (default: ~/.codex)
   -f, --format FORMAT   Output: table, json, jsonl, csv
   -h, --help            Show full help with more examples
 

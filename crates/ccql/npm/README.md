@@ -1,6 +1,6 @@
 # ccql
 
-SQL query engine for Claude Code data.
+SQL query engine for Claude Code and Codex CLI data.
 
 ## Installation
 
@@ -12,6 +12,7 @@ npm install -g ccql
 
 ```bash
 ccql "SELECT display FROM history LIMIT 5"
+ccql "SELECT display FROM jhistory LIMIT 5"
 ccql "SELECT tool_name, COUNT(*) FROM transcripts WHERE type='tool_use' GROUP BY tool_name"
 ccql tables
 ```

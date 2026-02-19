@@ -2,7 +2,7 @@
 //!
 //! Provides unified access to:
 //! - Single-file tables (history, stats) via JsonStorage
-//! - Multi-file tables (transcripts, todos) via directory scanning
+//! - Virtual tables (jhistory/codex_history, transcripts, todos) via custom scanners
 
 use crate::config::Config;
 use async_trait::async_trait;
@@ -39,7 +39,40 @@ impl CompositeStorage {
 
     /// Check if a table is a virtual multi-file table
     fn is_virtual_table(&self, table_name: &str) -> bool {
-        matches!(table_name, "transcripts" | "todos")
+        matches!(
+            table_name,
+            "jhistory" | "codex_history" | "transcripts" | "todos"
+        )
+    }
+
+    /// Scan Codex jhistory and return all rows
+    fn scan_jhistory(&self) -> Result<Vec<(Key, DataRow)>> {
+        let jhistory_file = self.config.jhistory_file();
+        if !jhistory_file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut rows = Vec::new();
+        let mut row_id: i64 = 0;
+
+        let file = fs::File::open(&jhistory_file)
+            .map_err(|e| GlueError::StorageMsg(format!("Failed to open jhistory file: {}", e)))?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            if let Ok(json) = serde_json::from_str::<JsonValue>(&line) {
+                if let Some(data_row) = jhistory_json_to_data_row(&json) {
+                    rows.push((Key::I64(row_id), data_row));
+                    row_id += 1;
+                }
+            }
+        }
+
+        Ok(rows)
     }
 
     /// Scan transcripts directory and return all rows
@@ -146,6 +179,27 @@ impl CompositeStorage {
         Ok(rows)
     }
 
+    /// Create a virtual schema for jhistory table (schemaless)
+    fn jhistory_schema(&self) -> Schema {
+        self.codex_history_schema_for("jhistory")
+    }
+
+    /// Create a virtual schema for codex_history alias table (schemaless)
+    fn codex_history_alias_schema(&self) -> Schema {
+        self.codex_history_schema_for("codex_history")
+    }
+
+    fn codex_history_schema_for(&self, table_name: &str) -> Schema {
+        Schema {
+            table_name: table_name.to_string(),
+            column_defs: None, // Schemaless
+            indexes: Vec::new(),
+            engine: None,
+            foreign_keys: Vec::new(),
+            comment: Some("Virtual table for Codex CLI history.jsonl".to_string()),
+        }
+    }
+
     /// Create a virtual schema for transcripts table (schemaless)
     fn transcripts_schema(&self) -> Schema {
         Schema {
@@ -221,6 +275,83 @@ fn todo_json_to_data_row(
     DataRow::Map(map)
 }
 
+/// Convert a codex jhistory JSON object to a normalized DataRow
+fn jhistory_json_to_data_row(json: &JsonValue) -> Option<DataRow> {
+    let obj = json.as_object()?;
+
+    let text = obj
+        .get("text")
+        .or_else(|| obj.get("display"))
+        .and_then(json_value_as_string)
+        .unwrap_or_default();
+
+    let session_id = obj
+        .get("session_id")
+        .or_else(|| obj.get("sessionId"))
+        .and_then(json_value_as_string)
+        .unwrap_or_default();
+
+    let ts_seconds = obj
+        .get("ts")
+        .and_then(json_value_as_i64)
+        .or_else(|| {
+            obj.get("timestamp")
+                .and_then(json_value_as_i64)
+                .map(normalize_ts_seconds)
+        })
+        .unwrap_or(0);
+
+    let timestamp_millis = ts_seconds.saturating_mul(1000);
+
+    let mut map = HashMap::new();
+    map.insert("display".to_string(), Value::Str(text.clone()));
+    map.insert("timestamp".to_string(), Value::I64(timestamp_millis));
+    map.insert("session_id".to_string(), Value::Str(session_id.clone()));
+    map.insert("sessionId".to_string(), Value::Str(session_id));
+    map.insert("text".to_string(), Value::Str(text));
+    map.insert("ts".to_string(), Value::I64(ts_seconds));
+
+    // Preserve any extra fields from codex output.
+    for (key, value) in obj {
+        if matches!(
+            key.as_str(),
+            "display" | "timestamp" | "session_id" | "sessionId" | "text" | "ts"
+        ) {
+            continue;
+        }
+        map.insert(key.clone(), json_value_to_glue_value(value));
+    }
+
+    Some(DataRow::Map(map))
+}
+
+fn normalize_ts_seconds(raw_ts: i64) -> i64 {
+    // Convert epoch milliseconds into seconds when needed.
+    if raw_ts > 10_000_000_000 {
+        raw_ts / 1000
+    } else {
+        raw_ts
+    }
+}
+
+fn json_value_as_i64(value: &JsonValue) -> Option<i64> {
+    match value {
+        JsonValue::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
+        JsonValue::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_value_as_string(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
 /// Parse todo filename to extract workspace_id and agent_id
 fn parse_todo_filename(filename: &str) -> (String, String) {
     let name = filename.strip_suffix(".json").unwrap_or(filename);
@@ -271,6 +402,8 @@ fn rows_to_iter(rows: Vec<(Key, DataRow)>) -> RowIter<'static> {
 impl Store for CompositeStorage {
     async fn fetch_schema(&self, table_name: &str) -> Result<Option<Schema>> {
         match table_name {
+            "jhistory" => Ok(Some(self.jhistory_schema())),
+            "codex_history" => Ok(Some(self.codex_history_alias_schema())),
             "transcripts" => Ok(Some(self.transcripts_schema())),
             "todos" => Ok(Some(self.todos_schema())),
             _ => self.json_storage.fetch_schema(table_name).await,
@@ -280,6 +413,10 @@ impl Store for CompositeStorage {
     async fn fetch_all_schemas(&self) -> Result<Vec<Schema>> {
         let mut schemas = self.json_storage.fetch_all_schemas().await?;
 
+        if self.config.jhistory_file().exists() {
+            schemas.push(self.jhistory_schema());
+            schemas.push(self.codex_history_alias_schema());
+        }
         if self.config.transcripts_dir().exists() {
             schemas.push(self.transcripts_schema());
         }
@@ -293,6 +430,7 @@ impl Store for CompositeStorage {
     async fn fetch_data(&self, table_name: &str, key: &Key) -> Result<Option<DataRow>> {
         if self.is_virtual_table(table_name) {
             let rows = match table_name {
+                "jhistory" | "codex_history" => self.scan_jhistory()?,
                 "transcripts" => self.scan_transcripts()?,
                 "todos" => self.scan_todos()?,
                 _ => return Ok(None),
@@ -312,6 +450,7 @@ impl Store for CompositeStorage {
     async fn scan_data(&self, table_name: &str) -> Result<RowIter<'_>> {
         if self.is_virtual_table(table_name) {
             let rows = match table_name {
+                "jhistory" | "codex_history" => self.scan_jhistory()?,
                 "transcripts" => self.scan_transcripts()?,
                 "todos" => self.scan_todos()?,
                 _ => Vec::new(),
@@ -563,5 +702,47 @@ mod tests {
             json_value_to_glue_value(&serde_json::json!(42)),
             Value::I64(42)
         );
+    }
+
+    #[test]
+    fn test_jhistory_json_to_data_row() {
+        let json = serde_json::json!({
+            "session_id": "abc123",
+            "ts": 1754402102,
+            "text": "hello codex"
+        });
+
+        let Some(DataRow::Map(map)) = jhistory_json_to_data_row(&json) else {
+            panic!("expected jhistory row");
+        };
+
+        assert_eq!(
+            map.get("display"),
+            Some(&Value::Str("hello codex".to_string()))
+        );
+        assert_eq!(map.get("ts"), Some(&Value::I64(1754402102)));
+        assert_eq!(map.get("timestamp"), Some(&Value::I64(1_754_402_102_000)));
+    }
+
+    #[test]
+    fn test_jhistory_json_to_data_row_with_string_numbers() {
+        let json = serde_json::json!({
+            "session_id": "abc123",
+            "ts": "1754402102",
+            "text": "hello codex"
+        });
+
+        let Some(DataRow::Map(map)) = jhistory_json_to_data_row(&json) else {
+            panic!("expected jhistory row");
+        };
+
+        assert_eq!(map.get("ts"), Some(&Value::I64(1_754_402_102)));
+        assert_eq!(map.get("timestamp"), Some(&Value::I64(1_754_402_102_000)));
+    }
+
+    #[test]
+    fn test_normalize_ts_seconds() {
+        assert_eq!(normalize_ts_seconds(1_754_402_102), 1_754_402_102);
+        assert_eq!(normalize_ts_seconds(1_754_402_102_000), 1_754_402_102);
     }
 }

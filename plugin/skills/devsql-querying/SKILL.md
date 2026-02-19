@@ -1,11 +1,11 @@
 ---
 name: devsql-querying
-description: Query and analyze Claude Code history joined with Git data using SQL. Use when user asks about their Claude conversations, productivity patterns, commit history correlation, session analytics, or wants to explore their coding history with SQL queries.
+description: Query and analyze Claude Code + Codex CLI history joined with Git data using SQL. Use when user asks about conversation history, productivity patterns, commit correlation, session analytics, or wants SQL-based history exploration.
 ---
 
 # DevSQL Querying Skill
 
-Query your Claude Code history joined with Git commits to analyze productivity patterns.
+Query Claude Code and Codex CLI history joined with Git commits to analyze productivity patterns.
 
 ## When to Use
 
@@ -13,7 +13,7 @@ Query your Claude Code history joined with Git commits to analyze productivity p
 - User wants to "Find my longest debugging sessions"
 - User asks "Which prompts led to the most commits?"
 - User wants productivity analytics or session insights
-- User asks about correlating Claude usage with Git history
+- User asks about correlating Claude/Codex usage with Git history
 
 ## Prerequisites
 
@@ -24,10 +24,12 @@ brew install douglance/tap/devsql
 
 ## Available Tables
 
-### Claude Code Tables
+### Claude/Codex Tables
 | Table | Columns |
 |-------|---------|
 | `history` | timestamp, display (prompt text), project, pastedContents |
+| `jhistory` | session_id, ts, text, display, timestamp |
+| `codex_history` | Alias of `jhistory` |
 | `transcripts` | Full conversation data including tool_use, tool_name |
 | `todos` | Todo items tracked in sessions |
 
@@ -42,7 +44,7 @@ brew install douglance/tap/devsql
 ## Approach
 
 1. Understand what the user wants to analyze
-2. Compose a SQL query joining Claude and Git data as needed
+2. Compose a SQL query joining history and Git data as needed
 3. Execute with: `devsql "<query>"`
 4. Present results with insights
 
@@ -54,6 +56,12 @@ Note: history.timestamp is in milliseconds. Use `datetime(timestamp/1000, 'unixe
 -- Recent prompts
 SELECT display as prompt, project
 FROM history ORDER BY timestamp DESC LIMIT 10;
+
+-- Recent Codex prompts
+SELECT datetime(timestamp/1000, 'unixepoch') as time, display
+FROM jhistory
+ORDER BY timestamp DESC
+LIMIT 10;
 
 -- Prompts this week
 SELECT COUNT(*) as prompts

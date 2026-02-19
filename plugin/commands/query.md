@@ -1,10 +1,10 @@
 ---
-description: Execute SQL queries against Claude Code history and Git data. Usage: /devsql:query <SQL>
+description: Execute SQL queries against Claude Code, Codex CLI, and Git data. Usage: /devsql:query <SQL>
 ---
 
 # DevSQL Query
 
-Execute SQL queries against your Claude Code conversation history joined with Git commit data.
+Execute SQL queries against your Claude Code and Codex CLI history joined with Git commit data.
 
 ## Prerequisites
 
@@ -23,34 +23,40 @@ devsql "$ARGUMENTS"
 
 ## Available Tables
 
-### Claude Code Tables (from ~/.claude)
-- `conversations` - Chat sessions with Claude
-- `messages` - Individual messages in conversations
-- `todos` - Todo items from sessions
-- `projects` - Project contexts
+### Claude + Codex Tables
+- `history` - Claude prompt history (`~/.claude/history.jsonl`)
+- `jhistory` - Codex prompt history (`~/.codex/history.jsonl`, or `$CODEX_HOME/history.jsonl`)
+- `codex_history` - Alias of `jhistory`
+- `transcripts` - Claude transcript logs
+- `todos` - Claude todo items
 
 ### Git Tables (from current repo)
 - `commits` - Git commit history
 - `branches` - Branch information
-- `files` - Files changed in commits
-- `blame` - Line-by-line blame data
-- `hooks` - Git hooks configuration
+- `diffs` - Aggregate diff stats
+- `diff_files` - Per-file diff stats
 
 ## Example Queries
 
 ```sql
--- Recent conversations
-SELECT * FROM conversations ORDER BY timestamp DESC LIMIT 10
+-- Recent Claude prompts
+SELECT display, project
+FROM history
+ORDER BY timestamp DESC
+LIMIT 10;
 
--- Commits with their Claude sessions
-SELECT c.hash, c.message, conv.id as session
+-- Recent Codex prompts
+SELECT datetime(timestamp/1000, 'unixepoch') AS time, display
+FROM jhistory
+ORDER BY timestamp DESC
+LIMIT 10;
+
+-- Commits correlated with Codex prompt activity
+SELECT date(c.authored_at) AS day, COUNT(*) AS commits, COUNT(j.session_id) AS codex_prompts
 FROM commits c
-JOIN conversations conv ON date(c.timestamp) = date(conv.timestamp)
-
--- Most active days
-SELECT date(timestamp) as day, COUNT(*) as sessions
-FROM conversations
-GROUP BY day ORDER BY sessions DESC
+LEFT JOIN jhistory j ON date(c.authored_at) = date(datetime(j.timestamp/1000, 'unixepoch'))
+GROUP BY day
+ORDER BY day DESC;
 ```
 
 ## Output

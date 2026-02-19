@@ -1,6 +1,6 @@
 # DevSQL Claude Code Plugin
 
-Query your Claude Code history with SQL, right from Claude Code.
+Query your Claude Code and Codex CLI history with SQL, right from Claude Code.
 
 ## Installation
 
@@ -19,6 +19,7 @@ The plugin auto-installs the `devsql` binary via Homebrew on first session start
 
 ```
 /devsql:query SELECT * FROM history LIMIT 10
+/devsql:query SELECT * FROM jhistory LIMIT 10
 ```
 
 ### Natural Language
@@ -36,13 +37,16 @@ Claude will automatically use devsql to answer.
 - `history` - Your prompts
 - `transcripts` - Full conversations
 - `todos` - Todo items
-- `projects` - Project contexts
+
+### Codex CLI
+- `jhistory` - Prompt history from `~/.codex/history.jsonl`
+- `codex_history` - Alias of `jhistory`
 
 ### Git
 - `commits` - Commit history
 - `branches` - Branch info
-- `diffs` - File changes
-- `blame` - Line attribution
+- `diffs` - Commit diff stats
+- `diff_files` - Per-file diff stats
 
 ## Examples
 
@@ -68,6 +72,11 @@ FROM history h
 JOIN commits c ON date(datetime(h.timestamp/1000, 'unixepoch')) = date(c.authored_at)
 GROUP BY h.display
 ORDER BY commits_after DESC LIMIT 10
+
+-- Recent Codex prompts
+SELECT datetime(timestamp/1000, 'unixepoch') as time, display
+FROM jhistory
+ORDER BY timestamp DESC LIMIT 10
 ```
 
 ## License

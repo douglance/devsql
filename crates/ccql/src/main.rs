@@ -7,9 +7,9 @@ use ccql::config::Config;
 use ccql::error::Result;
 use ccql::models::TodoStatus;
 
-const LONG_ABOUT: &str = r#"SQL query engine for Claude Code data.
+const LONG_ABOUT: &str = r#"SQL query engine for Claude Code and Codex CLI data.
 
-Tables: history, transcripts, todos  (run 'ccql tables' for schemas)
+Tables: history, jhistory, codex_history, transcripts, todos  (run 'ccql tables' for schemas)
 
 QUICK START
 ═══════════════════════════════════════════════════════════════════════════════
@@ -27,6 +27,8 @@ TABLES
 ═══════════════════════════════════════════════════════════════════════════════
 
 history        User prompts (display, timestamp, project, pastedContents)
+jhistory       Codex CLI prompt history (display, timestamp, session_id, text)
+codex_history  Alias of jhistory
 transcripts    Logs (_session_id, type, content, tool_name, tool_input, tool_output)
 todos          Tasks (_workspace_id, content, status, activeForm)
 
@@ -46,7 +48,7 @@ WRITE MODE: --dry-run to preview, --write to execute (auto-backup)"#;
 #[command(name = "ccql")]
 #[command(author = "Claude Code Query")]
 #[command(version = "0.1.0")]
-#[command(about = "Query Claude Code data with SQL", long_about = LONG_ABOUT)]
+#[command(about = "Query Claude Code and Codex CLI data with SQL", long_about = LONG_ABOUT)]
 #[command(after_long_help = AFTER_LONG_HELP)]
 struct Cli {
     /// SQL query to execute (default command)
@@ -123,7 +125,7 @@ enum Commands {
         /// jq-style query expression
         query: String,
 
-        /// Data source: history, transcripts, stats, todos
+        /// Data source: history, jhistory, codex_history, transcripts, stats, todos
         source: String,
 
         /// Filter by file pattern (for transcripts)
@@ -244,11 +246,7 @@ async fn main() -> Result<()> {
 
     let data_dir = cli
         .data_dir
-        .or_else(|| {
-            std::env::var("CLAUDE_DATA_DIR")
-                .ok()
-                .map(PathBuf::from)
-        })
+        .or_else(|| std::env::var("CLAUDE_DATA_DIR").ok().map(PathBuf::from))
         .unwrap_or_else(Config::default_data_dir);
 
     let config = Config::new(data_dir)?;
@@ -365,6 +363,7 @@ async fn main() -> Result<()> {
 
 fn print_tables_info(config: &Config) {
     let history_exists = config.history_file().exists();
+    let jhistory_exists = config.jhistory_file().exists();
     let transcripts_exists = config.transcripts_dir().exists();
     let todos_exists = config.todos_dir().exists();
 
@@ -373,15 +372,37 @@ fn print_tables_info(config: &Config) {
 
     // history
     let status = if history_exists { "✓" } else { "✗" };
-    println!("{} history                       {}", status, config.history_file().display());
+    println!(
+        "{} history                       {}",
+        status,
+        config.history_file().display()
+    );
     println!("  ├── display        TEXT         The prompt text you typed");
     println!("  ├── timestamp      INTEGER      Unix timestamp (milliseconds)");
     println!("  ├── project        TEXT         Project directory path");
     println!("  └── pastedContents OBJECT       Pasted content (JSON)\n");
 
+    // jhistory
+    let status = if jhistory_exists { "✓" } else { "✗" };
+    println!(
+        "{} jhistory                     {}",
+        status,
+        config.jhistory_file().display()
+    );
+    println!("  ├── display        TEXT         Prompt text (normalized from text)");
+    println!("  ├── timestamp      INTEGER      Unix timestamp (milliseconds)");
+    println!("  ├── session_id     TEXT         Codex session id");
+    println!("  ├── text           TEXT         Raw prompt text");
+    println!("  └── ts             INTEGER      Raw Unix timestamp (seconds)\n");
+    println!("  Alias: codex_history\n");
+
     // transcripts
     let status = if transcripts_exists { "✓" } else { "✗" };
-    println!("{} transcripts                   {}", status, config.transcripts_dir().display());
+    println!(
+        "{} transcripts                   {}",
+        status,
+        config.transcripts_dir().display()
+    );
     println!("  ├── _source_file   TEXT         Source file (ses_xxx.jsonl)");
     println!("  ├── _session_id    TEXT         Session ID");
     println!("  ├── type           TEXT         'user' | 'tool_use' | 'tool_result'");
@@ -393,7 +414,11 @@ fn print_tables_info(config: &Config) {
 
     // todos
     let status = if todos_exists { "✓" } else { "✗" };
-    println!("{} todos                         {}", status, config.todos_dir().display());
+    println!(
+        "{} todos                         {}",
+        status,
+        config.todos_dir().display()
+    );
     println!("  ├── _source_file   TEXT         Source filename");
     println!("  ├── _workspace_id  TEXT         Workspace ID");
     println!("  ├── _agent_id      TEXT         Agent ID");
@@ -403,6 +428,7 @@ fn print_tables_info(config: &Config) {
 
     println!("Run 'ccql examples' for more query examples.");
     println!("\nData directory: {}", config.data_dir.display());
+    println!("Codex directory: {}", config.codex_data_dir().display());
 }
 
 fn print_examples() {
@@ -423,10 +449,15 @@ fn print_examples() {
     println!("  # Search prompts");
     println!("  ccql \"SELECT display FROM history WHERE display LIKE '%error%'\"\n");
     println!("  # Prompts by project");
-    println!("  ccql \"SELECT project, COUNT(*) as n FROM history GROUP BY project ORDER BY n DESC\"\n");
+    println!(
+        "  ccql \"SELECT project, COUNT(*) as n FROM history GROUP BY project ORDER BY n DESC\"\n"
+    );
     println!("  # Long prompts (likely pasted code)");
     println!("  ccql \"SELECT LENGTH(display) as len, SUBSTR(display, 1, 60) as preview");
     println!("        FROM history ORDER BY len DESC LIMIT 10\"\n");
+    println!("  # Recent Codex prompts from jhistory");
+    println!("  ccql \"SELECT datetime(timestamp/1000, 'unixepoch') as time, display");
+    println!("        FROM jhistory ORDER BY timestamp DESC LIMIT 10\"\n");
 
     println!("TRANSCRIPT QUERIES");
     println!("═══════════════════════════════════════════════════════════════════════════════\n");

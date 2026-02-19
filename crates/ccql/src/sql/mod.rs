@@ -1,8 +1,8 @@
 //! SQL query engine using GlueSQL with JSON/JSONL storage
 //!
 //! Provides SQL querying capabilities over Claude Code data files.
-//! Supports both single-file tables (history, stats) and multi-file
-//! virtual tables (transcripts, todos).
+//! Supports both single-file tables (history, stats) and virtual
+//! tables (jhistory, transcripts, todos).
 
 mod composite_storage;
 mod safety;
@@ -164,6 +164,12 @@ impl SqlEngine {
             tables.push("history".to_string());
         }
 
+        // Codex history.jsonl -> jhistory table
+        if self.config.jhistory_file().exists() {
+            tables.push("jhistory".to_string());
+            tables.push("codex_history".to_string());
+        }
+
         // stats-cache.json -> stats table (note: renamed to avoid hyphen in SQL)
         if self.config.stats_file().exists() {
             tables.push("stats".to_string());
@@ -250,9 +256,7 @@ fn glue_value_to_json(value: &Value) -> JsonValue {
                 .collect();
             JsonValue::Object(obj)
         }
-        Value::List(list) => {
-            JsonValue::Array(list.iter().map(glue_value_to_json).collect())
-        }
+        Value::List(list) => JsonValue::Array(list.iter().map(glue_value_to_json).collect()),
         Value::Point(p) => serde_json::json!({
             "x": p.x,
             "y": p.y
@@ -293,6 +297,8 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use tempfile::tempdir;
 
     #[test]
     fn test_is_write_operation() {
@@ -302,5 +308,67 @@ mod tests {
         assert!(is_write_operation("DROP TABLE foo"));
         assert!(!is_write_operation("SELECT * FROM foo"));
         assert!(!is_write_operation("  select * from foo"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_reads_jhistory_rows() {
+        let claude_dir = tempdir().expect("claude temp dir");
+        let codex_dir = tempdir().expect("codex temp dir");
+
+        std::fs::write(
+            codex_dir.path().join("history.jsonl"),
+            r#"{"session_id":"s1","ts":1700000000,"text":"first prompt"}"#.to_string()
+                + "\n"
+                + r#"{"session_id":"s2","ts":1700000001,"text":"second prompt"}"#,
+        )
+        .expect("write jhistory");
+
+        let config = Config::new_with_codex_data_dir(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        )
+        .expect("config");
+
+        let mut engine = SqlEngine::new(config, SqlOptions::default()).expect("engine");
+
+        let rows = engine
+            .execute("SELECT display, session_id, timestamp FROM jhistory ORDER BY timestamp DESC")
+            .await
+            .expect("query");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["display"], serde_json::json!("second prompt"));
+        assert_eq!(rows[0]["session_id"], serde_json::json!("s2"));
+        assert_eq!(
+            rows[0]["timestamp"],
+            serde_json::json!(1_700_000_001_000_i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_codex_history_alias_queries_same_data() {
+        let claude_dir = tempdir().expect("claude temp dir");
+        let codex_dir = tempdir().expect("codex temp dir");
+
+        std::fs::write(
+            codex_dir.path().join("history.jsonl"),
+            r#"{"session_id":"s1","ts":1700000000,"text":"prompt"}"#,
+        )
+        .expect("write jhistory");
+
+        let config = Config::new_with_codex_data_dir(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        )
+        .expect("config");
+
+        let mut engine = SqlEngine::new(config, SqlOptions::default()).expect("engine");
+
+        let rows = engine
+            .execute("SELECT COUNT(*) AS n FROM codex_history")
+            .await
+            .expect("query");
+
+        assert_eq!(rows[0]["n"], serde_json::json!(1));
     }
 }
