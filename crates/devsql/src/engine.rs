@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
-/// Schema version. Bump when transcripts columns / indexes change so the
-/// cache gets dropped and rebuilt on the next run.
-const SCHEMA_VERSION: i64 = 1;
+/// Schema version. Bump when transcripts columns / indexes / FTS structure
+/// change so the cache gets dropped and rebuilt on the next run.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Cache filename inside `claude_data_dir`.
 const CACHE_FILE: &str = ".devsql-cache.db";
@@ -118,8 +118,13 @@ impl UnifiedEngine {
         if !matches {
             // Old version (or no version yet). Drop our owned tables so the
             // loaders rebuild them. Don't touch tables we don't own.
+            // FTS index + triggers must drop before transcripts (foreign ref).
             self.conn.execute_batch(
-                "DROP TABLE IF EXISTS transcripts;
+                "DROP TRIGGER IF EXISTS transcripts_fts_ai;
+                 DROP TRIGGER IF EXISTS transcripts_fts_ad;
+                 DROP TRIGGER IF EXISTS transcripts_fts_au;
+                 DROP TABLE IF EXISTS transcripts_fts;
+                 DROP TABLE IF EXISTS transcripts;
                  DROP TABLE IF EXISTS _transcript_files;
                  DROP TABLE IF EXISTS history;
                  DROP TABLE IF EXISTS todos;
@@ -290,6 +295,40 @@ impl UnifiedEngine {
                 ON transcripts (source_path);
              CREATE INDEX IF NOT EXISTS idx_transcripts_type
                 ON transcripts (type);",
+        )?;
+
+        // FTS5 inverted index over `content` for fast substring/word search.
+        // External-content table — points at the existing `transcripts` rowid
+        // so we don't duplicate the content storage, just the term index.
+        //
+        // Use it via: WHERE rowid IN (SELECT rowid FROM transcripts_fts
+        //                             WHERE transcripts_fts MATCH 'papertrail')
+        // ~10-100x faster than `content LIKE '%foo%'` for selective queries.
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
+                content,
+                content='transcripts',
+                content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+             );
+             -- Triggers keep the FTS index in sync with incremental updates.
+             CREATE TRIGGER IF NOT EXISTS transcripts_fts_ai
+                AFTER INSERT ON transcripts BEGIN
+                INSERT INTO transcripts_fts(rowid, content)
+                    VALUES (new.rowid, new.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS transcripts_fts_ad
+                AFTER DELETE ON transcripts BEGIN
+                INSERT INTO transcripts_fts(transcripts_fts, rowid, content)
+                    VALUES('delete', old.rowid, old.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS transcripts_fts_au
+                AFTER UPDATE ON transcripts BEGIN
+                INSERT INTO transcripts_fts(transcripts_fts, rowid, content)
+                    VALUES('delete', old.rowid, old.content);
+                INSERT INTO transcripts_fts(rowid, content)
+                    VALUES (new.rowid, new.content);
+             END;",
         )?;
 
         // Build the on-disk set of files and their (mtime, size).
@@ -629,10 +668,11 @@ fn extract_message_fields(entry: &Value) -> (String, String, String) {
             for block in blocks {
                 let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match btype {
-                    "text" | "thinking" => {
+                    // Skip "thinking" blocks: they're verbose internal reasoning
+                    // that rarely needs to be searched, and they dominate the
+                    // cache size. Drop on the floor.
+                    "text" => {
                         if let Some(s) = block.get("text").and_then(|v| v.as_str()) {
-                            text_parts.push(s.to_string());
-                        } else if let Some(s) = block.get("thinking").and_then(|v| v.as_str()) {
                             text_parts.push(s.to_string());
                         }
                     }

@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 \":memory:\")",
+      "Bash(./target/release/devsql --no-cache \"CREATE VIRTUAL TABLE t USING fts5\\(x\\); INSERT INTO t VALUES \\('hello world'\\); SELECT * FROM t WHERE t MATCH 'hello'\")",
+      "Bash(cargo build *)",
+      "Bash(cp target/release/devsql /opt/homebrew/bin/devsql)",
+      "Read(//Users/j/.claude/**)",
+      "Bash(time devsql --rebuild-cache -f json \"SELECT COUNT\\(*\\) FROM transcripts\")",
+      "Bash(sqlite3 ~/.claude/.devsql-cache.db \"SELECT name, SUM\\(pgsize\\) / 1024 / 1024 || ' MB' AS size FROM dbstat GROUP BY name ORDER BY SUM\\(pgsize\\) DESC LIMIT 20\")",
+      "Bash(sqlite3 ~/.claude/.devsql-cache.db \"SELECT COUNT\\(*\\) as rows, SUM\\(LENGTH\\(content\\)\\)/1024/1024 || ' MB' as content_bytes, MAX\\(LENGTH\\(content\\)\\)/1024 || ' KB' as max_row, AVG\\(LENGTH\\(content\\)\\) as avg FROM transcripts\")",
+      "Bash(time devsql -f json \"SELECT COUNT\\(*\\) FROM transcripts WHERE content LIKE '%papertrail%'\")",
+      "Bash(time devsql -f json \"SELECT COUNT\\(*\\) FROM transcripts WHERE rowid IN \\(SELECT rowid FROM transcripts_fts WHERE transcripts_fts MATCH 'papertrail'\\)\")",
+      "Bash(time devsql -f json \"SELECT project, session_id, type, role, substr\\(content, 1, 80\\) as snippet FROM transcripts WHERE rowid IN \\(SELECT rowid FROM transcripts_fts WHERE transcripts_fts MATCH 'papertrail solarwinds'\\) AND timestamp >= '2026-05-01' ORDER BY timestamp DESC LIMIT 3\")",
+      "Bash(cargo test *)"
+    ]
+  }
+}
