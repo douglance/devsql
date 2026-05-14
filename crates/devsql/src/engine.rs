@@ -131,13 +131,132 @@ impl UnifiedEngine {
             "CREATE TABLE IF NOT EXISTS transcripts (
                 rowid INTEGER PRIMARY KEY,
                 type TEXT,
+                role TEXT,
                 content TEXT,
                 tool_name TEXT,
-                session_id TEXT
+                session_id TEXT,
+                project TEXT,
+                timestamp TEXT,
+                cwd TEXT,
+                git_branch TEXT,
+                user_type TEXT,
+                uuid TEXT,
+                parent_uuid TEXT,
+                source_file TEXT
             )",
             [],
         )?;
-        // TODO: Load from transcripts/*.jsonl
+
+        // Current Claude Code layout: ~/.claude/projects/<slug>/<session>.jsonl
+        let projects_dir = self.claude_data_dir.join("projects");
+        if projects_dir.exists() {
+            if let Ok(project_entries) = std::fs::read_dir(&projects_dir) {
+                for project_entry in project_entries.flatten() {
+                    let project_path = project_entry.path();
+                    if !project_path.is_dir() {
+                        continue;
+                    }
+                    let project_slug = project_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
+
+                    if let Ok(session_entries) = std::fs::read_dir(&project_path) {
+                        for session_entry in session_entries.flatten() {
+                            let path = session_entry.path();
+                            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                                self.load_transcript_file(&path, project_slug.as_deref())?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Legacy layout: ~/.claude/transcripts/<session>.jsonl
+        let transcripts_dir = self.claude_data_dir.join("transcripts");
+        if transcripts_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&transcripts_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "jsonl") {
+                        self.load_transcript_file(&path, None)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_transcript_file(
+        &mut self,
+        path: &std::path::Path,
+        project: Option<&str>,
+    ) -> Result<()> {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        // Legacy filenames sometimes carried a `ses_` prefix.
+        let session_id = stem.strip_prefix("ses_").unwrap_or(stem).to_string();
+        let source_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO transcripts (
+                    type, role, content, tool_name, session_id, project,
+                    timestamp, cwd, git_branch, user_type, uuid, parent_uuid, source_file
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )?;
+            for line in content.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let row_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let timestamp = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                let cwd = entry.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                let git_branch = entry.get("gitBranch").and_then(|v| v.as_str()).unwrap_or("");
+                let user_type = entry.get("userType").and_then(|v| v.as_str()).unwrap_or("");
+                let uuid = entry.get("uuid").and_then(|v| v.as_str()).unwrap_or("");
+                let parent_uuid = entry
+                    .get("parentUuid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let (role, text, tool_name) = extract_message_fields(&entry);
+
+                stmt.execute(params![
+                    row_type,
+                    role,
+                    text,
+                    tool_name,
+                    session_id,
+                    project.unwrap_or(""),
+                    timestamp,
+                    cwd,
+                    git_branch,
+                    user_type,
+                    uuid,
+                    parent_uuid,
+                    source_file,
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -256,6 +375,61 @@ impl UnifiedEngine {
 
         Ok(())
     }
+}
+
+/// Extract `(role, content_text, tool_name)` from a transcript row's
+/// `message` object. The Claude Code JSONL format stores user prompts as
+/// either a string or a list of content blocks, and assistant responses
+/// as a list of `text` / `thinking` / `tool_use` blocks. We collapse all
+/// text-bearing blocks into one string and surface the first tool name.
+fn extract_message_fields(entry: &Value) -> (String, String, String) {
+    let Some(msg) = entry.get("message") else {
+        return (String::new(), String::new(), String::new());
+    };
+
+    let role = msg
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let content = msg.get("content");
+    let (text, tool_name) = match content {
+        Some(Value::String(s)) => (s.clone(), String::new()),
+        Some(Value::Array(blocks)) => {
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut first_tool: Option<String> = None;
+            for block in blocks {
+                let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match btype {
+                    "text" | "thinking" => {
+                        if let Some(s) = block.get("text").and_then(|v| v.as_str()) {
+                            text_parts.push(s.to_string());
+                        } else if let Some(s) = block.get("thinking").and_then(|v| v.as_str()) {
+                            text_parts.push(s.to_string());
+                        }
+                    }
+                    "tool_use" => {
+                        if first_tool.is_none() {
+                            if let Some(n) = block.get("name").and_then(|v| v.as_str()) {
+                                first_tool = Some(n.to_string());
+                            }
+                        }
+                    }
+                    "tool_result" => {
+                        if let Some(s) = block.get("content").and_then(|v| v.as_str()) {
+                            text_parts.push(s.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (text_parts.join("\n"), first_tool.unwrap_or_default())
+        }
+        _ => (String::new(), String::new()),
+    };
+
+    (role, text, tool_name)
 }
 
 /// Normalize dates from various formats to YYYY-MM-DD
