@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use walkdir::WalkDir;
 
 /// Storage that combines JsonStorage with virtual multi-file tables
 pub struct CompositeStorage {
@@ -53,33 +54,31 @@ impl CompositeStorage {
         let mut files: Vec<(PathBuf, String, Option<String>)> = Vec::new();
 
         // Current layout: ~/.claude/projects/<slug>/<session>.jsonl
+        // Also captures nested layouts produced by recent Claude Code builds,
+        // e.g. <slug>/<session-uuid>/subagents/<agent>.jsonl for spawned
+        // subagent transcripts, and <slug>/prune-backup/*.jsonl for archived
+        // pre-compaction transcripts.
         let projects_dir = self.config.projects_dir();
         if projects_dir.exists() {
-            if let Ok(project_entries) = fs::read_dir(&projects_dir) {
-                for project_entry in project_entries.flatten() {
-                    let project_path = project_entry.path();
-                    if !project_path.is_dir() {
-                        continue;
-                    }
-                    let project_slug = project_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string());
-
-                    if let Ok(session_entries) = fs::read_dir(&project_path) {
-                        for session_entry in session_entries.flatten() {
-                            let path = session_entry.path();
-                            if path.extension().is_some_and(|ext| ext == "jsonl") {
-                                let session_id = path
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-                                files.push((path, session_id, project_slug.clone()));
-                            }
-                        }
-                    }
+            for entry in WalkDir::new(&projects_dir).into_iter().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if !path.extension().is_some_and(|ext| ext == "jsonl") {
+                    continue;
                 }
+                let session_id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                // Project slug is the first directory under projects/.
+                let relative = path.strip_prefix(&projects_dir).ok();
+                let project_slug = relative
+                    .and_then(|r| r.components().next())
+                    .and_then(|c| c.as_os_str().to_str())
+                    .map(|s| s.to_string());
+
+                files.push((path.to_path_buf(), session_id, project_slug));
             }
         }
 

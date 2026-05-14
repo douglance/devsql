@@ -48,6 +48,7 @@ tracing-subscriber.workspace = true
 
 # Utilities
 dirs = "5.0"
+walkdir.workspace = true
 
 [[bin]]
 name = "devsql"

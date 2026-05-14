@@ -148,28 +148,26 @@ impl UnifiedEngine {
         )?;
 
         // Current Claude Code layout: ~/.claude/projects/<slug>/<session>.jsonl
+        // Also nested layouts: <slug>/<session-uuid>/subagents/<agent>.jsonl
+        // (spawned subagent transcripts) and <slug>/prune-backup/*.jsonl
+        // (archived pre-compaction transcripts).
         let projects_dir = self.claude_data_dir.join("projects");
         if projects_dir.exists() {
-            if let Ok(project_entries) = std::fs::read_dir(&projects_dir) {
-                for project_entry in project_entries.flatten() {
-                    let project_path = project_entry.path();
-                    if !project_path.is_dir() {
-                        continue;
-                    }
-                    let project_slug = project_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string());
-
-                    if let Ok(session_entries) = std::fs::read_dir(&project_path) {
-                        for session_entry in session_entries.flatten() {
-                            let path = session_entry.path();
-                            if path.extension().is_some_and(|ext| ext == "jsonl") {
-                                self.load_transcript_file(&path, project_slug.as_deref())?;
-                            }
-                        }
-                    }
+            for entry in walkdir::WalkDir::new(&projects_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if !path.extension().is_some_and(|ext| ext == "jsonl") {
+                    continue;
                 }
+                let project_slug = path
+                    .strip_prefix(&projects_dir)
+                    .ok()
+                    .and_then(|r| r.components().next())
+                    .and_then(|c| c.as_os_str().to_str())
+                    .map(|s| s.to_string());
+                self.load_transcript_file(path, project_slug.as_deref())?;
             }
         }
 

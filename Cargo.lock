@@ -977,6 +977,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vcsql",
+ "walkdir",
 ]
 
 [[package]]
