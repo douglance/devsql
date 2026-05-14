@@ -39,6 +39,16 @@ struct Cli {
     /// Omit header row
     #[arg(short = 'H', long = "no-header")]
     no_header: bool,
+
+    /// Disable the persistent on-disk cache (in-memory only, slower but
+    /// guarantees a fresh scan of every JSONL file each invocation).
+    #[arg(long = "no-cache")]
+    no_cache: bool,
+
+    /// Delete the cache before running, forcing a full rebuild. Use after
+    /// upgrading devsql if you suspect stale rows.
+    #[arg(long = "rebuild-cache")]
+    rebuild_cache: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -73,7 +83,12 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Create engine and load tables
-    let mut engine = UnifiedEngine::new(claude_dir, repo_path)?;
+    let mut engine = UnifiedEngine::with_options(
+        claude_dir,
+        repo_path,
+        !cli.no_cache,
+        cli.rebuild_cache,
+    )?;
 
     // Detect which tables are needed
     let (claude_tables, git_tables) = detect_tables(&query);
