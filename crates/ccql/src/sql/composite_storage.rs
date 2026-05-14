@@ -20,6 +20,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 
 /// Storage that combines JsonStorage with virtual multi-file tables
 pub struct CompositeStorage {
@@ -42,49 +43,104 @@ impl CompositeStorage {
         matches!(table_name, "transcripts" | "todos")
     }
 
-    /// Scan transcripts directory and return all rows
-    fn scan_transcripts(&self) -> Result<Vec<(Key, DataRow)>> {
-        let transcripts_dir = self.config.transcripts_dir();
-        if !transcripts_dir.exists() {
-            return Ok(Vec::new());
-        }
+    /// Discover all transcript .jsonl files from both the current Claude Code
+    /// layout (`~/.claude/projects/<slug>/<session-uuid>.jsonl`) and the legacy
+    /// flat layout (`~/.claude/transcripts/<session>.jsonl`).
+    ///
+    /// Returns `(path, session_id, project_slug)` tuples. `project_slug` is the
+    /// parent directory name for the new layout, or `None` for the legacy one.
+    fn list_transcript_files(&self) -> Vec<(PathBuf, String, Option<String>)> {
+        let mut files: Vec<(PathBuf, String, Option<String>)> = Vec::new();
 
-        let mut rows = Vec::new();
-        let mut row_id: i64 = 0;
+        // Current layout: ~/.claude/projects/<slug>/<session>.jsonl
+        let projects_dir = self.config.projects_dir();
+        if projects_dir.exists() {
+            if let Ok(project_entries) = fs::read_dir(&projects_dir) {
+                for project_entry in project_entries.flatten() {
+                    let project_path = project_entry.path();
+                    if !project_path.is_dir() {
+                        continue;
+                    }
+                    let project_slug = project_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
 
-        let entries = fs::read_dir(&transcripts_dir)
-            .map_err(|e| GlueError::StorageMsg(format!("Failed to read transcripts dir: {}", e)))?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "jsonl") {
-                let source_file = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let session_id = source_file
-                    .strip_prefix("ses_")
-                    .and_then(|s| s.strip_suffix(".jsonl"))
-                    .unwrap_or(&source_file)
-                    .to_string();
-
-                if let Ok(file) = fs::File::open(&path) {
-                    let reader = BufReader::new(file);
-                    for line in reader.lines().map_while(Result::ok) {
-                        if let Ok(json) = serde_json::from_str::<JsonValue>(&line) {
-                            let data_row =
-                                json_to_data_row_with_meta(&json, &source_file, &session_id);
-                            rows.push((Key::I64(row_id), data_row));
-                            row_id += 1;
+                    if let Ok(session_entries) = fs::read_dir(&project_path) {
+                        for session_entry in session_entries.flatten() {
+                            let path = session_entry.path();
+                            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                                let session_id = path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                files.push((path, session_id, project_slug.clone()));
+                            }
                         }
                     }
                 }
             }
         }
 
+        // Legacy layout: ~/.claude/transcripts/<session>.jsonl
+        let transcripts_dir = self.config.transcripts_dir();
+        if transcripts_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&transcripts_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "jsonl") {
+                        let stem = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown");
+                        // Legacy filenames sometimes carried a `ses_` prefix.
+                        let session_id = stem.strip_prefix("ses_").unwrap_or(stem).to_string();
+                        files.push((path, session_id, None));
+                    }
+                }
+            }
+        }
+
+        files
+    }
+
+    /// Scan transcripts directory and return all rows
+    fn scan_transcripts(&self) -> Result<Vec<(Key, DataRow)>> {
+        let mut rows = Vec::new();
+        let mut row_id: i64 = 0;
+
+        for (path, session_id, project) in self.list_transcript_files() {
+            let source_file = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(json) = serde_json::from_str::<JsonValue>(&line) {
+                    let data_row = json_to_data_row_with_meta(
+                        &json,
+                        &source_file,
+                        &session_id,
+                        project.as_deref(),
+                    );
+                    rows.push((Key::I64(row_id), data_row));
+                    row_id += 1;
+                }
+            }
+        }
+
         Ok(rows)
+    }
+
+    /// True if any transcript source directory exists on disk.
+    fn has_transcripts(&self) -> bool {
+        self.config.projects_dir().exists() || self.config.transcripts_dir().exists()
     }
 
     /// Scan todos directory and return all rows
@@ -172,7 +228,12 @@ impl CompositeStorage {
 }
 
 /// Convert a JSON object to a DataRow with metadata columns
-fn json_to_data_row_with_meta(json: &JsonValue, source_file: &str, session_id: &str) -> DataRow {
+fn json_to_data_row_with_meta(
+    json: &JsonValue,
+    source_file: &str,
+    session_id: &str,
+    project: Option<&str>,
+) -> DataRow {
     let mut map = HashMap::new();
 
     map.insert(
@@ -182,6 +243,10 @@ fn json_to_data_row_with_meta(json: &JsonValue, source_file: &str, session_id: &
     map.insert(
         "_session_id".to_string(),
         Value::Str(session_id.to_string()),
+    );
+    map.insert(
+        "_project".to_string(),
+        project.map_or(Value::Null, |p| Value::Str(p.to_string())),
     );
 
     if let JsonValue::Object(obj) = json {
@@ -280,7 +345,7 @@ impl Store for CompositeStorage {
     async fn fetch_all_schemas(&self) -> Result<Vec<Schema>> {
         let mut schemas = self.json_storage.fetch_all_schemas().await?;
 
-        if self.config.transcripts_dir().exists() {
+        if self.has_transcripts() {
             schemas.push(self.transcripts_schema());
         }
         if self.config.todos_dir().exists() {
@@ -537,6 +602,61 @@ impl CustomFunctionMut for CompositeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_scan_transcripts_finds_both_layouts() {
+        // Build a temp ~/.claude-style data dir with both the current projects/
+        // layout and the legacy transcripts/ layout, and verify scan_transcripts
+        // surfaces rows from both with the right metadata.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+
+        // Current layout: projects/<slug>/<session>.jsonl
+        let proj_dir = data_dir.join("projects").join("-Users-test-repo");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let mut f = fs::File::create(proj_dir.join("aaa-bbb.jsonl")).unwrap();
+        writeln!(f, "{{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}").unwrap();
+        writeln!(f, "{{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T00:00:01Z\"}}").unwrap();
+
+        // Legacy layout: transcripts/<session>.jsonl
+        let legacy_dir = data_dir.join("transcripts");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let mut f = fs::File::create(legacy_dir.join("ses_old.jsonl")).unwrap();
+        writeln!(f, "{{\"type\":\"user\"}}").unwrap();
+
+        let config = Config::new(data_dir.to_path_buf()).unwrap();
+        let storage = CompositeStorage::new(config).unwrap();
+        let rows = storage.scan_transcripts().unwrap();
+
+        assert_eq!(rows.len(), 3, "should see 2 new-layout rows + 1 legacy row");
+
+        let projects: Vec<_> = rows
+            .iter()
+            .filter_map(|(_, r)| match r {
+                DataRow::Map(m) => m.get("_project").cloned(),
+                _ => None,
+            })
+            .collect();
+        assert!(projects
+            .iter()
+            .any(|v| matches!(v, Value::Str(s) if s == "-Users-test-repo")));
+        assert!(projects.iter().any(|v| matches!(v, Value::Null)));
+
+        let sessions: Vec<_> = rows
+            .iter()
+            .filter_map(|(_, r)| match r {
+                DataRow::Map(m) => m.get("_session_id").cloned(),
+                _ => None,
+            })
+            .collect();
+        assert!(sessions
+            .iter()
+            .any(|v| matches!(v, Value::Str(s) if s == "aaa-bbb")));
+        assert!(sessions
+            .iter()
+            .any(|v| matches!(v, Value::Str(s) if s == "old")));
+    }
 
     #[test]
     fn test_parse_todo_filename() {

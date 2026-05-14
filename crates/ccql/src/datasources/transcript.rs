@@ -14,27 +14,50 @@ impl TranscriptDataSource {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        let transcripts_dir = self.config.transcripts_dir();
-        if !transcripts_dir.exists() {
-            return Ok(vec![]);
+        let mut sessions = Vec::new();
+
+        // Current Claude Code layout: ~/.claude/projects/<slug>/<session>.jsonl
+        let projects_dir = self.config.projects_dir();
+        if projects_dir.exists() {
+            for entry in WalkDir::new(&projects_dir)
+                .max_depth(2)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                    if let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) {
+                        let metadata = std::fs::metadata(path).ok();
+                        sessions.push(SessionInfo {
+                            session_id: session_id.to_string(),
+                            path: path.to_path_buf(),
+                            size_bytes: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+                            modified: metadata.and_then(|m| m.modified().ok()),
+                        });
+                    }
+                }
+            }
         }
 
-        let mut sessions = Vec::new();
-        for entry in WalkDir::new(&transcripts_dir)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                if let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) {
-                    let metadata = std::fs::metadata(path).ok();
-                    sessions.push(SessionInfo {
-                        session_id: session_id.to_string(),
-                        path: path.to_path_buf(),
-                        size_bytes: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-                        modified: metadata.and_then(|m| m.modified().ok()),
-                    });
+        // Legacy flat layout: ~/.claude/transcripts/<session>.jsonl
+        let transcripts_dir = self.config.transcripts_dir();
+        if transcripts_dir.exists() {
+            for entry in WalkDir::new(&transcripts_dir)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                    if let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) {
+                        let metadata = std::fs::metadata(path).ok();
+                        sessions.push(SessionInfo {
+                            session_id: session_id.to_string(),
+                            path: path.to_path_buf(),
+                            size_bytes: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+                            modified: metadata.and_then(|m| m.modified().ok()),
+                        });
+                    }
                 }
             }
         }
@@ -44,7 +67,19 @@ impl TranscriptDataSource {
     }
 
     pub async fn load_session(&self, session_id: &str) -> Result<Vec<serde_json::Value>> {
-        let path = self.config.transcripts_dir().join(format!("{}.jsonl", session_id));
+        // Look up via list_sessions so both old and new layouts are supported.
+        if let Some(info) = self
+            .list_sessions()?
+            .into_iter()
+            .find(|s| s.session_id == session_id)
+        {
+            return streaming::read_jsonl_raw(info.path).await;
+        }
+        // Fallback to legacy path for backward compatibility.
+        let path = self
+            .config
+            .transcripts_dir()
+            .join(format!("{}.jsonl", session_id));
         streaming::read_jsonl_raw(path).await
     }
 

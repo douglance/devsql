@@ -170,7 +170,7 @@ impl SqlEngine {
         }
 
         // Virtual multi-file tables
-        if self.config.transcripts_dir().exists() {
+        if self.config.transcripts_dir().exists() || self.config.projects_dir().exists() {
             tables.push("transcripts".to_string());
         }
 
