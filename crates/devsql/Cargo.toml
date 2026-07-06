@@ -54,6 +54,8 @@ streaming-iterator = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
 
 [features]
 tree-sitter-ast = [

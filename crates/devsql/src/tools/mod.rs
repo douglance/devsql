@@ -7,6 +7,7 @@ pub mod context;
 pub mod diff;
 pub mod history;
 pub mod impact;
+pub mod recall;
 pub mod search;
 pub mod semantic_diff;
 

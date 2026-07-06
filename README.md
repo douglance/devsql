@@ -73,6 +73,7 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql history <file>` | Git commit history for a specific file |
 | `devsql diff <base> <head>` | Compare two Git refs with file and symbol-level stats |
 | `devsql impact <file>` | Analyze exports and find potential dependents |
+| `devsql recall <terms>` | Load prior work (sessions, commits, prompts) ranked by term-match count then recency |
 
 Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`).
 
@@ -166,6 +167,12 @@ devsql search "Error" --kind struct
 ### Semantic diff between refs
 ```bash
 devsql diff main~5 HEAD
+```
+
+### Recall prior work
+```bash
+devsql recall "vision simulator mute"
+devsql recall "auth token refresh" -r /path/to/repo
 ```
 
 ### File context and impact
