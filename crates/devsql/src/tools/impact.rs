@@ -21,13 +21,13 @@ struct ImpactArgs {
 #[allow(dead_code)]
 struct ImpactOptions {
     /// Git repository path
-    #[incurs(alias = "r", default = ".")]
+    #[incur(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incurs(alias = "d")]
+    #[incur(alias = "d")]
     data_dir: Option<String>,
     /// Depth of dependency analysis (reserved for future use)
-    #[incurs(default = "1")]
+    #[incur(default = "1")]
     depth: i64,
 }
 

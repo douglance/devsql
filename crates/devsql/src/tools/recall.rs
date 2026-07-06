@@ -22,13 +22,13 @@ struct RecallArgs {
 #[allow(dead_code)]
 struct RecallOptions {
     /// Git repository path (scopes the commits source)
-    #[incurs(alias = "r", default = ".")]
+    #[incur(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incurs(alias = "d")]
+    #[incur(alias = "d")]
     data_dir: Option<String>,
     /// Maximum number of results per source
-    #[incurs(alias = "n", default = "8")]
+    #[incur(alias = "n", default = "8")]
     limit: i64,
 }
 

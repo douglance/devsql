@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "ccql"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "devsql"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -2066,9 +2066,9 @@ dependencies = [
 
 [[package]]
 name = "incurs"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e518f0f195a87bf7ec6739fe34e75996c23cfd14d1daca3b857a9be770146af"
+checksum = "c8fe8cbdd6f0418caf5d66f925e2b31ee055e9b0f7dbe9f8e9fc17ba533fc7e5"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2086,9 +2086,9 @@ dependencies = [
 
 [[package]]
 name = "incurs-macros"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "623331cc990b8685a8cbb4f7f6d3a50a347dd897d0f5ed4c9701d58b4eaaf074"
+checksum = "a8f871e14b442dbc948131778a2f9d0f5e17f45a14a61b1178088dbc70483e19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4591,7 +4591,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vcsql"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "assert_cmd",

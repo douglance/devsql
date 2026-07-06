@@ -26,10 +26,10 @@ struct DiffArgs {
 #[allow(dead_code)]
 struct DiffOptions {
     /// Git repository path
-    #[incurs(alias = "r", default = ".")]
+    #[incur(alias = "r", default = ".")]
     repo: String,
     /// Maximum number of files to return
-    #[incurs(alias = "n", default = "100")]
+    #[incur(alias = "n", default = "100")]
     limit: i64,
 }
 

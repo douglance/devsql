@@ -27,13 +27,13 @@ struct QueryArgs {
 #[allow(dead_code)]
 struct QueryOptions {
     /// Git repository path
-    #[incurs(alias = "r", default = ".")]
+    #[incur(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incurs(alias = "d")]
+    #[incur(alias = "d")]
     data_dir: Option<String>,
     /// Omit header row in table/csv output
-    #[incurs(alias = "H")]
+    #[incur(alias = "H")]
     no_header: bool,
 }
 
