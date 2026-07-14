@@ -40,7 +40,7 @@ struct RecallHandler;
 
 /// Build `((E LIKE '%t1%') + (E LIKE '%t2%') + ...)` -- SQLite booleans sum to
 /// a match count, so this scores a row by how many terms it hits.
-fn score_expr(expr: &str, terms: &[String]) -> String {
+pub(crate) fn score_expr(expr: &str, terms: &[String]) -> String {
     let parts: Vec<String> = terms
         .iter()
         .map(|t| format!("({expr} LIKE '%{t}%')"))
@@ -49,7 +49,7 @@ fn score_expr(expr: &str, terms: &[String]) -> String {
 }
 
 /// Build `((E LIKE '%t1%') OR (E LIKE '%t2%') OR ...)` -- the match predicate.
-fn match_expr(expr: &str, terms: &[String]) -> String {
+pub(crate) fn match_expr(expr: &str, terms: &[String]) -> String {
     let parts: Vec<String> = terms
         .iter()
         .map(|t| format!("({expr} LIKE '%{t}%')"))

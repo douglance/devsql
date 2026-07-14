@@ -52,6 +52,8 @@ impl UnifiedEngine {
                 "transcripts" => self.load_transcripts()?,
                 "sessions" => self.load_sessions()?,
                 "todos" => self.load_todos()?,
+                "tool_calls" => self.load_tool_calls()?,
+                "codex_tool_calls" => self.load_codex_tool_calls()?,
                 _ => {}
             }
         }
@@ -75,6 +77,13 @@ impl UnifiedEngine {
     /// Load code analysis tables needed for the query
     pub fn load_code_tables(&mut self, tables: &[&str]) -> Result<()> {
         crate::providers::load_all_code_tables(&self.conn, &self.git_repo_path, tables)
+    }
+
+    /// Access the underlying SQLite connection. Used by `gather` to
+    /// materialize section results as `gather_<section>` tables in the
+    /// connection used for rendering.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// Execute a SQL query and return results as JSON values
@@ -245,6 +254,125 @@ impl UnifiedEngine {
                         usage_int("usage_ephemeral_1h_input_tokens"),
                         usage.get("usage_service_tier").and_then(|v| v.as_str()),
                     ])?;
+                }
+            }
+        }
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    fn load_tool_calls(&mut self) -> Result<()> {
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS tool_calls (
+                rowid INTEGER PRIMARY KEY,
+                tool_name TEXT,
+                input_json TEXT,
+                target TEXT,
+                session_id TEXT,
+                _project TEXT,
+                timestamp TEXT
+            )",
+            [],
+        )?;
+
+        let Some(config) = self.ccql_config() else {
+            return Ok(());
+        };
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tool_calls (tool_name, input_json, target, session_id, _project, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+
+            for file in discover_transcript_files(&config) {
+                let content = match std::fs::read_to_string(&file.path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                for line in content.lines() {
+                    let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+
+                    for call in ccql::datasources::tool_calls::extract_tool_calls(&entry) {
+                        stmt.execute(params![
+                            call.tool_name,
+                            call.input_json,
+                            call.target,
+                            file.session_id,
+                            file.project,
+                            call.timestamp,
+                        ])?;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    fn load_codex_tool_calls(&mut self) -> Result<()> {
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS codex_tool_calls (
+                rowid INTEGER PRIMARY KEY,
+                tool_name TEXT,
+                arguments_json TEXT,
+                cmd TEXT,
+                session_id TEXT,
+                cwd TEXT,
+                timestamp TEXT
+            )",
+            [],
+        )?;
+
+        let sessions_dir = self.codex_data_dir.join("sessions");
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO codex_tool_calls (tool_name, arguments_json, cmd, session_id, cwd, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+
+            for path in ccql::datasources::codex_tool_calls::discover_codex_session_files(&sessions_dir) {
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                let mut session_id: Option<String> = None;
+                let mut cwd: Option<String> = None;
+
+                for line in content.lines() {
+                    let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+
+                    if let Some(meta) =
+                        ccql::datasources::codex_tool_calls::extract_session_meta(&entry)
+                    {
+                        session_id = meta.session_id.or(session_id);
+                        cwd = meta.cwd.or(cwd);
+                        continue;
+                    }
+
+                    if let Some(call) =
+                        ccql::datasources::codex_tool_calls::extract_codex_tool_call(&entry)
+                    {
+                        stmt.execute(params![
+                            call.tool_name,
+                            call.arguments_json,
+                            call.cmd,
+                            session_id,
+                            cwd,
+                            call.timestamp,
+                        ])?;
+                    }
                 }
             }
         }
@@ -772,6 +900,8 @@ pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         "sessions",
         "todos",
         "stats",
+        "tool_calls",
+        "codex_tool_calls",
     ];
     let git_tables = [
         "commits",

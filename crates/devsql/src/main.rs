@@ -207,6 +207,7 @@ fn build_cli() -> Cli {
         .command("history", devsql::tools::history::build())
         .command("impact", devsql::tools::impact::build())
         .command("recall", devsql::tools::recall::build())
+        .command("gather", devsql::tools::gather::build())
 }
 
 #[tokio::main]

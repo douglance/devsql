@@ -74,8 +74,9 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql diff <base> <head>` | Compare two Git refs with file and symbol-level stats |
 | `devsql impact <file>` | Analyze exports and find potential dependents |
 | `devsql recall <terms>` | Load prior work (sessions, commits, prompts) ranked by term-match count then recency |
+| `devsql gather <terms>` | Run prior_work, repo_state, code_search, symbols, excerpts, and activity concurrently and return one token-budgeted bundle |
 
-Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`).
+Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`). `gather` also takes `--budget` (default `8000` tokens; lowest-ranked rows are dropped round-robin per section, never mid-row, until the bundle fits).
 
 ## Tables
 

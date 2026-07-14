@@ -5,6 +5,7 @@
 
 pub mod context;
 pub mod diff;
+pub mod gather;
 pub mod history;
 pub mod impact;
 pub mod recall;

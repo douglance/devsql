@@ -43,6 +43,10 @@ walkdir.workspace = true
 ignore.workspace = true
 regex.workspace = true
 
+# Token counting for `gather`'s budget enforcement (same BPE incurs uses for
+# its own --token-count/--token-limit flags)
+tiktoken-rs = "0.6"
+
 # Tree-sitter (optional, for AST analysis)
 tree-sitter = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
