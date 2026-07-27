@@ -308,6 +308,7 @@ jobs:
         run: |
           git config --global user.name "${GITHUB_USER}"
           git config --global user.email "${GITHUB_EMAIL}"
+          committed=false
 
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
             filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
@@ -320,9 +321,14 @@ jobs:
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
 
             git add "Formula/${filename}"
-            git commit -m "${name} ${version}"
+            if ! git diff --cached --quiet; then
+              git commit -m "${name} ${version}"
+              committed=true
+            fi
           done
-          git push
+          if [ "$committed" = true ]; then
+            git push
+          fi
 
   announce:
     needs:
