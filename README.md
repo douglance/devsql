@@ -2,15 +2,15 @@
 
 Unified SQL interface across AI coding history, Git repositories, and source code.
 
-DevSQL loads data from Claude Code, Codex CLI, Git, and your source tree into an in-memory SQLite database so you can join, filter, and aggregate across all of them with standard SQL.
+DevSQL loads data from Claude Code, Codex CLI, Git, and your source tree into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
 
 ## Overview
 
 ```
-~/.claude/    ─┐
-~/.codex/     ─┤
-.git/         ─┼──▶  SQLite (in-memory)  ──▶  SQL queries / JSON / CSV
-src/**/*      ─┘
+~/.claude/   --+
+~/.codex/    --+
+.git/        --+--> SQLite --> SQL queries / JSON / CSV
+src/**/*     --+
 ```
 
 Three standalone tools, one unified interface:
@@ -73,7 +73,7 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql history <file>` | Git commit history for a specific file |
 | `devsql diff <base> <head>` | Compare two Git refs with file and symbol-level stats |
 | `devsql impact <file>` | Analyze exports and find potential dependents |
-| `devsql recall <terms>` | Load prior work (sessions, commits, prompts) ranked by term-match count then recency |
+| `devsql recall <terms>` | Load prior work (Claude sessions, Codex threads, commits, prompts) ranked by term-match count then recency |
 | `devsql gather <terms>` | Run prior_work, repo_state, code_search, symbols, excerpts, and activity concurrently and return one token-budgeted bundle |
 
 Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`). `gather` also takes `--budget` (default `8000` tokens; lowest-ranked rows are dropped round-robin per section, never mid-row, until the bundle fits).
@@ -89,7 +89,14 @@ Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.
 | `sessions` | Same files as `transcripts` | One row per session: title, cwd, git_branch, first/last_timestamp, message counts, subagent_count, `total_*_tokens`, pr_url, pr_number |
 | `todos` | `~/.claude/todos/*.json` | Task items (content, status) |
 | `jhistory` | `~/.codex/history.jsonl` | Codex CLI prompts (session_id, text, display, timestamp) |
-| `codex_history` | — | Alias for `jhistory` |
+| `codex_history` | - | Alias for `jhistory` |
+| `codex_threads` | `$CODEX_HOME/{sessions,archived_sessions}/**/rollout-*.jsonl[.zst]` | One row per Codex thread: lineage, cwd, Git branch, state, compression, journal path, timestamps, first user text, and aggregate counts |
+| `codex_events` | Same rollout journals | One row per newline-terminated journal record: thread ID, record index, timestamp, record type, payload type, role, call ID, and source path |
+| `codex_messages` | Same rollout journals | Normalized user and assistant content, including canonical-message status and source provenance |
+| `codex_tool_executions` | Same rollout journals | Tool calls paired with outputs by thread and call ID |
+| `codex_tool_calls` | Same rollout journals | Backward-compatible tool-call view: tool_name, arguments_json, cmd, session_id, cwd, timestamp |
+| `codex_compactions` | Same rollout journals | Compaction summaries and window metadata |
+| `codex_ingest_errors` | DevSQL Codex index | Nonfatal journal read and JSON parsing errors |
 
 ### Git
 
@@ -176,6 +183,21 @@ devsql recall "vision simulator mute"
 devsql recall "auth token refresh" -r /path/to/repo
 ```
 
+### Query Codex conversation history
+```sql
+SELECT
+  thread.cwd,
+  message.role,
+  message.text,
+  message.timestamp
+FROM codex_messages AS message
+JOIN codex_threads AS thread
+  ON thread.thread_id = message.thread_id
+WHERE message.is_canonical = 1
+  AND message.text LIKE '%auth callback%'
+ORDER BY message.timestamp DESC;
+```
+
 ### File context and impact
 ```bash
 devsql context src/engine.rs
@@ -187,8 +209,18 @@ devsql history src/engine.rs
 
 - `history.timestamp` is in epoch milliseconds. Use `datetime(timestamp/1000, 'unixepoch')` to convert.
 - A custom `DATE()` function normalizes epoch ms, epoch seconds, and ISO strings.
-- Tables are loaded lazily — only those referenced in your query are populated.
+- Tables are loaded lazily; only those referenced in your query are populated.
 - The `symbols` table extracts functions, structs, enums, traits, types, classes, interfaces, and more depending on language.
+
+### Codex journal indexing and privacy
+
+- DevSQL reads canonical Codex journals from `$CODEX_HOME`, falling back to `~/.codex`. It reads active and archived `.jsonl` and `.jsonl.zst` journals; it does not query Codex's catalog, history, goals, memories, logs, credentials, attachments, generated images, or shell snapshots.
+- The versioned Codex index lives under the platform cache directory at `devsql/codex-index/<CODEX_HOME-hash>.sqlite`. Its first build parses the complete journal corpus and the derived cache can be as large as, or larger than, the source files. Later loads use file metadata to skip unchanged journals and read only appended records from growing plain journals.
+- A journal's own `payload.id` is its thread ID. For subagent journals, `payload.session_id` and `source.subagent.thread_spawn.parent_thread_id` identify the parent and are stored as lineage instead of collapsing the child into the parent.
+- The index is rebuildable and removes derived rows after source journals disappear. Schema changes automatically replace the disposable cache.
+- DevSQL creates the cache directory with mode `0700` and cache files with mode `0600` on Unix. The cache still contains conversation text, tool arguments, commands, and tool output, so protect it like the source journals.
+- Explicit SQL returns indexed content as stored. `recall` and `gather` redact common authorization values, API keys, access and refresh tokens, passwords, cookies, known token prefixes, and sensitive URL values before rendering automatic context.
+- DevSQL records encrypted reasoning only as event metadata. It does not decrypt or index reasoning content.
 
 ## License
 

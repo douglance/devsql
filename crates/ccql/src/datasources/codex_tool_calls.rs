@@ -37,9 +37,13 @@ pub fn extract_session_meta(json: &Value) -> Option<CodexSessionMeta> {
     Some(CodexSessionMeta {
         session_id: payload
             .get("session_id")
+            .or_else(|| payload.get("id"))
             .and_then(|v| v.as_str())
             .map(String::from),
-        cwd: payload.get("cwd").and_then(|v| v.as_str()).map(String::from),
+        cwd: payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     })
 }
 
@@ -92,7 +96,10 @@ pub fn extract_codex_tool_call(json: &Value) -> Option<CodexToolCallRow> {
 /// calls; other tool names have no `cmd` value.
 fn extract_cmd(tool_name: &str, arguments: &Value) -> Option<String> {
     match tool_name {
-        "exec_command" => arguments.get("cmd").and_then(|c| c.as_str()).map(String::from),
+        "exec_command" => arguments
+            .get("cmd")
+            .and_then(|c| c.as_str())
+            .map(String::from),
         "shell" => match arguments.get("command") {
             Some(Value::String(s)) => Some(s.clone()),
             Some(Value::Array(items)) => {
@@ -173,6 +180,20 @@ mod tests {
 
         let non_meta = serde_json::json!({"type": "response_item"});
         assert!(extract_session_meta(&non_meta).is_none());
+    }
+
+    #[test]
+    fn extracts_legacy_session_id_from_id_field() {
+        let line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "legacy-thread-id",
+                "cwd": "/repo"
+            }
+        });
+
+        let meta = extract_session_meta(&line).expect("session_meta");
+        assert_eq!(meta.session_id.as_deref(), Some("legacy-thread-id"));
     }
 
     #[test]
@@ -270,7 +291,11 @@ mod tests {
             }
         }
 
-        assert_eq!(rows.len(), 2, "2 function_call lines; the message line yields none");
+        assert_eq!(
+            rows.len(),
+            2,
+            "2 function_call lines; the message line yields none"
+        );
 
         let (wait_call, wait_session, wait_cwd) = &rows[0];
         assert_eq!(wait_call.tool_name, "wait");

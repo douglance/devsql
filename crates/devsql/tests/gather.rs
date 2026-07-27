@@ -15,6 +15,24 @@ fn isolated_codex_home() -> TempDir {
     TempDir::new().expect("temp")
 }
 
+fn populated_codex_home() -> TempDir {
+    let temp = TempDir::new().expect("temp");
+    write(
+        &temp
+            .path()
+            .join("sessions/2026/07/27/rollout-gather-codex.jsonl"),
+        &format!(
+            concat!(
+                "{{\"timestamp\":\"2026-07-27T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"gather-codex\",\"cwd\":\"/repo\",\"thread_source\":\"user\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-27T10:00:01Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"investigate {term} password=hunter2\"}}]}}}}\n",
+                "{{\"timestamp\":\"2026-07-27T10:00:02Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-gather\",\"arguments\":\"{{\\\"cmd\\\":\\\"echo {term} Authorization: Bearer abc.def.ghi\\\"}}\"}}}}\n"
+            ),
+            term = TERM
+        ),
+    );
+    temp
+}
+
 fn write(path: &std::path::Path, contents: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
     std::fs::write(path, contents).expect("write");
@@ -63,13 +81,13 @@ fn create_git_repo() -> TempDir {
 
     write(
         &temp.path().join("lib.rs"),
-        &format!("// fixture for {TERM}\nfn find_{TERM}() {{\n    println!(\"{TERM} handler\");\n}}\n"),
+        &format!(
+            "// fixture for {TERM}\nfn find_{TERM}() {{\n    println!(\"{TERM} handler\");\n}}\n"
+        ),
     );
 
     let mut index = repo.index().expect("index");
-    index
-        .add_path(std::path::Path::new("lib.rs"))
-        .expect("add");
+    index.add_path(std::path::Path::new("lib.rs")).expect("add");
     index.write().expect("write index");
     let tree_id = index.write_tree().expect("write tree");
     let tree = repo.find_tree(tree_id).expect("find tree");
@@ -192,13 +210,13 @@ fn gather_survives_one_failing_section() {
     assert_eq!(parsed["repo_state"]["rows"], serde_json::json!([]));
 
     // The other sections still ran and returned real data.
-    assert!(parsed["prior_work"]["note"].is_null());
+    assert!(parsed["prior_work"]["note"].is_null(), "{parsed}");
     assert!(parsed["prior_work"]["rows"]
         .as_array()
         .expect("rows array")
         .iter()
         .any(|r| r["text"].as_str().unwrap_or("").contains(TERM)));
-    assert!(parsed["activity"]["note"].is_null());
+    assert!(parsed["activity"]["note"].is_null(), "{parsed}");
     assert!(parsed["code_search"].get("rows").is_some());
     assert!(parsed["symbols"].get("rows").is_some());
     assert!(parsed["excerpts"].get("rows").is_some());
@@ -301,4 +319,51 @@ fn gather_empty_terms_still_returns_sections() {
         .success()
         .stdout(predicate::str::contains("\"prior_work\""))
         .stdout(predicate::str::contains("\"repo_state\""));
+}
+
+#[test]
+fn gather_includes_redacted_codex_threads_and_activity() {
+    let claude = TempDir::new().expect("claude");
+    let repo = create_empty_git_repo();
+    let codex_home = populated_codex_home();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex_home.path())
+        .args([
+            "gather",
+            TERM,
+            "--data-dir",
+            claude.path().to_str().unwrap(),
+            "-r",
+            repo.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--budget",
+            "100000",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: Value = serde_json::from_slice(&output).expect("valid json");
+    let prior = parsed["prior_work"]["rows"].as_array().expect("prior rows");
+    let thread = prior
+        .iter()
+        .find(|row| row["kind"] == "codex_thread")
+        .expect("codex thread");
+    assert!(thread["text"].as_str().unwrap().contains(TERM));
+    assert!(thread["text"].as_str().unwrap().contains("<redacted>"));
+    assert!(!thread["text"].as_str().unwrap().contains("hunter2"));
+
+    let activity = parsed["activity"]["rows"]
+        .as_array()
+        .expect("activity rows");
+    let call = activity
+        .iter()
+        .find(|row| row["kind"] == "codex_tool")
+        .expect("codex tool");
+    assert!(call["cmd"].as_str().unwrap().contains("Bearer <redacted>"));
+    assert!(!call["cmd"].as_str().unwrap().contains("abc.def.ghi"));
 }

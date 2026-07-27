@@ -92,6 +92,7 @@ impl CommandHandler for RecallHandler {
                 data: json!({
                     "terms": terms,
                     "sessions": Value::Array(vec![]),
+                    "codex_threads": Value::Array(vec![]),
                     "commits": Value::Array(vec![]),
                     "prompts": Value::Array(vec![]),
                     "total": 0,
@@ -105,7 +106,9 @@ impl CommandHandler for RecallHandler {
             Err(e) => return e,
         };
 
-        if let Err(e) = engine.load_claude_tables(&["sessions", "history"]) {
+        if let Err(e) =
+            engine.load_claude_tables(&["sessions", "history", "codex_threads", "codex_messages"])
+        {
             return CommandResult::Error {
                 code: "LOAD_ERROR".into(),
                 message: format!("Failed to load claude tables: {e}"),
@@ -139,6 +142,45 @@ impl CommandHandler for RecallHandler {
             Ok(rows) => rows,
             Err(e) => return query_error("Sessions", e),
         };
+
+        let codex_score = score_expr("message.text", &terms);
+        let codex_sql = format!(
+            "WITH ranked AS (
+               SELECT message.thread_id,
+                      substr(COALESCE(message.timestamp, thread.last_event_at), 1, 10) AS date,
+                      thread.cwd,
+                      message.role,
+                      substr(replace(message.text, char(10), ' '), 1, 200) AS excerpt,
+                      thread.state,
+                      {score} AS score,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY message.thread_id
+                        ORDER BY {score} DESC, message.timestamp DESC
+                      ) AS rank
+               FROM codex_messages AS message
+               JOIN codex_threads AS thread
+                 ON thread.thread_id = message.thread_id
+               WHERE message.is_canonical = 1 AND {matches}
+             )
+             SELECT thread_id, date, cwd, role, excerpt, state, score
+             FROM ranked
+             WHERE rank = 1
+             ORDER BY score DESC, date DESC
+             LIMIT {limit}",
+            score = codex_score,
+            matches = match_expr("message.text", &terms),
+        );
+        let mut codex_threads = match engine.query(&codex_sql) {
+            Ok(rows) => rows,
+            Err(e) => return query_error("Codex threads", e),
+        };
+        for thread in &mut codex_threads {
+            if let Some(excerpt) = thread.get_mut("excerpt") {
+                if let Some(text) = excerpt.as_str() {
+                    *excerpt = Value::String(crate::redaction::redact_sensitive_text(text));
+                }
+            }
+        }
 
         // commits (scoped to repo)
         let commit_expr = "(summary || ' ' || coalesce(message, ''))";
@@ -174,12 +216,13 @@ impl CommandHandler for RecallHandler {
             Err(e) => return query_error("Prompts", e),
         };
 
-        let total = sessions.len() + commits.len() + prompts.len();
+        let total = sessions.len() + codex_threads.len() + commits.len() + prompts.len();
 
         CommandResult::Ok {
             data: json!({
                 "terms": terms,
                 "sessions": Value::Array(sessions),
+                "codex_threads": Value::Array(codex_threads),
                 "commits": Value::Array(commits),
                 "prompts": Value::Array(prompts),
                 "total": total,
@@ -206,7 +249,7 @@ fn query_error(source: &str, e: crate::Error) -> CommandResult {
 pub fn build() -> CommandDef {
     CommandDef::build("recall", RecallHandler)
         .description(
-            "Load prior work (sessions, commits, prompts) relevant to search terms, \
+            "Load prior work (Claude sessions, Codex threads, commits, prompts) relevant to search terms, \
              ranked by term-match count then recency",
         )
         .args::<RecallArgs>()

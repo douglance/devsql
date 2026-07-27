@@ -16,13 +16,22 @@ pub struct UnifiedEngine {
     claude_data_dir: PathBuf,
     codex_data_dir: PathBuf,
     git_repo_path: PathBuf,
+    codex_loaded: bool,
 }
 
 impl UnifiedEngine {
     /// Create a new unified engine
     pub fn new(claude_data_dir: PathBuf, git_repo_path: PathBuf) -> Result<Self> {
+        Self::new_with_codex_data_dir(claude_data_dir, git_repo_path, default_codex_data_dir())
+    }
+
+    /// Create a unified engine with an explicit Codex data directory.
+    pub fn new_with_codex_data_dir(
+        claude_data_dir: PathBuf,
+        git_repo_path: PathBuf,
+        codex_data_dir: PathBuf,
+    ) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let codex_data_dir = default_codex_data_dir();
 
         // Register custom DATE function that handles both epoch ms and ISO dates
         conn.create_scalar_function(
@@ -40,6 +49,7 @@ impl UnifiedEngine {
             claude_data_dir,
             codex_data_dir,
             git_repo_path,
+            codex_loaded: false,
         })
     }
 
@@ -54,6 +64,12 @@ impl UnifiedEngine {
                 "todos" => self.load_todos()?,
                 "tool_calls" => self.load_tool_calls()?,
                 "codex_tool_calls" => self.load_codex_tool_calls()?,
+                "codex_threads"
+                | "codex_events"
+                | "codex_messages"
+                | "codex_tool_executions"
+                | "codex_compactions"
+                | "codex_ingest_errors" => self.load_codex_tables()?,
                 _ => {}
             }
         }
@@ -317,67 +333,52 @@ impl UnifiedEngine {
     }
 
     fn load_codex_tool_calls(&mut self) -> Result<()> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS codex_tool_calls (
-                rowid INTEGER PRIMARY KEY,
-                tool_name TEXT,
-                arguments_json TEXT,
-                cmd TEXT,
-                session_id TEXT,
-                cwd TEXT,
-                timestamp TEXT
-            )",
-            [],
-        )?;
+        self.load_codex_tables()
+    }
 
-        let sessions_dir = self.codex_data_dir.join("sessions");
-
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO codex_tool_calls (tool_name, arguments_json, cmd, session_id, cwd, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
-
-            for path in ccql::datasources::codex_tool_calls::discover_codex_session_files(&sessions_dir) {
-                let content = match std::fs::read_to_string(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                let mut session_id: Option<String> = None;
-                let mut cwd: Option<String> = None;
-
-                for line in content.lines() {
-                    let Ok(entry) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
-                    if let Some(meta) =
-                        ccql::datasources::codex_tool_calls::extract_session_meta(&entry)
-                    {
-                        session_id = meta.session_id.or(session_id);
-                        cwd = meta.cwd.or(cwd);
-                        continue;
-                    }
-
-                    if let Some(call) =
-                        ccql::datasources::codex_tool_calls::extract_codex_tool_call(&entry)
-                    {
-                        stmt.execute(params![
-                            call.tool_name,
-                            call.arguments_json,
-                            call.cmd,
-                            session_id,
-                            cwd,
-                            call.timestamp,
-                        ])?;
-                    }
-                }
-            }
+    fn load_codex_tables(&mut self) -> Result<()> {
+        if self.codex_loaded {
+            return Ok(());
         }
-        tx.commit()?;
+        let mut index = crate::codex_index::CodexIndex::open(&self.codex_data_dir)?;
+        index.sync()?;
+        let cache_path = index.cache_path().to_string_lossy().into_owned();
+        drop(index);
 
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS codex_index", [cache_path])?;
+        self.conn.execute_batch(
+            "
+            CREATE TEMP VIEW codex_threads AS
+              SELECT * FROM codex_index.codex_threads;
+            CREATE TEMP VIEW codex_events AS
+              SELECT * FROM codex_index.codex_events;
+            CREATE TEMP VIEW codex_messages AS
+              SELECT * FROM codex_index.codex_messages;
+            CREATE TEMP VIEW codex_tool_executions AS
+              SELECT * FROM codex_index.codex_tool_executions;
+            CREATE TEMP VIEW codex_compactions AS
+              SELECT * FROM codex_index.codex_compactions;
+            CREATE TEMP VIEW codex_ingest_errors AS
+              SELECT * FROM codex_index.codex_ingest_errors;
+            CREATE TEMP VIEW codex_tool_calls AS
+              SELECT
+                row_number() OVER (
+                  ORDER BY execution.thread_id, execution.call_record_index
+                ) AS rowid,
+                execution.tool_name,
+                execution.arguments_json,
+                execution.cmd,
+                execution.thread_id AS session_id,
+                COALESCE(execution.cwd, thread.cwd) AS cwd,
+                execution.called_at AS timestamp
+              FROM codex_index.codex_tool_executions AS execution
+              LEFT JOIN codex_index.codex_threads AS thread
+                ON thread.thread_id = execution.thread_id
+              WHERE execution.call_record_index IS NOT NULL;
+            ",
+        )?;
+        self.codex_loaded = true;
         Ok(())
     }
 
@@ -902,6 +903,12 @@ pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         "stats",
         "tool_calls",
         "codex_tool_calls",
+        "codex_threads",
+        "codex_events",
+        "codex_messages",
+        "codex_tool_executions",
+        "codex_compactions",
+        "codex_ingest_errors",
     ];
     let git_tables = [
         "commits",
@@ -954,6 +961,7 @@ pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn detect_tables_handles_jhistory_without_history_false_positive() {
@@ -1095,5 +1103,97 @@ mod tests {
         assert_eq!(rich["assistant_message_count"], serde_json::json!(1));
         assert_eq!(rich["total_input_tokens"], serde_json::json!(6));
         assert_eq!(rich["total_output_tokens"], serde_json::json!(127));
+    }
+
+    #[test]
+    fn codex_tool_calls_include_archived_compressed_journals() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        let journal = codex_home
+            .join("archived_sessions")
+            .join("rollout-thread-z.jsonl.zst");
+        std::fs::create_dir_all(journal.parent().expect("parent")).expect("mkdir");
+        let output = std::fs::File::create(&journal).expect("create");
+        let mut encoder = zstd::stream::write::Encoder::new(output, 0).expect("encoder");
+        encoder
+            .write_all(
+                concat!(
+                    "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-z\",\"cwd\":\"/repo\"}}\n",
+                    "{\"timestamp\":\"2026-07-27T10:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"zstd history\"}]}}\n",
+                    "{\"timestamp\":\"2026-07-27T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-z\",\"arguments\":\"{\\\"cmd\\\":\\\"cargo test\\\"}\"}}\n",
+                    "{\"timestamp\":\"2026-07-27T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-z\",\"output\":\"ok\"}}\n",
+                    "{\"timestamp\":\"2026-07-27T10:00:03Z\",\"type\":\"compacted\",\"payload\":{\"window_id\":\"w2\",\"message\":\"zstd summary\"}}\n",
+                    "not-json\n"
+                )
+                .as_bytes(),
+            )
+            .expect("write");
+        encoder.finish().expect("finish");
+        let mut engine = UnifiedEngine::new_with_codex_data_dir(
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+            codex_home,
+        )
+        .expect("engine");
+
+        engine
+            .load_claude_tables(&["codex_tool_calls"])
+            .expect("load");
+        let rows = engine
+            .query(
+                "SELECT tool_name, cmd, session_id, cwd
+                 FROM codex_tool_calls",
+            )
+            .expect("query");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tool_name"], serde_json::json!("exec_command"));
+        assert_eq!(rows[0]["cmd"], serde_json::json!("cargo test"));
+        assert_eq!(rows[0]["session_id"], serde_json::json!("thread-z"));
+        assert_eq!(rows[0]["cwd"], serde_json::json!("/repo"));
+
+        let thread = engine
+            .query(
+                "SELECT state, compressed, event_count, user_message_count,
+                        tool_call_count, compaction_count
+                 FROM codex_threads WHERE thread_id = 'thread-z'",
+            )
+            .expect("thread");
+        assert_eq!(thread[0]["state"], serde_json::json!("archived"));
+        assert_eq!(thread[0]["compressed"], serde_json::json!(1));
+        assert_eq!(thread[0]["event_count"], serde_json::json!(6));
+        assert_eq!(thread[0]["user_message_count"], serde_json::json!(1));
+        assert_eq!(thread[0]["tool_call_count"], serde_json::json!(1));
+        assert_eq!(thread[0]["compaction_count"], serde_json::json!(1));
+
+        let message = engine
+            .query("SELECT role, text, is_canonical FROM codex_messages")
+            .expect("messages");
+        assert_eq!(message[0]["role"], serde_json::json!("user"));
+        assert_eq!(message[0]["text"], serde_json::json!("zstd history"));
+        assert_eq!(message[0]["is_canonical"], serde_json::json!(1));
+
+        let execution = engine
+            .query(
+                "SELECT tool_name, cmd, output_text
+                 FROM codex_tool_executions",
+            )
+            .expect("execution");
+        assert_eq!(execution[0]["output_text"], serde_json::json!("ok"));
+
+        let compaction = engine
+            .query("SELECT window_id, summary_text FROM codex_compactions")
+            .expect("compaction");
+        assert_eq!(compaction[0]["window_id"], serde_json::json!("w2"));
+        assert_eq!(
+            compaction[0]["summary_text"],
+            serde_json::json!("zstd summary")
+        );
+
+        let errors = engine
+            .query("SELECT error_kind FROM codex_ingest_errors")
+            .expect("errors");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["error_kind"], serde_json::json!("json"));
     }
 }

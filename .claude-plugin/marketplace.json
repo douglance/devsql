@@ -9,7 +9,7 @@
       "name": "devsql",
       "source": "./plugin",
       "description": "Query your Claude Code history with SQL. Analyze conversations, commits, and productivity patterns.",
-      "version": "0.3.0",
+      "version": "0.3.2",
       "author": {
         "name": "Doug Lance"
       }

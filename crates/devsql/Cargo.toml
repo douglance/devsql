@@ -11,8 +11,8 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Workspace crates
-ccql = { path = "../ccql", version = "0.3.0" }
-vcsql = { path = "../vcsql", version = "0.3.0" }
+ccql = { path = "../ccql", version = "0.3.2" }
+vcsql = { path = "../vcsql", version = "0.3.2" }
 
 # SQL engine - SQLite for unified queries
 rusqlite.workspace = true
@@ -42,6 +42,7 @@ dirs = "5.0"
 walkdir.workspace = true
 ignore.workspace = true
 regex.workspace = true
+sha2.workspace = true
 
 # Token counting for `gather`'s budget enforcement (same BPE incurs uses for
 # its own --token-count/--token-limit flags)
@@ -60,6 +61,7 @@ streaming-iterator = { workspace = true, optional = true }
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+zstd.workspace = true
 
 [features]
 tree-sitter-ast = [

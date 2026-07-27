@@ -4,9 +4,11 @@
 //! unified query interface, enabling cross-database joins to analyze
 //! developer productivity patterns.
 
+mod codex_index;
 pub mod engine;
 pub mod error;
 pub mod providers;
+mod redaction;
 pub mod tools;
 
 pub use engine::UnifiedEngine;

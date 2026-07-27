@@ -1,4 +1,5 @@
 pub mod codex_history;
+pub mod codex_journal;
 pub mod codex_tool_calls;
 pub mod history;
 pub mod stats;

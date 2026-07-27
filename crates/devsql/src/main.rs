@@ -111,7 +111,7 @@ impl CommandHandler for SqlHandler {
         if let Err(e) = engine.load_claude_tables(&claude_refs) {
             return CommandResult::Error {
                 code: "LOAD_ERROR".to_string(),
-                message: format!("Failed to load Claude tables: {e}"),
+                message: format!("Failed to load AI history tables: {e}"),
                 retryable: false,
                 exit_code: Some(1),
                 cta: None,
@@ -187,11 +187,17 @@ fn build_cli() -> Cli {
                         command: r#""SELECT datetime(timestamp/1000, 'unixepoch') as time, display FROM jhistory ORDER BY timestamp DESC LIMIT 10""#.to_string(),
                         description: Some("Recent Codex prompts".to_string()),
                     },
+                    Example {
+                        command: r#""SELECT thread_id, cwd, last_event_at FROM codex_threads ORDER BY last_event_at DESC LIMIT 10""#.to_string(),
+                        description: Some("Recent Codex conversations".to_string()),
+                    },
                 ])
                 .hint(
                     "TABLES:\n  \
                      Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  \
-                     Codex CLI:    jhistory / codex_history (session_id, ts, text, display, timestamp)\n  \
+                     Codex CLI:    jhistory / codex_history, codex_threads, codex_messages,\n                 \
+                                   codex_events, codex_tool_executions / codex_tool_calls,\n                 \
+                                   codex_compactions, codex_ingest_errors\n  \
                      Git:          commits, diffs, diff_files, branches\n\n\
                      TELL YOUR AI AGENT:\n  \
                      \"Use devsql to find my most effective prompts from the past month\"\n  \

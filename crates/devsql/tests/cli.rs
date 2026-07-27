@@ -48,11 +48,27 @@ fn create_claude_data_dir() -> TempDir {
     temp
 }
 
+fn create_codex_data_dir() -> TempDir {
+    let temp = TempDir::new().expect("temp");
+    write(
+        &temp
+            .path()
+            .join("sessions/2026/07/27/rollout-codex-recall.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-07-27T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-recall\",\"cwd\":\"/Users/test/Developer/app\",\"thread_source\":\"user\"}}\n",
+            "{\"timestamp\":\"2026-07-27T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"debug auth callback Authorization: Bearer abc.def.ghi\"}]}}\n"
+        ),
+    );
+    temp
+}
+
 #[test]
 fn recall_surfaces_matching_fixture() {
     let data = create_claude_data_dir();
+    let codex_home = TempDir::new().expect("codex");
 
     Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex_home.path())
         .args([
             "recall",
             "vision",
@@ -70,8 +86,10 @@ fn recall_surfaces_matching_fixture() {
 #[test]
 fn recall_ranks_more_matches_first() {
     let data = create_claude_data_dir();
+    let codex_home = TempDir::new().expect("codex");
 
     let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex_home.path())
         .args([
             "recall",
             "vision simulator",
@@ -110,8 +128,10 @@ fn recall_ranks_more_matches_first() {
 #[test]
 fn recall_empty_terms_exit_zero() {
     let data = create_claude_data_dir();
+    let codex_home = TempDir::new().expect("codex");
 
     Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex_home.path())
         .args([
             "recall",
             "a",
@@ -123,4 +143,38 @@ fn recall_empty_terms_exit_zero() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"total\": 0"));
+}
+
+#[test]
+fn recall_returns_ranked_redacted_codex_threads() {
+    let claude = TempDir::new().expect("claude");
+    let codex_home = create_codex_data_dir();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex_home.path())
+        .args([
+            "recall",
+            "auth callback",
+            "--data-dir",
+            claude.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: Value = serde_json::from_slice(&output).expect("valid json");
+    let threads = parsed["codex_threads"]
+        .as_array()
+        .expect("codex_threads array");
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["thread_id"], serde_json::json!("codex-recall"));
+    assert_eq!(threads[0]["score"], serde_json::json!(2));
+    let excerpt = threads[0]["excerpt"].as_str().expect("excerpt");
+    assert!(excerpt.contains("debug auth callback"));
+    assert!(excerpt.contains("Bearer <redacted>"));
+    assert!(!excerpt.contains("abc.def.ghi"));
 }

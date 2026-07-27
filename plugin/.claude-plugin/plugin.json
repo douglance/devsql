@@ -1,6 +1,6 @@
 {
   "name": "devsql",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Query your Claude Code history with SQL. Analyze conversations, commits, and productivity patterns.",
   "author": {
     "name": "Doug Lance",
