@@ -79,6 +79,11 @@ impl UnifiedEngine {
         crate::providers::load_all_code_tables(&self.conn, &self.git_repo_path, tables)
     }
 
+    /// Load the normalized Atuin, zsh, and bash history table.
+    pub fn load_shell_history(&mut self) -> Result<()> {
+        crate::providers::shell_history::load(&mut self.conn)
+    }
+
     /// Access the underlying SQLite connection. Used by `gather` to
     /// materialize section results as `gather_<section>` tables in the
     /// connection used for rendering.
@@ -888,8 +893,8 @@ fn query_mentions_table(query_upper: &str, table_name: &str) -> bool {
 
 /// Detect which tables are needed from a SQL query.
 ///
-/// Returns a 3-tuple: (claude_tables, git_tables, code_tables).
-pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+/// Returns a 4-tuple: (claude_tables, git_tables, code_tables, shell_tables).
+pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     let query_upper = query.to_uppercase();
 
     let claude_tables = [
@@ -929,6 +934,7 @@ pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         "imports",
         "ast_nodes",
     ];
+    let shell_tables = ["shell_history"];
 
     let needed_claude: Vec<String> = claude_tables
         .iter()
@@ -948,7 +954,13 @@ pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         .map(|s| s.to_string())
         .collect();
 
-    (needed_claude, needed_git, needed_code)
+    let needed_shell: Vec<String> = shell_tables
+        .iter()
+        .filter(|t| query_mentions_table(&query_upper, t))
+        .map(|s| s.to_string())
+        .collect();
+
+    (needed_claude, needed_git, needed_code, needed_shell)
 }
 
 #[cfg(test)]
@@ -957,7 +969,7 @@ mod tests {
 
     #[test]
     fn detect_tables_handles_jhistory_without_history_false_positive() {
-        let (claude, _, _) = detect_tables("SELECT session_id, text FROM jhistory LIMIT 5");
+        let (claude, _, _, _) = detect_tables("SELECT session_id, text FROM jhistory LIMIT 5");
 
         assert!(claude.contains(&"jhistory".to_string()));
         assert!(!claude.contains(&"history".to_string()));
@@ -965,7 +977,7 @@ mod tests {
 
     #[test]
     fn detect_tables_handles_codex_history_without_history_false_positive() {
-        let (claude, _, _) = detect_tables("SELECT session_id, text FROM codex_history LIMIT 5");
+        let (claude, _, _, _) = detect_tables("SELECT session_id, text FROM codex_history LIMIT 5");
 
         assert!(claude.contains(&"codex_history".to_string()));
         assert!(!claude.contains(&"history".to_string()));
@@ -973,13 +985,21 @@ mod tests {
 
     #[test]
     fn detect_tables_finds_code_tables() {
-        let (_, _, code) = detect_tables(
+        let (_, _, code, _) = detect_tables(
             "SELECT * FROM source_files JOIN symbols ON source_files.path = symbols.file_path",
         );
 
         assert!(code.contains(&"source_files".to_string()));
         assert!(code.contains(&"symbols".to_string()));
         assert!(!code.contains(&"source_lines".to_string()));
+    }
+
+    #[test]
+    fn detect_tables_finds_shell_history_without_history_false_positive() {
+        let (claude, _, _, shell) = detect_tables("SELECT command FROM shell_history LIMIT 5");
+
+        assert_eq!(shell, vec!["shell_history".to_string()]);
+        assert!(!claude.contains(&"history".to_string()));
     }
 
     #[test]

@@ -430,8 +430,7 @@ fn section_prior_work(claude_dir: &Path, repo_path: &Path, terms: &[String], lim
     SectionResult::ok(rows)
 }
 
-/// 2. repo_state -- branch, ahead/behind, dirty files, working-diff stats,
-/// last 10 commits.
+/// 2. repo_state -- branch, ahead/behind, dirty files, working-diff stats, and last 10 commits.
 fn section_repo_state(repo_path: &Path) -> SectionResult {
     let repo = match git2::Repository::open(repo_path) {
         Ok(r) => r,
@@ -505,8 +504,7 @@ fn section_repo_state(repo_path: &Path) -> SectionResult {
     SectionResult::ok(rows)
 }
 
-/// 3. code_search -- term hits from `source_lines`, ranked by match count
-/// per file.
+/// 3. code_search -- term hits from `source_lines`, ranked by match count per file.
 fn section_code_search(claude_dir: &Path, repo_path: &Path, terms: &[String], limit: i64) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
@@ -559,8 +557,7 @@ fn section_symbols(claude_dir: &Path, repo_path: &Path, terms: &[String], limit:
     }
 }
 
-/// 5. excerpts -- top-5 files by match count, with matched line ranges
-/// (+/-3 lines) from `source_lines`.
+/// 5. excerpts -- top-5 files by match count, with matched line ranges from `source_lines`.
 fn section_excerpts(claude_dir: &Path, repo_path: &Path, terms: &[String]) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
@@ -637,8 +634,7 @@ fn section_excerpts(claude_dir: &Path, repo_path: &Path, terms: &[String]) -> Se
     SectionResult::ok(rows)
 }
 
-/// 6. activity -- open todos matching terms, plus top tools/commands from
-/// `tool_calls` and `codex_tool_calls` whose target/cmd matches the terms.
+/// 6. activity -- open todos, tool calls, and shell commands matching terms.
 fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit: i64) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
@@ -650,6 +646,9 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
     };
     if let Err(e) = engine.load_claude_tables(&["todos", "tool_calls", "codex_tool_calls"]) {
         return SectionResult::err(format!("failed to load activity tables: {e}"));
+    }
+    if let Err(e) = engine.load_shell_history() {
+        return SectionResult::err(format!("failed to load shell history: {e}"));
     }
 
     let mut rows = Vec::new();
@@ -682,6 +681,22 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
     match engine.query(&codex_sql) {
         Ok(r) => rows.extend(r),
         Err(e) => return SectionResult::err(format!("codex_tool_calls query failed: {e}")),
+    }
+
+    let command_expr = "(command || ' ' || coalesce(cwd, ''))";
+    let shell_sql = format!(
+        "SELECT 'shell_command' AS kind, source AS text, command, cwd, exit_code, \
+                timestamp, {score} AS score \
+         FROM shell_history \
+         WHERE {matches} \
+         ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
+         LIMIT {limit}",
+        score = score_expr(command_expr, terms),
+        matches = match_expr(command_expr, terms),
+    );
+    match engine.query(&shell_sql) {
+        Ok(r) => rows.extend(r),
+        Err(e) => return SectionResult::err(format!("shell_history query failed: {e}")),
     }
 
     SectionResult::ok(rows)

@@ -1,4 +1,4 @@
-//! DevSQL CLI - Unified SQL queries across Claude/Codex + Git data
+//! DevSQL CLI - Unified SQL queries across developer-local data
 //!
 //! Built on the incurs framework, giving devsql all built-in CLI features:
 //! --help, --version, --llms, --llms-full, --mcp, --json, --csv, --table,
@@ -103,7 +103,7 @@ impl CommandHandler for SqlHandler {
             }
         };
 
-        let (claude_tables, git_tables, code_tables) = detect_tables(&query);
+        let (claude_tables, git_tables, code_tables, shell_tables) = detect_tables(&query);
         let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
         let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
         let code_refs: Vec<&str> = code_tables.iter().map(|s| s.as_str()).collect();
@@ -135,6 +135,17 @@ impl CommandHandler for SqlHandler {
                 cta: None,
             };
         }
+        if !shell_tables.is_empty() {
+            if let Err(e) = engine.load_shell_history() {
+                return CommandResult::Error {
+                    code: "LOAD_ERROR".to_string(),
+                    message: format!("Failed to load shell-history tables: {e}"),
+                    retryable: false,
+                    exit_code: Some(1),
+                    cta: None,
+                };
+            }
+        }
 
         match engine.query(&query) {
             Ok(results) => CommandResult::Ok {
@@ -159,15 +170,14 @@ impl CommandHandler for SqlHandler {
 fn build_cli() -> Cli {
     Cli::create("devsql")
         .description(
-            "Query your AI coding history to become a better prompter.\n\n\
-             Join Claude/Codex conversations with Git commits to find your most productive\n\
-             prompts, identify struggle sessions, and learn what actually works for you.",
+            "Query AI coding, Git, source code, and shell history with SQL.\n\n\
+             Join developer-local data to recall prior work and understand how changes were made.",
         )
         .version(env!("CARGO_PKG_VERSION"))
         .format(Format::Table)
         .root(
             CommandDef::build("devsql", SqlHandler)
-                .description("Execute a SQL query against your Claude/Codex + Git data")
+                .description("Execute a SQL query against developer-local data")
                 .args::<QueryArgs>()
                 .options::<QueryOptions>()
                 .examples(vec![
@@ -187,12 +197,17 @@ fn build_cli() -> Cli {
                         command: r#""SELECT datetime(timestamp/1000, 'unixepoch') as time, display FROM jhistory ORDER BY timestamp DESC LIMIT 10""#.to_string(),
                         description: Some("Recent Codex prompts".to_string()),
                     },
+                    Example {
+                        command: r#""SELECT source, timestamp, command FROM shell_history ORDER BY timestamp DESC LIMIT 10""#.to_string(),
+                        description: Some("Recent Atuin, zsh, and bash commands".to_string()),
+                    },
                 ])
                 .hint(
                     "TABLES:\n  \
                      Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  \
                      Codex CLI:    jhistory / codex_history (session_id, ts, text, display, timestamp)\n  \
                      Git:          commits, diffs, diff_files, branches\n\n\
+                     Shell:        shell_history (Atuin, zsh, bash)\n\n\
                      TELL YOUR AI AGENT:\n  \
                      \"Use devsql to find my most effective prompts from the past month\"\n  \
                      \"Query my history to find when I struggled most\"\n  \

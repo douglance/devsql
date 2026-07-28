@@ -9,6 +9,7 @@ use crate::Result;
 pub mod ast_nodes;
 #[cfg(feature = "tree-sitter-ast")]
 pub mod imports;
+pub mod shell_history;
 pub mod source_files;
 pub mod source_lines;
 pub mod symbols;

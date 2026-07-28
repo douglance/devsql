@@ -94,6 +94,7 @@ impl CommandHandler for RecallHandler {
                     "sessions": Value::Array(vec![]),
                     "commits": Value::Array(vec![]),
                     "prompts": Value::Array(vec![]),
+                    "commands": Value::Array(vec![]),
                     "total": 0,
                 }),
                 cta: None,
@@ -118,6 +119,15 @@ impl CommandHandler for RecallHandler {
             return CommandResult::Error {
                 code: "LOAD_ERROR".into(),
                 message: format!("Failed to load git tables: {e}"),
+                retryable: false,
+                exit_code: Some(1),
+                cta: None,
+            };
+        }
+        if let Err(e) = engine.load_shell_history() {
+            return CommandResult::Error {
+                code: "LOAD_ERROR".into(),
+                message: format!("Failed to load shell history: {e}"),
                 retryable: false,
                 exit_code: Some(1),
                 cta: None,
@@ -174,7 +184,24 @@ impl CommandHandler for RecallHandler {
             Err(e) => return query_error("Prompts", e),
         };
 
-        let total = sessions.len() + commits.len() + prompts.len();
+        // shell commands (Atuin, zsh, and bash)
+        let command_expr = "(command || ' ' || coalesce(cwd, ''))";
+        let commands_sql = format!(
+            "SELECT source, command, substr(timestamp, 1, 10) AS date, cwd, \
+                    exit_code, {score} AS score \
+             FROM shell_history \
+             WHERE {matches} \
+             ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
+             LIMIT {limit}",
+            score = score_expr(command_expr, &terms),
+            matches = match_expr(command_expr, &terms),
+        );
+        let commands = match engine.query(&commands_sql) {
+            Ok(rows) => rows,
+            Err(e) => return query_error("Shell commands", e),
+        };
+
+        let total = sessions.len() + commits.len() + prompts.len() + commands.len();
 
         CommandResult::Ok {
             data: json!({
@@ -182,6 +209,7 @@ impl CommandHandler for RecallHandler {
                 "sessions": Value::Array(sessions),
                 "commits": Value::Array(commits),
                 "prompts": Value::Array(prompts),
+                "commands": Value::Array(commands),
                 "total": total,
             }),
             cta: None,
@@ -206,7 +234,7 @@ fn query_error(source: &str, e: crate::Error) -> CommandResult {
 pub fn build() -> CommandDef {
     CommandDef::build("recall", RecallHandler)
         .description(
-            "Load prior work (sessions, commits, prompts) relevant to search terms, \
+            "Load prior work (sessions, commits, prompts, shell commands) relevant to search terms, \
              ranked by term-match count then recency",
         )
         .args::<RecallArgs>()
