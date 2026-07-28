@@ -42,6 +42,7 @@ dirs = "5.0"
 walkdir.workspace = true
 ignore.workspace = true
 regex.workspace = true
+memchr.workspace = true
 toml = "0.5"
 
 # Token counting for `gather`'s budget enforcement (same BPE incurs uses for

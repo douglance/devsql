@@ -25,6 +25,10 @@ pub fn discover_codex_session_files(sessions_dir: &Path) -> Vec<PathBuf> {
 pub struct CodexSessionMeta {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_role: Option<String>,
+    pub originator: Option<String>,
 }
 
 /// Extract session metadata from one JSONL record, if it is a
@@ -37,9 +41,29 @@ pub fn extract_session_meta(json: &Value) -> Option<CodexSessionMeta> {
     Some(CodexSessionMeta {
         session_id: payload
             .get("session_id")
+            .or_else(|| payload.get("id"))
             .and_then(|v| v.as_str())
             .map(String::from),
-        cwd: payload.get("cwd").and_then(|v| v.as_str()).map(String::from),
+        cwd: payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        parent_session_id: payload
+            .get("parent_thread_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        agent_id: payload
+            .get("agent_path")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        agent_role: payload
+            .get("agent_role")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        originator: payload
+            .get("originator")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     })
 }
 
@@ -49,6 +73,8 @@ pub struct CodexToolCallRow {
     pub tool_name: String,
     pub arguments_json: String,
     pub cmd: Option<String>,
+    pub source_id: Option<String>,
+    pub cwd: Option<String>,
     pub timestamp: Option<String>,
 }
 
@@ -75,6 +101,14 @@ pub fn extract_codex_tool_call(json: &Value) -> Option<CodexToolCallRow> {
     };
 
     let cmd = extract_cmd(&tool_name, &arguments_value);
+    let source_id = payload
+        .get("call_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let cwd = arguments_value
+        .get("workdir")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let timestamp = json
         .get("timestamp")
         .and_then(|v| v.as_str())
@@ -84,6 +118,8 @@ pub fn extract_codex_tool_call(json: &Value) -> Option<CodexToolCallRow> {
         tool_name,
         arguments_json,
         cmd,
+        source_id,
+        cwd,
         timestamp,
     })
 }
@@ -92,7 +128,10 @@ pub fn extract_codex_tool_call(json: &Value) -> Option<CodexToolCallRow> {
 /// calls; other tool names have no `cmd` value.
 fn extract_cmd(tool_name: &str, arguments: &Value) -> Option<String> {
     match tool_name {
-        "exec_command" => arguments.get("cmd").and_then(|c| c.as_str()).map(String::from),
+        "exec_command" => arguments
+            .get("cmd")
+            .and_then(|c| c.as_str())
+            .map(String::from),
         "shell" => match arguments.get("command") {
             Some(Value::String(s)) => Some(s.clone()),
             Some(Value::Array(items)) => {
@@ -160,7 +199,11 @@ mod tests {
             "type": "session_meta",
             "payload": {
                 "session_id": "019f4f55-8ff1-7bb2-9870-a9321fa7ff32",
-                "cwd": "/Users/doug/Developer/app"
+                "cwd": "/Users/doug/Developer/app",
+                "parent_thread_id": "parent-session",
+                "agent_path": "/root/worker",
+                "agent_role": "engineer",
+                "originator": "codex-tui"
             }
         });
 
@@ -170,6 +213,10 @@ mod tests {
             Some("019f4f55-8ff1-7bb2-9870-a9321fa7ff32")
         );
         assert_eq!(meta.cwd.as_deref(), Some("/Users/doug/Developer/app"));
+        assert_eq!(meta.parent_session_id.as_deref(), Some("parent-session"));
+        assert_eq!(meta.agent_id.as_deref(), Some("/root/worker"));
+        assert_eq!(meta.agent_role.as_deref(), Some("engineer"));
+        assert_eq!(meta.originator.as_deref(), Some("codex-tui"));
 
         let non_meta = serde_json::json!({"type": "response_item"});
         assert!(extract_session_meta(&non_meta).is_none());
@@ -191,6 +238,8 @@ mod tests {
         let row = extract_codex_tool_call(&line).expect("function_call");
         assert_eq!(row.tool_name, "exec_command");
         assert_eq!(row.cmd.as_deref(), Some("echo hi"));
+        assert_eq!(row.source_id.as_deref(), Some("call_abc"));
+        assert_eq!(row.cwd.as_deref(), Some("/tmp"));
         assert_eq!(row.timestamp.as_deref(), Some("2026-07-11T04:19:22.459Z"));
         assert_eq!(
             row.arguments_json,
@@ -270,7 +319,11 @@ mod tests {
             }
         }
 
-        assert_eq!(rows.len(), 2, "2 function_call lines; the message line yields none");
+        assert_eq!(
+            rows.len(),
+            2,
+            "2 function_call lines; the message line yields none"
+        );
 
         let (wait_call, wait_session, wait_cwd) = &rows[0];
         assert_eq!(wait_call.tool_name, "wait");

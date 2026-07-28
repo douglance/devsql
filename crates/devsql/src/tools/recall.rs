@@ -124,10 +124,10 @@ impl CommandHandler for RecallHandler {
                 cta: None,
             };
         }
-        if let Err(e) = engine.load_shell_history() {
+        if let Err(e) = engine.load_command_events() {
             return CommandResult::Error {
                 code: "LOAD_ERROR".into(),
-                message: format!("Failed to load shell history: {e}"),
+                message: format!("Failed to load command events: {e}"),
                 retryable: false,
                 exit_code: Some(1),
                 cta: None,
@@ -184,12 +184,14 @@ impl CommandHandler for RecallHandler {
             Err(e) => return query_error("Prompts", e),
         };
 
-        // shell commands (Atuin, zsh, and bash)
+        // Shell and exact agent-issued commands.
         let command_expr = "(command || ' ' || coalesce(cwd, ''))";
         let commands_sql = format!(
-            "SELECT source, command, substr(timestamp, 1, 10) AS date, cwd, \
-                    exit_code, {score} AS score \
-             FROM shell_history \
+            "SELECT source, channel, actor, provenance_quality, provenance_reason, \
+                    source_id, session_id, parent_session_id, agent_id, agent_role, \
+                    originator, tool_name, command, substr(timestamp, 1, 10) AS date, \
+                    cwd, exit_code, {score} AS score \
+             FROM command_events \
              WHERE {matches} \
              ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
              LIMIT {limit}",
@@ -198,7 +200,7 @@ impl CommandHandler for RecallHandler {
         );
         let commands = match engine.query(&commands_sql) {
             Ok(rows) => rows,
-            Err(e) => return query_error("Shell commands", e),
+            Err(e) => return query_error("Command events", e),
         };
 
         let total = sessions.len() + commits.len() + prompts.len() + commands.len();

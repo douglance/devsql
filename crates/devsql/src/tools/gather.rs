@@ -644,11 +644,11 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
         Ok(e) => e,
         Err(e) => return SectionResult::err(format!("engine init failed: {e}")),
     };
-    if let Err(e) = engine.load_claude_tables(&["todos", "tool_calls", "codex_tool_calls"]) {
+    if let Err(e) = engine.load_claude_tables(&["todos"]) {
         return SectionResult::err(format!("failed to load activity tables: {e}"));
     }
-    if let Err(e) = engine.load_shell_history() {
-        return SectionResult::err(format!("failed to load shell history: {e}"));
+    if let Err(e) = engine.load_command_events() {
+        return SectionResult::err(format!("failed to load command events: {e}"));
     }
 
     let mut rows = Vec::new();
@@ -665,7 +665,9 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
 
     let tools_sql = format!(
         "SELECT 'tool' AS kind, tool_name AS text, target, COUNT(*) AS count \
-         FROM tool_calls WHERE {matches} GROUP BY tool_name, target ORDER BY count DESC LIMIT {limit}",
+         FROM tool_calls \
+         WHERE tool_name != 'Bash' AND {matches} \
+         GROUP BY tool_name, target ORDER BY count DESC LIMIT {limit}",
         matches = match_expr("target", terms),
     );
     match engine.query(&tools_sql) {
@@ -673,10 +675,14 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
         Err(e) => return SectionResult::err(format!("tool_calls query failed: {e}")),
     }
 
+    let codex_tool_expr = "(tool_name || ' ' || coalesce(arguments_json, ''))";
     let codex_sql = format!(
-        "SELECT 'codex_tool' AS kind, tool_name AS text, cmd, COUNT(*) AS count \
-         FROM codex_tool_calls WHERE {matches} GROUP BY tool_name, cmd ORDER BY count DESC LIMIT {limit}",
-        matches = match_expr("cmd", terms),
+        "SELECT 'tool' AS kind, tool_name AS text, \
+                substr(arguments_json, 1, 240) AS target, COUNT(*) AS count \
+         FROM codex_tool_calls \
+         WHERE tool_name NOT IN ('exec_command', 'shell') AND {matches} \
+         GROUP BY tool_name, arguments_json ORDER BY count DESC LIMIT {limit}",
+        matches = match_expr(codex_tool_expr, terms),
     );
     match engine.query(&codex_sql) {
         Ok(r) => rows.extend(r),
@@ -684,11 +690,26 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
     }
 
     let command_expr = "(command || ' ' || coalesce(cwd, ''))";
+    let agent_sql = format!(
+        "SELECT 'agent_command' AS kind, source AS text, actor, agent_role, \
+                tool_name, command, cwd, timestamp, {score} AS score \
+         FROM command_events \
+         WHERE channel = 'agent_tool' AND {matches} \
+         ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
+         LIMIT {limit}",
+        score = score_expr(command_expr, terms),
+        matches = match_expr(command_expr, terms),
+    );
+    match engine.query(&agent_sql) {
+        Ok(r) => rows.extend(r),
+        Err(e) => return SectionResult::err(format!("agent command query failed: {e}")),
+    }
+
     let shell_sql = format!(
         "SELECT 'shell_command' AS kind, source AS text, command, cwd, exit_code, \
                 timestamp, {score} AS score \
-         FROM shell_history \
-         WHERE {matches} \
+         FROM command_events \
+         WHERE channel = 'shell' AND {matches} \
          ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
          LIMIT {limit}",
         score = score_expr(command_expr, terms),
@@ -696,7 +717,7 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
     );
     match engine.query(&shell_sql) {
         Ok(r) => rows.extend(r),
-        Err(e) => return SectionResult::err(format!("shell_history query failed: {e}")),
+        Err(e) => return SectionResult::err(format!("shell command query failed: {e}")),
     }
 
     SectionResult::ok(rows)

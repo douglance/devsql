@@ -993,6 +993,7 @@ dependencies = [
  "git2",
  "ignore",
  "incurs",
+ "memchr",
  "predicates",
  "regex",
  "rusqlite",

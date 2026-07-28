@@ -8,7 +8,9 @@ use chrono::DateTime;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 /// Unified query engine that loads data from both Claude Code and Git
 pub struct UnifiedEngine {
@@ -82,6 +84,65 @@ impl UnifiedEngine {
     /// Load the normalized Atuin, zsh, and bash history table.
     pub fn load_shell_history(&mut self) -> Result<()> {
         crate::providers::shell_history::load(&mut self.conn)
+    }
+
+    /// Load normalized shell and agent-issued command events with source-native provenance.
+    pub fn load_command_events(&mut self) -> Result<()> {
+        self.load_shell_history()?;
+        if !table_exists(&self.conn, "tool_calls")? {
+            self.load_tool_calls()?;
+        }
+        if !table_exists(&self.conn, "codex_tool_calls")? {
+            self.load_codex_tool_calls()?;
+        }
+
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS command_events;
+             CREATE TABLE command_events (
+                source TEXT,
+                channel TEXT,
+                actor TEXT,
+                provenance_quality TEXT,
+                provenance_reason TEXT,
+                source_id TEXT,
+                source_order INTEGER,
+                session_id TEXT,
+                parent_session_id TEXT,
+                agent_id TEXT,
+                agent_role TEXT,
+                originator TEXT,
+                tool_name TEXT,
+                timestamp TEXT,
+                duration_ms INTEGER,
+                exit_code INTEGER,
+                command TEXT,
+                cwd TEXT,
+                hostname TEXT,
+                source_path TEXT
+             );
+             INSERT INTO command_events
+             SELECT source, 'shell', 'unknown', 'unattributed',
+                    'unattributed_shell_history', source_id, source_order,
+                    session_id, NULL, NULL, NULL, NULL, NULL, timestamp,
+                    duration_ms, exit_code, command, cwd, hostname, history_path
+             FROM shell_history;
+             INSERT INTO command_events
+             SELECT 'claude', 'agent_tool', 'agent', 'exact', NULL,
+                    source_id, rowid, session_id, parent_session_id, agent_id,
+                    agent_role, originator, tool_name, timestamp, NULL, NULL,
+                    command, cwd, NULL, source_path
+             FROM tool_calls
+             WHERE tool_name = 'Bash' AND command IS NOT NULL;
+             INSERT INTO command_events
+             SELECT 'codex', 'agent_tool', 'agent', 'exact', NULL,
+                    source_id, rowid, session_id, parent_session_id, agent_id,
+                    agent_role, originator, tool_name, timestamp, NULL, NULL,
+                    cmd, cwd, NULL, source_path
+             FROM codex_tool_calls
+             WHERE tool_name IN ('exec_command', 'shell') AND cmd IS NOT NULL;",
+        )?;
+
+        Ok(())
     }
 
     /// Access the underlying SQLite connection. Used by `gather` to
@@ -274,7 +335,15 @@ impl UnifiedEngine {
                 tool_name TEXT,
                 input_json TEXT,
                 target TEXT,
+                source_id TEXT,
+                command TEXT,
                 session_id TEXT,
+                parent_session_id TEXT,
+                agent_id TEXT,
+                agent_role TEXT,
+                originator TEXT,
+                cwd TEXT,
+                source_path TEXT,
                 _project TEXT,
                 timestamp TEXT
             )",
@@ -288,32 +357,47 @@ impl UnifiedEngine {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tool_calls (tool_name, input_json, target, session_id, _project, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO tool_calls (
+                    tool_name, input_json, target, source_id, command, session_id,
+                    parent_session_id, agent_id, agent_role, originator, cwd,
+                    source_path, _project, timestamp
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                 )",
             )?;
 
             for file in discover_transcript_files(&config) {
-                let content = match std::fs::read_to_string(&file.path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                for line in content.lines() {
-                    let Ok(entry) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
+                let source_path = file.path.to_string_lossy().into_owned();
+                visit_jsonl_candidates(&file.path, &[b"\"tool_use\""], |entry| {
+                    let record_session_id = string_field(&entry, "sessionId")
+                        .or_else(|| string_field(&entry, "session_id"))
+                        .unwrap_or_else(|| file.session_id.clone());
+                    let parent_session_id = file.agent_id.as_ref().map(|_| file.session_id.clone());
+                    let agent_role = string_field(&entry, "agentName");
+                    let originator = string_field(&entry, "originator")
+                        .or_else(|| nested_string_field(&entry, "origin", "kind"))
+                        .or_else(|| string_field(&entry, "entrypoint"));
+                    let cwd = string_field(&entry, "cwd");
                     for call in ccql::datasources::tool_calls::extract_tool_calls(&entry) {
                         stmt.execute(params![
                             call.tool_name,
                             call.input_json,
                             call.target,
-                            file.session_id,
+                            call.source_id,
+                            call.command,
+                            record_session_id,
+                            parent_session_id,
+                            file.agent_id,
+                            agent_role,
+                            originator,
+                            cwd,
+                            source_path,
                             file.project,
                             call.timestamp,
                         ])?;
                     }
-                }
+                    Ok(())
+                })?;
             }
         }
         tx.commit()?;
@@ -328,8 +412,14 @@ impl UnifiedEngine {
                 tool_name TEXT,
                 arguments_json TEXT,
                 cmd TEXT,
+                source_id TEXT,
                 session_id TEXT,
+                parent_session_id TEXT,
+                agent_id TEXT,
+                agent_role TEXT,
+                originator TEXT,
                 cwd TEXT,
+                source_path TEXT,
                 timestamp TEXT
             )",
             [],
@@ -340,45 +430,53 @@ impl UnifiedEngine {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO codex_tool_calls (tool_name, arguments_json, cmd, session_id, cwd, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO codex_tool_calls (
+                    tool_name, arguments_json, cmd, source_id, session_id,
+                    parent_session_id, agent_id, agent_role, originator, cwd,
+                    source_path, timestamp
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                 )",
             )?;
 
-            for path in ccql::datasources::codex_tool_calls::discover_codex_session_files(&sessions_dir) {
-                let content = match std::fs::read_to_string(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
+            for path in
+                ccql::datasources::codex_tool_calls::discover_codex_session_files(&sessions_dir)
+            {
+                let source_path = path.to_string_lossy().into_owned();
+                let mut meta = ccql::datasources::codex_tool_calls::CodexSessionMeta::default();
+                visit_jsonl_candidates(
+                    &path,
+                    &[b"\"session_meta\"", b"\"function_call\""],
+                    |entry| {
+                        if let Some(new_meta) =
+                            ccql::datasources::codex_tool_calls::extract_session_meta(&entry)
+                        {
+                            merge_codex_meta(&mut meta, new_meta);
+                            return Ok(());
+                        }
 
-                let mut session_id: Option<String> = None;
-                let mut cwd: Option<String> = None;
-
-                for line in content.lines() {
-                    let Ok(entry) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
-                    if let Some(meta) =
-                        ccql::datasources::codex_tool_calls::extract_session_meta(&entry)
-                    {
-                        session_id = meta.session_id.or(session_id);
-                        cwd = meta.cwd.or(cwd);
-                        continue;
-                    }
-
-                    if let Some(call) =
-                        ccql::datasources::codex_tool_calls::extract_codex_tool_call(&entry)
-                    {
-                        stmt.execute(params![
-                            call.tool_name,
-                            call.arguments_json,
-                            call.cmd,
-                            session_id,
-                            cwd,
-                            call.timestamp,
-                        ])?;
-                    }
-                }
+                        if let Some(call) =
+                            ccql::datasources::codex_tool_calls::extract_codex_tool_call(&entry)
+                        {
+                            let cwd = call.cwd.clone().or_else(|| meta.cwd.clone());
+                            stmt.execute(params![
+                                call.tool_name,
+                                call.arguments_json,
+                                call.cmd,
+                                call.source_id,
+                                meta.session_id,
+                                meta.parent_session_id,
+                                meta.agent_id,
+                                meta.agent_role,
+                                meta.originator,
+                                cwd,
+                                source_path,
+                                call.timestamp,
+                            ])?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
         }
         tx.commit()?;
@@ -816,6 +914,82 @@ impl UnifiedEngine {
     }
 }
 
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table_name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn visit_jsonl_candidates<F>(path: &Path, markers: &[&[u8]], mut visit: F) -> Result<()>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    let Ok(file) = File::open(path) else {
+        return Ok(());
+    };
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes_read = match reader.read_until(b'\n', &mut line) {
+            Ok(bytes_read) => bytes_read,
+            Err(_) => return Ok(()),
+        };
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        if !markers
+            .iter()
+            .any(|marker| memchr::memmem::find(&line, marker).is_some())
+        {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        visit(entry)?;
+    }
+}
+
+fn string_field(json: &Value, field: &str) -> Option<String> {
+    json.get(field).and_then(Value::as_str).map(String::from)
+}
+
+fn nested_string_field(json: &Value, parent: &str, field: &str) -> Option<String> {
+    json.get(parent)
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+fn merge_codex_meta(
+    current: &mut ccql::datasources::codex_tool_calls::CodexSessionMeta,
+    new: ccql::datasources::codex_tool_calls::CodexSessionMeta,
+) {
+    if new.session_id.is_some() {
+        current.session_id = new.session_id;
+    }
+    if new.cwd.is_some() {
+        current.cwd = new.cwd;
+    }
+    if new.parent_session_id.is_some() {
+        current.parent_session_id = new.parent_session_id;
+    }
+    if new.agent_id.is_some() {
+        current.agent_id = new.agent_id;
+    }
+    if new.agent_role.is_some() {
+        current.agent_role = new.agent_role;
+    }
+    if new.originator.is_some() {
+        current.originator = new.originator;
+    }
+}
+
 /// Normalize dates from various formats to YYYY-MM-DD
 fn normalize_date(value: &str) -> String {
     // Epoch milliseconds (13 digits)
@@ -934,7 +1108,7 @@ pub fn detect_tables(query: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec
         "imports",
         "ast_nodes",
     ];
-    let shell_tables = ["shell_history"];
+    let shell_tables = ["shell_history", "command_events"];
 
     let needed_claude: Vec<String> = claude_tables
         .iter()
@@ -1000,6 +1174,13 @@ mod tests {
 
         assert_eq!(shell, vec!["shell_history".to_string()]);
         assert!(!claude.contains(&"history".to_string()));
+    }
+
+    #[test]
+    fn detect_tables_finds_command_events() {
+        let (_, _, _, shell) = detect_tables("SELECT actor, command FROM command_events");
+
+        assert_eq!(shell, vec!["command_events".to_string()]);
     }
 
     #[test]

@@ -77,7 +77,8 @@ impl ShellFixtures {
         command
             .env("DEVSQL_ATUIN_DB", &self.atuin_db)
             .env("DEVSQL_ZSH_HISTORY", &self.zsh_history)
-            .env("DEVSQL_BASH_HISTORY", &self.bash_history);
+            .env("DEVSQL_BASH_HISTORY", &self.bash_history)
+            .env("CODEX_HOME", self.root.path().join("codex"));
         command
     }
 
@@ -85,6 +86,63 @@ impl ShellFixtures {
         let path = self.root.path().join("claude");
         std::fs::create_dir_all(&path).expect("claude dir");
         path
+    }
+
+    fn agent_history(&self) -> (PathBuf, PathBuf) {
+        let claude = self.root.path().join("claude");
+        let claude_session = claude
+            .join("projects")
+            .join("-work-claude")
+            .join("claude-session.jsonl");
+        std::fs::create_dir_all(claude_session.parent().unwrap()).expect("claude projects");
+        std::fs::write(
+            &claude_session,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-07-12T10:00:00.000Z","sessionId":"claude-session","cwd":"/work/claude","entrypoint":"cli","message":{"content":[{"type":"tool_use","id":"toolu_bash_1","name":"Bash","input":{"command":"printf 'provenance-agent-term\nsecond line'"}}]}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-07-12T10:00:01.000Z","sessionId":"claude-session","cwd":"/work/claude","entrypoint":"cli","message":{"content":[{"type":"tool_use","id":"toolu_read_1","name":"Read","input":{"file_path":"/work/claude/src/lib.rs"}}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("claude fixture");
+        let claude_subagent = claude
+            .join("projects")
+            .join("-work-claude")
+            .join("claude-session")
+            .join("subagents")
+            .join("agent-research.jsonl");
+        std::fs::create_dir_all(claude_subagent.parent().unwrap()).expect("claude subagents");
+        std::fs::write(
+            &claude_subagent,
+            concat!(
+                "malformed json is ignored\n",
+                r#"{"type":"assistant","timestamp":"2026-07-12T10:01:00.000Z","sessionId":"claude-session","cwd":"/work/claude","entrypoint":"cli","agentName":"researcher","message":{"content":[{"type":"tool_use","id":"toolu_subagent_1","name":"Bash","input":{"command":"echo claude-subagent-provenance"}}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("claude subagent fixture");
+
+        let codex = self.root.path().join("codex");
+        let codex_session = codex
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("rollout-provenance.jsonl");
+        std::fs::create_dir_all(codex_session.parent().unwrap()).expect("codex sessions");
+        std::fs::write(
+            &codex_session,
+            concat!(
+                r#"{"timestamp":"2026-07-12T11:00:00.000Z","type":"session_meta","payload":{"session_id":"codex-session","cwd":"/work/codex-default","parent_thread_id":"codex-parent","agent_path":"/root/provenance","agent_role":"engineer","originator":"codex-tui"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-12T11:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo provenance-agent-term\",\"workdir\":\"/work/codex-call\"}","call_id":"call_exec_1"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-12T11:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait_1"}}"#,
+                "\n",
+            ),
+        )
+        .expect("codex fixture");
+
+        (claude, codex)
     }
 
     fn git_repo(&self) -> PathBuf {
@@ -185,6 +243,202 @@ fn missing_optional_sources_yield_an_empty_table() {
 }
 
 #[test]
+fn command_events_preserve_exact_source_native_provenance() {
+    let fixtures = ShellFixtures::new();
+    let (claude, codex) = fixtures.agent_history();
+    let output = fixtures
+        .command()
+        .env("CODEX_HOME", codex)
+        .args([
+            "SELECT source, channel, actor, provenance_quality, provenance_reason, \
+                    source_id, session_id, parent_session_id, agent_id, agent_role, \
+                    originator, tool_name, command, cwd, source_path \
+             FROM command_events \
+             WHERE command LIKE '%provenance-agent-term%' \
+             ORDER BY source",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = parse_json(&output);
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "only command-bearing agent tool calls qualify"
+    );
+
+    let claude_row = rows.iter().find(|row| row["source"] == "claude").unwrap();
+    assert_eq!(claude_row["channel"], "agent_tool");
+    assert_eq!(claude_row["actor"], "agent");
+    assert_eq!(claude_row["provenance_quality"], "exact");
+    assert!(claude_row["provenance_reason"].is_null());
+    assert_eq!(claude_row["source_id"], "toolu_bash_1");
+    assert_eq!(claude_row["session_id"], "claude-session");
+    assert!(claude_row["parent_session_id"].is_null());
+    assert!(claude_row["agent_id"].is_null());
+    assert!(claude_row["agent_role"].is_null());
+    assert_eq!(claude_row["originator"], "cli");
+    assert_eq!(claude_row["tool_name"], "Bash");
+    assert_eq!(
+        claude_row["command"],
+        "printf 'provenance-agent-term\nsecond line'"
+    );
+    assert_eq!(claude_row["cwd"], "/work/claude");
+    assert!(claude_row["source_path"]
+        .as_str()
+        .unwrap()
+        .ends_with("claude-session.jsonl"));
+
+    let codex_row = rows.iter().find(|row| row["source"] == "codex").unwrap();
+    assert_eq!(codex_row["channel"], "agent_tool");
+    assert_eq!(codex_row["actor"], "agent");
+    assert_eq!(codex_row["provenance_quality"], "exact");
+    assert!(codex_row["provenance_reason"].is_null());
+    assert_eq!(codex_row["source_id"], "call_exec_1");
+    assert_eq!(codex_row["session_id"], "codex-session");
+    assert_eq!(codex_row["parent_session_id"], "codex-parent");
+    assert_eq!(codex_row["agent_id"], "/root/provenance");
+    assert_eq!(codex_row["agent_role"], "engineer");
+    assert_eq!(codex_row["originator"], "codex-tui");
+    assert_eq!(codex_row["tool_name"], "exec_command");
+    assert_eq!(codex_row["command"], "echo provenance-agent-term");
+    assert_eq!(codex_row["cwd"], "/work/codex-call");
+    assert!(codex_row["source_path"]
+        .as_str()
+        .unwrap()
+        .ends_with("rollout-provenance.jsonl"));
+}
+
+#[test]
+fn command_events_mark_shell_history_as_unattributed() {
+    let fixtures = ShellFixtures::new();
+    let claude = fixtures.empty_claude_dir();
+    let codex = fixtures.root.path().join("codex");
+    std::fs::create_dir_all(&codex).expect("codex dir");
+    let output = fixtures
+        .command()
+        .env("CODEX_HOME", codex)
+        .args([
+            "SELECT source, channel, actor, provenance_quality, provenance_reason, \
+                    tool_name, command \
+             FROM command_events \
+             WHERE command LIKE '%shared-shell-term%' \
+             ORDER BY source",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = parse_json(&output);
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "source-native duplicates remain visible");
+    for row in rows {
+        assert_eq!(row["channel"], "shell");
+        assert_eq!(row["actor"], "unknown");
+        assert_eq!(row["provenance_quality"], "unattributed");
+        assert_eq!(row["provenance_reason"], "unattributed_shell_history");
+        assert!(row["tool_name"].is_null());
+    }
+}
+
+#[test]
+fn command_events_preserve_claude_subagent_identity() {
+    let fixtures = ShellFixtures::new();
+    let (claude, codex) = fixtures.agent_history();
+    let output = fixtures
+        .command()
+        .env("CODEX_HOME", codex)
+        .args([
+            "SELECT session_id, parent_session_id, agent_id, agent_role, command \
+             FROM command_events \
+             WHERE command = 'echo claude-subagent-provenance'",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = parse_json(&output);
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["session_id"], "claude-session");
+    assert_eq!(rows[0]["parent_session_id"], "claude-session");
+    assert_eq!(rows[0]["agent_id"], "agent-research");
+    assert_eq!(rows[0]["agent_role"], "researcher");
+}
+
+#[test]
+fn command_events_expose_the_stable_public_schema() {
+    let fixtures = ShellFixtures::new();
+    let claude = fixtures.empty_claude_dir();
+    let output = fixtures
+        .command()
+        .args([
+            "SELECT name FROM pragma_table_info('command_events') ORDER BY cid",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = parse_json(&output);
+    let names: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "source",
+            "channel",
+            "actor",
+            "provenance_quality",
+            "provenance_reason",
+            "source_id",
+            "source_order",
+            "session_id",
+            "parent_session_id",
+            "agent_id",
+            "agent_role",
+            "originator",
+            "tool_name",
+            "timestamp",
+            "duration_ms",
+            "exit_code",
+            "command",
+            "cwd",
+            "hostname",
+            "source_path",
+        ]
+    );
+}
+
+#[test]
 fn recall_always_returns_matching_raw_shell_commands() {
     let fixtures = ShellFixtures::new();
     let claude = fixtures.empty_claude_dir();
@@ -214,7 +468,45 @@ fn recall_always_returns_matching_raw_shell_commands() {
         .as_str()
         .unwrap()
         .contains("TOKEN=super-secret")));
+    assert!(commands.iter().all(|row| row["actor"] == "unknown"));
     assert_eq!(result["total"], 2);
+}
+
+#[test]
+fn recall_returns_exact_agent_command_provenance() {
+    let fixtures = ShellFixtures::new();
+    let (claude, codex) = fixtures.agent_history();
+    let repo = fixtures.git_repo();
+    let output = fixtures
+        .command()
+        .env("CODEX_HOME", codex)
+        .args([
+            "recall",
+            "provenance-agent-term",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let result = parse_json(&output);
+    let commands = result["commands"].as_array().expect("commands");
+    assert_eq!(commands.len(), 2);
+    assert!(commands.iter().all(|row| {
+        row["actor"] == "agent"
+            && row["provenance_quality"] == "exact"
+            && row["channel"] == "agent_tool"
+    }));
+    assert!(commands
+        .iter()
+        .any(|row| row["agent_role"] == "engineer" && row["session_id"] == "codex-session"));
 }
 
 #[test]
@@ -259,5 +551,45 @@ fn gather_always_adds_matching_shell_commands_to_activity() {
                 .as_str()
                 .unwrap_or("")
                 .contains("bash-shell-term")
+    }));
+}
+
+#[test]
+fn gather_labels_agent_commands_without_double_counting_command_tools() {
+    let fixtures = ShellFixtures::new();
+    let (claude, codex) = fixtures.agent_history();
+    let repo = fixtures.git_repo();
+
+    let output = fixtures
+        .command()
+        .env("CODEX_HOME", codex)
+        .args([
+            "gather",
+            "provenance-agent-term",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let result = parse_json(&output);
+    let activity = result["activity"]["rows"]
+        .as_array()
+        .expect("activity rows");
+    let agent_commands: Vec<&Value> = activity
+        .iter()
+        .filter(|row| row["kind"] == "agent_command")
+        .collect();
+    assert_eq!(agent_commands.len(), 2);
+    assert!(!activity.iter().any(|row| {
+        row["kind"] == "tool"
+            && (row["text"] == "Bash" || row["text"] == "exec_command" || row["text"] == "shell")
     }));
 }

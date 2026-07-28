@@ -51,8 +51,10 @@ fn create_claude_data_dir() -> TempDir {
 #[test]
 fn recall_surfaces_matching_fixture() {
     let data = create_claude_data_dir();
+    let codex = TempDir::new().expect("codex");
 
     Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
         .args([
             "recall",
             "vision",
@@ -70,8 +72,10 @@ fn recall_surfaces_matching_fixture() {
 #[test]
 fn recall_ranks_more_matches_first() {
     let data = create_claude_data_dir();
+    let codex = TempDir::new().expect("codex");
 
     let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
         .args([
             "recall",
             "vision simulator",
@@ -110,8 +114,10 @@ fn recall_ranks_more_matches_first() {
 #[test]
 fn recall_empty_terms_exit_zero() {
     let data = create_claude_data_dir();
+    let codex = TempDir::new().expect("codex");
 
     Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
         .args([
             "recall",
             "a",

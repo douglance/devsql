@@ -136,10 +136,15 @@ impl CommandHandler for SqlHandler {
             };
         }
         if !shell_tables.is_empty() {
-            if let Err(e) = engine.load_shell_history() {
+            let load_result = if shell_tables.iter().any(|table| table == "command_events") {
+                engine.load_command_events()
+            } else {
+                engine.load_shell_history()
+            };
+            if let Err(e) = load_result {
                 return CommandResult::Error {
                     code: "LOAD_ERROR".to_string(),
-                    message: format!("Failed to load shell-history tables: {e}"),
+                    message: format!("Failed to load command-history tables: {e}"),
                     retryable: false,
                     exit_code: Some(1),
                     cta: None,

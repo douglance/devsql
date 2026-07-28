@@ -2,15 +2,16 @@
 
 Unified SQL interface across AI coding history, Git repositories, and source code.
 
-DevSQL loads data from Claude Code, Codex CLI, Git, and your source tree into an in-memory SQLite database so you can join, filter, and aggregate across all of them with standard SQL.
+DevSQL loads data from Claude Code, Codex CLI, shell history, Git, and your source tree into an in-memory SQLite database so you can join, filter, and aggregate across all of them with standard SQL.
 
 ## Overview
 
 ```
-~/.claude/    ─┐
-~/.codex/     ─┤
-.git/         ─┼──▶  SQLite (in-memory)  ──▶  SQL queries / JSON / CSV
-src/**/*      ─┘
+~/.claude/       ─┐
+~/.codex/        ─┤
+shell histories  ─┤
+.git/            ─┼──▶  SQLite (in-memory)  ──▶  SQL queries / JSON / CSV
+src/**/*         ─┘
 ```
 
 Three standalone tools, one unified interface:
@@ -73,7 +74,7 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql history <file>` | Git commit history for a specific file |
 | `devsql diff <base> <head>` | Compare two Git refs with file and symbol-level stats |
 | `devsql impact <file>` | Analyze exports and find potential dependents |
-| `devsql recall <terms>` | Load prior work (sessions, commits, prompts, shell commands) ranked by term-match count then recency |
+| `devsql recall <terms>` | Load prior work (sessions, commits, prompts, shell commands, and agent-issued commands) ranked by term-match count then recency |
 | `devsql gather <terms>` | Run prior_work, repo_state, code_search, symbols, excerpts, and activity concurrently and return one token-budgeted bundle |
 
 Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`). `gather` also takes `--budget` (default `8000` tokens; lowest-ranked rows are dropped round-robin per section, never mid-row, until the bundle fits).
@@ -96,11 +97,27 @@ Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.
 | Table | Source | Description |
 |-------|--------|-------------|
 | `shell_history` | Atuin, zsh, and bash | Normalized commands with source, source_id, source_order, timestamp, duration_ms, exit_code, command, cwd, session_id, hostname, and history_path |
+| `command_events` | `shell_history`, Claude Bash calls, and Codex exec/shell calls | Commands with explicit channel, actor, provenance quality/reason, source identity, session/agent metadata, tool name, execution metadata, and source path |
 
 DevSQL reads shell history without modifying it. It excludes Atuin rows marked
 deleted, keeps duplicate commands across sources, and treats missing or
 unreadable sources as empty. Commands are returned exactly as stored, including
 credential-like text.
+
+`command_events` is a source-native union. It does not infer who typed an
+Atuin, zsh, or bash command and does not correlate or deduplicate rows across
+sources. Those rows use `channel = 'shell'`, `actor = 'unknown'`,
+`provenance_quality = 'unattributed'`, and
+`provenance_reason = 'unattributed_shell_history'`. Claude Bash calls and Codex
+`exec_command`/`shell` calls use `channel = 'agent_tool'`, `actor = 'agent'`,
+and `provenance_quality = 'exact'`. Version 1 emits only `agent` and `unknown`;
+`human` and `automation` are reserved for future exact sources.
+
+The stable `command_events` columns are `source`, `channel`, `actor`,
+`provenance_quality`, `provenance_reason`, `source_id`, `source_order`,
+`session_id`, `parent_session_id`, `agent_id`, `agent_role`, `originator`,
+`tool_name`, `timestamp`, `duration_ms`, `exit_code`, `command`, `cwd`,
+`hostname`, and `source_path`. Values are read without redaction.
 
 Source paths are discovered from Atuin's `db_path` setting and the standard
 Atuin, zsh, and bash locations. Set `DEVSQL_ATUIN_DB`,

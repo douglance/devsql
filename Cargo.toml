@@ -37,6 +37,7 @@ chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2.5"
 ignore = "0.4"
 regex = "1.11"
+memchr = "2.7"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
