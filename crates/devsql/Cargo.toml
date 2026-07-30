@@ -21,7 +21,7 @@ rusqlite.workspace = true
 git2.workspace = true
 
 # CLI framework
-incurs = { version = "0.1.1", default-features = false, features = ["cli"] }
+incurs = { version = "0.4.0", default-features = false, features = ["cli"] }
 async-trait = "0.1"
 
 # Serialization

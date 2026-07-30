@@ -21,16 +21,16 @@ struct SearchArgs {
 #[allow(dead_code)]
 struct SearchOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Filter by symbol kind (function, struct, enum, trait, impl, etc.)
-    #[incur(alias = "k")]
+    #[incurs(alias = "k")]
     kind: Option<String>,
     /// Maximum number of results
-    #[incur(alias = "n", default = "50")]
+    #[incurs(alias = "n", default = 50)]
     limit: i64,
 }
 

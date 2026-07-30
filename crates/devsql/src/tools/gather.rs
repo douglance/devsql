@@ -30,14 +30,14 @@ struct GatherArgs {
 #[allow(dead_code)]
 struct GatherOptions {
     /// Git repository path (scopes repo_state, code_search, symbols, excerpts)
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Token budget for the bundle; lowest-ranked rows are dropped round-robin
     /// per section (never mid-row) until the bundle fits
-    #[incur(default = "8000")]
+    #[incurs(default = 8000)]
     budget: i64,
 }
 
