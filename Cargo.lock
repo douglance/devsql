@@ -2096,9 +2096,9 @@ dependencies = [
 
 [[package]]
 name = "incurs"
-version = "0.1.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8fe8cbdd6f0418caf5d66f925e2b31ee055e9b0f7dbe9f8e9fc17ba533fc7e5"
+checksum = "6511967cbd78c7257507349622e880a245c9b4b7837911b9435edda88d8bd4fd"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2112,13 +2112,14 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]
 name = "incurs-macros"
-version = "0.1.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8f871e14b442dbc948131778a2f9d0f5e17f45a14a61b1178088dbc70483e19"
+checksum = "470469b8c297727c16ce6b153efaf0f56c209e1f179e116470fcac339e506740"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4297,6 +4298,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

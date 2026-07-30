@@ -21,13 +21,13 @@ struct ContextArgs {
 #[allow(dead_code)]
 struct ContextOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Include symbol details
-    #[incur(alias = "s")]
+    #[incurs(alias = "s")]
     symbols: bool,
 }
 

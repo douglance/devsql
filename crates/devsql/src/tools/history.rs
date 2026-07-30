@@ -21,13 +21,13 @@ struct HistoryArgs {
 #[allow(dead_code)]
 struct HistoryOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Maximum number of commits to return
-    #[incur(alias = "n", default = "20")]
+    #[incurs(alias = "n", default = 20)]
     limit: i64,
 }
 
