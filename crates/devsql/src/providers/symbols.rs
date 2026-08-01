@@ -73,7 +73,7 @@ struct SymbolRow {
 pub fn load(conn: &Connection, repo_path: &Path) -> Result<()> {
     #[cfg(feature = "tree-sitter-ast")]
     {
-        return load_with_tree_sitter(conn, repo_path);
+        load_with_tree_sitter(conn, repo_path)
     }
     #[cfg(not(feature = "tree-sitter-ast"))]
     {

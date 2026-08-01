@@ -5,39 +5,40 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params_from_iter, Connection};
 use serde_json::{json, Value};
 
-use super::recall::{match_expr, score_expr};
 use super::engine_from_options;
+use super::recall::{match_expr, score_expr};
+use super::{legacy_context, read_only_mcp, typed_from_result};
 use crate::UnifiedEngine;
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct GatherArgs {
     /// Space-separated terms to gather context for
     terms: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct GatherOptions {
     /// Git repository path (scopes repo_state, code_search, symbols, excerpts)
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Token budget for the bundle; lowest-ranked rows are dropped round-robin
     /// per section (never mid-row) until the bundle fits
-    #[incur(default = "8000")]
+    #[incurs(default = 8000)]
     budget: i64,
 }
 
@@ -58,9 +59,22 @@ const SECTION_ORDER: [&str; 6] = [
 // Section result
 // ---------------------------------------------------------------------------
 
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 struct SectionResult {
     rows: Vec<Value>,
     note: Option<String>,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct GatherOutput {
+    terms: Vec<String>,
+    budget: usize,
+    prior_work: SectionResult,
+    repo_state: SectionResult,
+    code_search: SectionResult,
+    symbols: SectionResult,
+    excerpts: SectionResult,
+    activity: SectionResult,
 }
 
 impl SectionResult {
@@ -147,7 +161,10 @@ impl CommandHandler for GatherHandler {
                     )
                 }),
                 scope.spawn(|| {
-                    ("excerpts", section_excerpts(&claude_dir, &repo_path, &terms))
+                    (
+                        "excerpts",
+                        section_excerpts(&claude_dir, &repo_path, &terms),
+                    )
                 }),
                 scope.spawn(|| {
                     (
@@ -183,9 +200,12 @@ impl CommandHandler for GatherHandler {
         // the connection used for rendering.
         for name in SECTION_ORDER {
             if let Some(section) = sections.get(name) {
-                if let Err(e) =
-                    materialize_section(render_engine.conn(), name, &section.rows, section.note.as_deref())
-                {
+                if let Err(e) = materialize_section(
+                    render_engine.conn(),
+                    name,
+                    &section.rows,
+                    section.note.as_deref(),
+                ) {
                     // Materialization is best-effort; never fail the bundle over it.
                     eprintln!("gather: failed to materialize gather_{name}: {e}");
                 }
@@ -235,7 +255,11 @@ fn count_tokens(value: &Value) -> usize {
 /// Drop lowest-ranked rows (the tail of each section's ranked list) one at a
 /// time, round-robin across sections, until the bundle fits the budget or
 /// there is nothing left to drop. Never truncates a row's content.
-fn enforce_budget(sections: &mut HashMap<&'static str, SectionResult>, terms: &[String], budget: usize) {
+fn enforce_budget(
+    sections: &mut HashMap<&'static str, SectionResult>,
+    terms: &[String],
+    budget: usize,
+) {
     let mut cursor = 0usize;
     loop {
         let data = build_data_json(terms, budget, sections);
@@ -288,10 +312,7 @@ fn materialize_section(
     if columns.is_empty() {
         conn.execute(&format!("CREATE TABLE \"{table}\" (note TEXT)"), [])?;
         if let Some(n) = note {
-            conn.execute(
-                &format!("INSERT INTO \"{table}\" (note) VALUES (?1)"),
-                [n],
-            )?;
+            conn.execute(&format!("INSERT INTO \"{table}\" (note) VALUES (?1)"), [n])?;
         }
         return Ok(());
     }
@@ -320,7 +341,11 @@ fn materialize_section(
         let obj = row.as_object();
         let values: Vec<SqlValue> = columns
             .iter()
-            .map(|c| obj.and_then(|o| o.get(c)).map(json_to_sql).unwrap_or(SqlValue::Null))
+            .map(|c| {
+                obj.and_then(|o| o.get(c))
+                    .map(json_to_sql)
+                    .unwrap_or(SqlValue::Null)
+            })
             .collect();
         stmt.execute(params_from_iter(values))?;
     }
@@ -365,7 +390,12 @@ fn resolve_claude_dir(options: &Value) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// 1. prior_work -- reuse recall's ranking (sessions, commits, prompts).
-fn section_prior_work(claude_dir: &Path, repo_path: &Path, terms: &[String], limit: i64) -> SectionResult {
+fn section_prior_work(
+    claude_dir: &Path,
+    repo_path: &Path,
+    terms: &[String],
+    limit: i64,
+) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
     }
@@ -431,7 +461,7 @@ fn section_prior_work(claude_dir: &Path, repo_path: &Path, terms: &[String], lim
 }
 
 /// 2. repo_state -- branch, ahead/behind, dirty files, working-diff stats,
-/// last 10 commits.
+///    last 10 commits.
 fn section_repo_state(repo_path: &Path) -> SectionResult {
     let repo = match git2::Repository::open(repo_path) {
         Ok(r) => r,
@@ -465,7 +495,9 @@ fn section_repo_state(repo_path: &Path) -> SectionResult {
     }));
 
     let mut status_opts = git2::StatusOptions::new();
-    status_opts.include_untracked(true).recurse_untracked_dirs(true);
+    status_opts
+        .include_untracked(true)
+        .recurse_untracked_dirs(true);
     if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
         for entry in statuses.iter() {
             rows.push(json!({
@@ -506,8 +538,13 @@ fn section_repo_state(repo_path: &Path) -> SectionResult {
 }
 
 /// 3. code_search -- term hits from `source_lines`, ranked by match count
-/// per file.
-fn section_code_search(claude_dir: &Path, repo_path: &Path, terms: &[String], limit: i64) -> SectionResult {
+///    per file.
+fn section_code_search(
+    claude_dir: &Path,
+    repo_path: &Path,
+    terms: &[String],
+    limit: i64,
+) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
     }
@@ -533,7 +570,12 @@ fn section_code_search(claude_dir: &Path, repo_path: &Path, terms: &[String], li
 }
 
 /// 4. symbols -- matching symbols from the regex-based symbols provider.
-fn section_symbols(claude_dir: &Path, repo_path: &Path, terms: &[String], limit: i64) -> SectionResult {
+fn section_symbols(
+    claude_dir: &Path,
+    repo_path: &Path,
+    terms: &[String],
+    limit: i64,
+) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
     }
@@ -560,7 +602,7 @@ fn section_symbols(claude_dir: &Path, repo_path: &Path, terms: &[String], limit:
 }
 
 /// 5. excerpts -- top-5 files by match count, with matched line ranges
-/// (+/-3 lines) from `source_lines`.
+///    (+/-3 lines) from `source_lines`.
 fn section_excerpts(claude_dir: &Path, repo_path: &Path, terms: &[String]) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
@@ -638,8 +680,13 @@ fn section_excerpts(claude_dir: &Path, repo_path: &Path, terms: &[String]) -> Se
 }
 
 /// 6. activity -- open todos matching terms, plus top tools/commands from
-/// `tool_calls` and `codex_tool_calls` whose target/cmd matches the terms.
-fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit: i64) -> SectionResult {
+///    `tool_calls` and `codex_tool_calls` whose target/cmd matches the terms.
+fn section_activity(
+    claude_dir: &Path,
+    repo_path: &Path,
+    terms: &[String],
+    limit: i64,
+) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
     }
@@ -692,30 +739,39 @@ fn section_activity(claude_dir: &Path, repo_path: &Path, terms: &[String], limit
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("gather", GatherHandler)
-        .description(
-            "Run every context-gathering action (prior work, repo state, code search, \
+    CommandDef::typed::<GatherArgs, GatherOptions, (), GatherOutput, _, _>(
+        "gather",
+        |ctx: TypedContext<GatherArgs, GatherOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(GatherHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description(
+        "Run every context-gathering action (prior work, repo state, code search, \
              symbols, excerpts, activity) concurrently and return one token-budgeted bundle",
-        )
-        .args::<GatherArgs>()
-        .options::<GatherOptions>()
-        .examples(vec![
-            Example {
-                command: "recall ranking --json".to_string(),
-                description: Some("Gather everything relevant to 'recall ranking'".to_string()),
-            },
-            Example {
-                command: "auth token refresh -r /path/to/repo --budget 4000".to_string(),
-                description: Some("Gather with a tighter token budget".to_string()),
-            },
-        ])
-        .hint(
-            "Each of the 6 sections (prior_work, repo_state, code_search, symbols, excerpts, \
+    )
+    .args::<GatherArgs>()
+    .options::<GatherOptions>()
+    .examples(vec![
+        Example {
+            command: "recall ranking --json".to_string(),
+            description: Some("Gather everything relevant to 'recall ranking'".to_string()),
+        },
+        Example {
+            command: "auth token refresh -r /path/to/repo --budget 4000".to_string(),
+            description: Some("Gather with a tighter token budget".to_string()),
+        },
+    ])
+    .hint(
+        "Each of the 6 sections (prior_work, repo_state, code_search, symbols, excerpts, \
              activity) is computed on its own connection concurrently, then materialized as a \
              `gather_<section>` table in the connection used to render this response -- a \
              section that errors yields an empty section with a `note` instead of failing the \
              whole bundle. Once the bundle exceeds --budget tokens, the lowest-ranked row is \
              dropped round-robin across sections (never mid-row) until it fits.",
-        )
-        .done()
+    )
+    .mcp(read_only_mcp())
+    .done()
 }

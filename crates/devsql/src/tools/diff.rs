@@ -1,19 +1,20 @@
 //! `devsql diff` -- compare two Git refs and return file-level and symbol-level stats.
 
 use git2::Delta;
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use serde_json::json;
 use std::path::PathBuf;
 
 use super::semantic_diff::{diff_file_symbols, read_file_at_commit, ChangeType, SymbolChange};
+use super::{legacy_context, read_only_mcp, typed_from_result};
 use crate::providers::detect_language;
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct DiffArgs {
     /// Base ref (commit, branch, tag)
@@ -22,15 +23,24 @@ struct DiffArgs {
     head: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct DiffOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Maximum number of files to return
-    #[incur(alias = "n", default = "100")]
+    #[incurs(alias = "n", default = 100)]
     limit: i64,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct DiffOutput {
+    base: String,
+    head: String,
+    summary: serde_json::Value,
+    files: Vec<serde_json::Value>,
+    semantic: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,19 +348,28 @@ impl CommandHandler for DiffHandler {
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("diff", DiffHandler)
-        .description("Compare two Git refs and return file-level diff stats")
-        .args::<DiffArgs>()
-        .options::<DiffOptions>()
-        .examples(vec![
-            Example {
-                command: "HEAD~1 HEAD".to_string(),
-                description: Some("Diff between previous and current commit".to_string()),
-            },
-            Example {
-                command: "main feature-branch --json".to_string(),
-                description: Some("Diff between main and a feature branch".to_string()),
-            },
-        ])
-        .done()
+    CommandDef::typed::<DiffArgs, DiffOptions, (), DiffOutput, _, _>(
+        "diff",
+        |ctx: TypedContext<DiffArgs, DiffOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(DiffHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description("Compare two Git refs and return file-level diff stats")
+    .args::<DiffArgs>()
+    .options::<DiffOptions>()
+    .examples(vec![
+        Example {
+            command: "HEAD~1 HEAD".to_string(),
+            description: Some("Diff between previous and current commit".to_string()),
+        },
+        Example {
+            command: "main feature-branch --json".to_string(),
+            description: Some("Diff between main and a feature branch".to_string()),
+        },
+    ])
+    .mcp(read_only_mcp())
+    .done()
 }

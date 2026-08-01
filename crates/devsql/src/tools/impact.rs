@@ -1,34 +1,41 @@
 //! `devsql impact` -- analyze a file's exported symbols and potential dependents.
 
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use serde_json::{json, Value};
 
-use super::engine_from_options;
+use super::{engine_from_options, legacy_context, read_only_mcp, typed_from_result};
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct ImpactArgs {
     /// File path (or partial path) to analyze
     file: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct ImpactOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Depth of dependency analysis (reserved for future use)
-    #[incur(default = "1")]
+    #[incurs(default = 1)]
     depth: i64,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct ImpactOutput {
+    file_pattern: String,
+    exported_symbols: Vec<Value>,
+    potential_dependents: Vec<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,15 +155,22 @@ impl CommandHandler for ImpactHandler {
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("impact", ImpactHandler)
-        .description("Analyze a file's exported symbols and potential dependents")
-        .args::<ImpactArgs>()
-        .options::<ImpactOptions>()
-        .examples(vec![
-            Example {
-                command: "src/engine.rs --json".to_string(),
-                description: Some("Analyze impact of changes to engine.rs".to_string()),
-            },
-        ])
-        .done()
+    CommandDef::typed::<ImpactArgs, ImpactOptions, (), ImpactOutput, _, _>(
+        "impact",
+        |ctx: TypedContext<ImpactArgs, ImpactOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(ImpactHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description("Analyze a file's exported symbols and potential dependents")
+    .args::<ImpactArgs>()
+    .options::<ImpactOptions>()
+    .examples(vec![Example {
+        command: "src/engine.rs --json".to_string(),
+        description: Some("Analyze impact of changes to engine.rs".to_string()),
+    }])
+    .mcp(read_only_mcp())
+    .done()
 }

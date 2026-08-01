@@ -1,37 +1,45 @@
 //! `devsql search` -- find symbols by name across the codebase.
 
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use serde_json::{json, Value};
 
-use super::engine_from_options;
+use super::{engine_from_options, legacy_context, read_only_mcp, typed_from_result};
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct SearchArgs {
     /// Symbol name or pattern to search for
     query: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct SearchOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Filter by symbol kind (function, struct, enum, trait, impl, etc.)
-    #[incur(alias = "k")]
+    #[incurs(alias = "k")]
     kind: Option<String>,
     /// Maximum number of results
-    #[incur(alias = "n", default = "50")]
+    #[incurs(alias = "n", default = 50)]
     limit: i64,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct SearchOutput {
+    query: String,
+    kind_filter: Option<String>,
+    total: usize,
+    matches: Vec<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,19 +134,28 @@ impl CommandHandler for SearchHandler {
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("search", SearchHandler)
-        .description("Search for symbols by name across the codebase")
-        .args::<SearchArgs>()
-        .options::<SearchOptions>()
-        .examples(vec![
-            Example {
-                command: "UnifiedEngine --json".to_string(),
-                description: Some("Find all symbols matching 'UnifiedEngine'".to_string()),
-            },
-            Example {
-                command: "load --kind function --json".to_string(),
-                description: Some("Find all functions with 'load' in the name".to_string()),
-            },
-        ])
-        .done()
+    CommandDef::typed::<SearchArgs, SearchOptions, (), SearchOutput, _, _>(
+        "search",
+        |ctx: TypedContext<SearchArgs, SearchOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(SearchHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description("Search for symbols by name across the codebase")
+    .args::<SearchArgs>()
+    .options::<SearchOptions>()
+    .examples(vec![
+        Example {
+            command: "UnifiedEngine --json".to_string(),
+            description: Some("Find all symbols matching 'UnifiedEngine'".to_string()),
+        },
+        Example {
+            command: "load --kind function --json".to_string(),
+            description: Some("Find all functions with 'load' in the name".to_string()),
+        },
+    ])
+    .mcp(read_only_mcp())
+    .done()
 }

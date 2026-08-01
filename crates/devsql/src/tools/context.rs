@@ -1,34 +1,42 @@
 //! `devsql context` -- retrieve file metadata and symbols for a given path.
 
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use serde_json::{json, Value};
 
-use super::engine_from_options;
+use super::{engine_from_options, legacy_context, read_only_mcp, typed_from_result};
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct ContextArgs {
     /// File path (or partial path) to get context for
     file: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct ContextOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Include symbol details
-    #[incur(alias = "s")]
+    #[incurs(alias = "s")]
+    #[serde(default)]
     symbols: bool,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct ContextOutput {
+    file_pattern: String,
+    total: usize,
+    files: Vec<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,10 +110,7 @@ impl CommandHandler for ContextHandler {
         // For each file, optionally get its symbols
         let mut results = Vec::new();
         for file_row in &file_rows {
-            let path = file_row
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = file_row.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
             let mut entry = file_row.clone();
 
@@ -143,19 +148,28 @@ impl CommandHandler for ContextHandler {
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("context", ContextHandler)
-        .description("Get file metadata and symbols for a given path")
-        .args::<ContextArgs>()
-        .options::<ContextOptions>()
-        .examples(vec![
-            Example {
-                command: "src/engine.rs --json".to_string(),
-                description: Some("Get context for engine.rs".to_string()),
-            },
-            Example {
-                command: "main.rs --no-symbols --json".to_string(),
-                description: Some("Get file info without symbols".to_string()),
-            },
-        ])
-        .done()
+    CommandDef::typed::<ContextArgs, ContextOptions, (), ContextOutput, _, _>(
+        "context",
+        |ctx: TypedContext<ContextArgs, ContextOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(ContextHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description("Get file metadata and symbols for a given path")
+    .args::<ContextArgs>()
+    .options::<ContextOptions>()
+    .examples(vec![
+        Example {
+            command: "src/engine.rs --json".to_string(),
+            description: Some("Get context for engine.rs".to_string()),
+        },
+        Example {
+            command: "main.rs --no-symbols --json".to_string(),
+            description: Some("Get file info without symbols".to_string()),
+        },
+    ])
+    .mcp(read_only_mcp())
+    .done()
 }

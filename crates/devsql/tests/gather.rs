@@ -63,13 +63,13 @@ fn create_git_repo() -> TempDir {
 
     write(
         &temp.path().join("lib.rs"),
-        &format!("// fixture for {TERM}\nfn find_{TERM}() {{\n    println!(\"{TERM} handler\");\n}}\n"),
+        &format!(
+            "// fixture for {TERM}\nfn find_{TERM}() {{\n    println!(\"{TERM} handler\");\n}}\n"
+        ),
     );
 
     let mut index = repo.index().expect("index");
-    index
-        .add_path(std::path::Path::new("lib.rs"))
-        .expect("add");
+    index.add_path(std::path::Path::new("lib.rs")).expect("add");
     index.write().expect("write index");
     let tree_id = index.write_tree().expect("write tree");
     let tree = repo.find_tree(tree_id).expect("find tree");
@@ -211,7 +211,10 @@ fn gather_enforces_token_budget() {
     let claude = create_claude_data_dir();
     let repo = create_git_repo();
     let codex_home = isolated_codex_home();
-    let budget = 90;
+    // The required six-section response envelope is roughly 130 tokens even
+    // after every row is trimmed, so keep the budget tight but above that
+    // irreducible minimum.
+    let budget = 160;
 
     // Sanity check: without a budget, this fixture produces a bundle well
     // over the tight budget below, so the assertion actually exercises
