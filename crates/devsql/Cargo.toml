@@ -3,7 +3,7 @@ name = "devsql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Unified SQL queries across Claude Code + Git data"
+description = "Unified SQL queries across AI coding, Git, source code, and shell history"
 repository = "https://github.com/douglance/devsql"
 homepage = "https://github.com/douglance/devsql"
 keywords = ["claude", "git", "sql", "productivity", "developer-tools"]
@@ -44,7 +44,9 @@ dirs = "5.0"
 walkdir.workspace = true
 ignore.workspace = true
 regex.workspace = true
+memchr.workspace = true
 sha2.workspace = true
+toml = "0.5"
 
 # Token counting for `gather`'s budget enforcement (same BPE incurs uses for
 # its own --token-count/--token-limit flags)

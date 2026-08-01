@@ -6,6 +6,8 @@ pub struct ToolCallRow {
     pub tool_name: String,
     pub input_json: String,
     pub target: Option<String>,
+    pub source_id: Option<String>,
+    pub command: Option<String>,
     pub timestamp: Option<String>,
 }
 
@@ -39,10 +41,21 @@ pub fn extract_tool_calls(json: &Value) -> Vec<ToolCallRow> {
             let input = block.get("input").cloned().unwrap_or(Value::Null);
             let input_json = serde_json::to_string(&input).unwrap_or_default();
             let target = extract_target(&tool_name, &input);
+            let source_id = block.get("id").and_then(|v| v.as_str()).map(String::from);
+            let command = if tool_name == "Bash" {
+                input
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .map(String::from)
+            } else {
+                None
+            };
             Some(ToolCallRow {
                 tool_name,
                 input_json,
                 target,
+                source_id,
+                command,
                 timestamp: timestamp.clone(),
             })
         })
@@ -81,7 +94,7 @@ mod tests {
             "message": {
                 "content": [
                     {"type": "text", "text": "let me check that"},
-                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls -la\necho done", "description": "list"}},
+                    {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "ls -la\necho done", "description": "list"}},
                     {"type": "tool_use", "name": "Read", "input": {"file_path": "/tmp/foo.rs"}},
                     {"type": "tool_use", "name": "Agent", "input": {"subagent_type": "sdlc:engineer", "prompt": "do it"}}
                 ]
@@ -93,7 +106,12 @@ mod tests {
 
         assert_eq!(rows[0].tool_name, "Bash");
         assert_eq!(rows[0].target.as_deref(), Some("ls -la"));
-        assert_eq!(rows[0].timestamp.as_deref(), Some("2026-06-01T10:00:05.000Z"));
+        assert_eq!(rows[0].source_id.as_deref(), Some("toolu_bash"));
+        assert_eq!(rows[0].command.as_deref(), Some("ls -la\necho done"));
+        assert_eq!(
+            rows[0].timestamp.as_deref(),
+            Some("2026-06-01T10:00:05.000Z")
+        );
 
         assert_eq!(rows[1].tool_name, "Read");
         assert_eq!(rows[1].target.as_deref(), Some("/tmp/foo.rs"));
@@ -150,6 +168,9 @@ mod tests {
 
         assert_eq!(rows[2].tool_name, "Agent");
         assert_eq!(rows[2].target.as_deref(), Some("sdlc:tester"));
-        assert_eq!(rows[2].timestamp.as_deref(), Some("2026-06-01T10:00:10.000Z"));
+        assert_eq!(
+            rows[2].timestamp.as_deref(),
+            Some("2026-06-01T10:00:10.000Z")
+        );
     }
 }

@@ -240,6 +240,7 @@ fn build_data_json(
 /// The BPE table is expensive to build, and budget enforcement calls
 /// `count_tokens` once per row dropped -- build it once per process.
 static BPE: std::sync::OnceLock<Option<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
+const CLI_CTA_TOKEN_RESERVE: usize = 32;
 
 /// Count tokens the same way `--format json` will render the bundle
 /// (`serde_json::to_string_pretty`), using the same BPE incurs uses for its
@@ -250,6 +251,17 @@ fn count_tokens(value: &Value) -> usize {
         Some(bpe) => bpe.encode_with_special_tokens(&text).len(),
         None => text.split_whitespace().count(),
     }
+}
+
+fn count_rendered_tokens(value: &Value) -> usize {
+    let mut rendered = value.clone();
+    if let Some(object) = rendered.as_object_mut() {
+        // Incurs may append a typed result CTA to JSON output. Include its
+        // field here; the reserve below covers dynamic CTA content such as a
+        // skills-update notice that the command cannot know in advance.
+        object.insert("cta".to_string(), Value::Null);
+    }
+    count_tokens(&rendered)
 }
 
 /// Drop lowest-ranked rows (the tail of each section's ranked list) one at a
@@ -263,7 +275,7 @@ fn enforce_budget(
     let mut cursor = 0usize;
     loop {
         let data = build_data_json(terms, budget, sections);
-        if count_tokens(&data) <= budget {
+        if count_rendered_tokens(&data).saturating_add(CLI_CTA_TOKEN_RESERVE) <= budget {
             return;
         }
 
@@ -715,8 +727,7 @@ fn section_excerpts(claude_dir: &Path, repo_path: &Path, terms: &[String]) -> Se
     SectionResult::ok(rows)
 }
 
-/// 6. activity -- open todos matching terms, plus top tools/commands from
-///    `tool_calls` and `codex_tool_calls` whose target/cmd matches the terms.
+/// 6. activity -- open todos, tool calls, and shell commands matching terms.
 fn section_activity(
     claude_dir: &Path,
     repo_path: &Path,
@@ -731,8 +742,11 @@ fn section_activity(
         Ok(e) => e,
         Err(e) => return SectionResult::err(format!("engine init failed: {e}")),
     };
-    if let Err(e) = engine.load_claude_tables(&["todos", "tool_calls", "codex_tool_calls"]) {
+    if let Err(e) = engine.load_claude_tables(&["todos"]) {
         return SectionResult::err(format!("failed to load activity tables: {e}"));
+    }
+    if let Err(e) = engine.load_command_events() {
+        return SectionResult::err(format!("failed to load command events: {e}"));
     }
 
     let mut rows = Vec::new();
@@ -749,7 +763,9 @@ fn section_activity(
 
     let tools_sql = format!(
         "SELECT 'tool' AS kind, tool_name AS text, target, COUNT(*) AS count \
-         FROM tool_calls WHERE {matches} GROUP BY tool_name, target ORDER BY count DESC LIMIT {limit}",
+         FROM tool_calls \
+         WHERE tool_name != 'Bash' AND {matches} \
+         GROUP BY tool_name, target ORDER BY count DESC LIMIT {limit}",
         matches = match_expr("target", terms),
     );
     match engine.query(&tools_sql) {
@@ -757,19 +773,54 @@ fn section_activity(
         Err(e) => return SectionResult::err(format!("tool_calls query failed: {e}")),
     }
 
+    let codex_tool_expr = "(tool_name || ' ' || coalesce(arguments_json, ''))";
     let codex_sql = format!(
-        "SELECT 'codex_tool' AS kind, tool_name AS text, cmd, COUNT(*) AS count \
-         FROM codex_tool_calls WHERE {matches} GROUP BY tool_name, cmd ORDER BY count DESC LIMIT {limit}",
-        matches = match_expr("cmd", terms),
+        "SELECT 'tool' AS kind, tool_name AS text, \
+                substr(arguments_json, 1, 240) AS target, COUNT(*) AS count \
+         FROM codex_tool_calls \
+         WHERE tool_name NOT IN ('exec_command', 'shell') AND {matches} \
+         GROUP BY tool_name, arguments_json ORDER BY count DESC LIMIT {limit}",
+        matches = match_expr(codex_tool_expr, terms),
     );
     match engine.query(&codex_sql) {
         Ok(mut codex_rows) => {
             for row in &mut codex_rows {
-                redact_row_field(row, "cmd");
+                redact_row_field(row, "target");
             }
             rows.extend(codex_rows);
         }
         Err(e) => return SectionResult::err(format!("codex_tool_calls query failed: {e}")),
+    }
+
+    let command_expr = "(command || ' ' || coalesce(cwd, ''))";
+    let agent_sql = format!(
+        "SELECT 'agent_command' AS kind, source, source AS text, actor, agent_role, \
+                tool_name, command, cwd, timestamp, {score} AS score \
+         FROM command_events \
+         WHERE channel = 'agent_tool' AND {matches} \
+         ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
+         LIMIT {limit}",
+        score = score_expr(command_expr, terms),
+        matches = match_expr(command_expr, terms),
+    );
+    match engine.query(&agent_sql) {
+        Ok(r) => rows.extend(r),
+        Err(e) => return SectionResult::err(format!("agent command query failed: {e}")),
+    }
+
+    let shell_sql = format!(
+        "SELECT 'shell_command' AS kind, source, source AS text, command, cwd, exit_code, \
+                timestamp, {score} AS score \
+         FROM command_events \
+         WHERE channel = 'shell' AND {matches} \
+         ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
+         LIMIT {limit}",
+        score = score_expr(command_expr, terms),
+        matches = match_expr(command_expr, terms),
+    );
+    match engine.query(&shell_sql) {
+        Ok(r) => rows.extend(r),
+        Err(e) => return SectionResult::err(format!("shell command query failed: {e}")),
     }
 
     SectionResult::ok(rows)

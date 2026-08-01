@@ -1,4 +1,4 @@
-//! DevSQL CLI - Unified SQL queries across Claude/Codex + Git data
+//! DevSQL CLI - Unified SQL queries across developer-local data
 //!
 //! Built on the incurs framework, giving devsql all built-in CLI features:
 //! --help, --version, --llms, --llms-full, --mcp, --json, --format,
@@ -53,7 +53,7 @@ async fn run_query(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResul
         Err(error) => return error.into_typed(),
     };
 
-    let (claude_tables, git_tables, code_tables, work_tables) = detect_tables(&query);
+    let (claude_tables, git_tables, code_tables, shell_tables, work_tables) = detect_tables(&query);
     let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
     let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
     let code_refs: Vec<&str> = code_tables.iter().map(|s| s.as_str()).collect();
@@ -68,6 +68,19 @@ async fn run_query(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResul
     if let Err(e) = engine.load_code_tables(&code_refs) {
         return TypedResult::error("LOAD_ERROR", format!("Failed to load code tables: {e}"));
     }
+    if !shell_tables.is_empty() {
+        let load_result = if shell_tables.iter().any(|table| table == "command_events") {
+            engine.load_command_events()
+        } else {
+            engine.load_shell_history()
+        };
+        if let Err(e) = load_result {
+            return TypedResult::error(
+                "LOAD_ERROR",
+                format!("Failed to load command-history tables: {e}"),
+            );
+        }
+    }
     if let Err(e) = engine.load_work_tables(&work_refs) {
         return TypedResult::error("LOAD_ERROR", format!("Failed to load work tables: {e}"));
     }
@@ -80,7 +93,7 @@ async fn run_query(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResul
 
 fn query_command(name: &str) -> CommandDef {
     CommandDef::typed::<QueryArgs, QueryOptions, (), QueryOutput, _, _>(name, run_query)
-        .description("Execute a SQL query against your Claude/Codex + Git data")
+        .description("Execute a SQL query against developer-local data")
         .examples(query_examples())
         .hint(query_hint())
         .mcp(devsql::tools::read_only_mcp())
@@ -109,11 +122,15 @@ fn query_examples() -> Vec<Example> {
             command: r#""SELECT thread_id, cwd, last_event_at FROM codex_threads ORDER BY last_event_at DESC LIMIT 10""#.to_string(),
             description: Some("Recent Codex conversations".to_string()),
         },
+        Example {
+            command: r#""SELECT source, timestamp, command FROM shell_history ORDER BY timestamp DESC LIMIT 10""#.to_string(),
+            description: Some("Recent Atuin, zsh, and bash commands".to_string()),
+        },
     ]
 }
 
 fn query_hint() -> &'static str {
-    "TABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use devsql to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with devsql today\"\n\nLearn more: https://github.com/douglance/devsql"
+    "TABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use devsql to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with devsql today\"\n\nLearn more: https://github.com/douglance/devsql"
 }
 
 // ---------------------------------------------------------------------------
@@ -123,9 +140,8 @@ fn query_hint() -> &'static str {
 fn build_cli() -> Cli {
     Cli::create("devsql")
         .description(
-            "Query your AI coding history to become a better prompter.\n\n\
-             Join Claude/Codex conversations with Git commits to find your most productive\n\
-             prompts, identify struggle sessions, and learn what actually works for you.",
+            "Query AI coding, Git, source code, shell history, and worklog data with SQL.\n\n\
+             Join developer-local data to recall prior work and understand how changes were made.",
         )
         .version(env!("CARGO_PKG_VERSION"))
         .default_extra_format(ExtraFormat::Table)

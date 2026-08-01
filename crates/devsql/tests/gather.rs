@@ -232,7 +232,7 @@ fn gather_enforces_token_budget() {
     // The required six-section response envelope is roughly 130 tokens even
     // after every row is trimmed, so keep the budget tight but above that
     // irreducible minimum.
-    let budget = 160;
+    let budget = 240;
 
     // Sanity check: without a budget, this fixture produces a bundle well
     // over the tight budget below, so the assertion actually exercises
@@ -325,7 +325,7 @@ fn gather_empty_terms_still_returns_sections() {
 }
 
 #[test]
-fn gather_includes_redacted_codex_threads_and_activity() {
+fn gather_redacts_codex_threads_and_preserves_command_provenance() {
     let claude = TempDir::new().expect("claude");
     let repo = create_empty_git_repo();
     let codex_home = populated_codex_home();
@@ -365,8 +365,11 @@ fn gather_includes_redacted_codex_threads_and_activity() {
         .expect("activity rows");
     let call = activity
         .iter()
-        .find(|row| row["kind"] == "codex_tool")
-        .expect("codex tool");
-    assert!(call["cmd"].as_str().unwrap().contains("Bearer <redacted>"));
-    assert!(!call["cmd"].as_str().unwrap().contains("abc.def.ghi"));
+        .find(|row| row["kind"] == "agent_command")
+        .expect("agent command");
+    assert_eq!(call["source"], "codex");
+    assert!(call["command"]
+        .as_str()
+        .unwrap()
+        .contains("Bearer abc.def.ghi"));
 }

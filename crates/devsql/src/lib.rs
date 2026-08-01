@@ -1,8 +1,7 @@
-//! DevSQL - Unified SQL queries across Claude Code + Git data
+//! DevSQL - Unified SQL queries across developer-local data
 //!
-//! This crate combines ccql (Claude Code data) and vcsql (Git data) into a
-//! unified query interface, enabling cross-database joins to analyze
-//! developer productivity patterns.
+//! This crate combines AI coding history, Git, source code, and shell history
+//! in a unified query interface.
 
 mod codex_index;
 pub mod engine;

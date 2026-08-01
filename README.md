@@ -1,16 +1,18 @@
 # DevSQL
 
-Unified SQL interface across AI coding history, Git repositories, and source code.
+Unified SQL interface across AI coding history, shell history, Git repositories, source code, and durable worklogs.
 
-DevSQL loads data from Claude Code, Codex CLI, Git, and your source tree into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
+DevSQL loads data from Claude Code, Codex CLI, shell history, Git, your source tree, and its durable worklog into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
 
 ## Overview
 
 ```
-~/.claude/   --+
-~/.codex/    --+
-.git/        --+--> SQLite --> SQL queries / JSON / CSV
-src/**/*     --+
+~/.claude/       --+
+~/.codex/        --+
+shell histories  --+
+worklog.sqlite   --+--> SQLite --> SQL queries / JSON / CSV
+.git/            --+
+src/**/*         --+
 ```
 
 Three standalone tools, one unified interface:
@@ -74,7 +76,7 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql history <file>` | Git commit history for a specific file |
 | `devsql diff <base> <head>` | Compare two Git refs with file and symbol-level stats |
 | `devsql impact <file>` | Analyze exports and find potential dependents |
-| `devsql recall <terms>` | Load prior work (Claude sessions, Codex threads, commits, prompts) ranked by term-match count then recency |
+| `devsql recall <terms>` | Load prior work (Claude sessions, Codex threads, commits, prompts, shell commands, and agent-issued commands) ranked by term-match count then recency |
 | `devsql gather <terms>` | Run prior_work, repo_state, code_search, symbols, excerpts, and activity concurrently and return one token-budgeted bundle |
 | `devsql work start\|update\|done\|note\|list` | Write structured work events to the durable day log (agents populate; humans read) |
 | `devsql today` / `day` / `days` | Cross-project day timeline (Today granular; past days summarized) |
@@ -110,16 +112,46 @@ Run `devsql --mcp` to start the stdio MCP server. It exposes the commands above 
 | `todos` | `~/.claude/todos/*.json` | Task items (content, status) |
 | `jhistory` | `~/.codex/history.jsonl` | Codex CLI prompts (session_id, text, display, timestamp) |
 | `codex_history` | - | Alias for `jhistory` |
-| `codex_threads` | `$CODEX_HOME/{sessions,archived_sessions}/**/rollout-*.jsonl[.zst]` | One row per Codex thread: lineage, cwd, Git branch, state, compression, journal path, timestamps, first user text, and aggregate counts |
+| `codex_threads` | `$CODEX_HOME/{sessions,archived_sessions}/**/rollout-*.jsonl[.zst]` | One row per Codex thread: lineage, agent identity, originator, cwd, Git branch, state, compression, journal path, timestamps, first user text, and aggregate counts |
 | `codex_events` | Same rollout journals | One row per newline-terminated journal record: thread ID, record index, timestamp, record type, payload type, role, call ID, and source path |
 | `codex_messages` | Same rollout journals | Normalized user and assistant content, including canonical-message status and source provenance |
 | `codex_tool_executions` | Same rollout journals | Tool calls paired with outputs by thread and call ID |
-| `codex_tool_calls` | Same rollout journals | Backward-compatible tool-call view: tool_name, arguments_json, cmd, session_id, cwd, timestamp |
+| `codex_tool_calls` | Same rollout journals | Backward-compatible tool-call view with source, session, agent, cwd, and timestamp provenance |
 | `codex_compactions` | Same rollout journals | Compaction summaries and window metadata |
 | `codex_ingest_errors` | DevSQL Codex index | Nonfatal journal read and JSON parsing errors |
-| `tool_calls` | `~/.claude/projects/<slug>/**/*.jsonl` (+ legacy `~/.claude/transcripts/*.jsonl`) | Claude assistant tool calls (tool_name, input_json, target, session_id, `_project`, timestamp) |
+| `tool_calls` | `~/.claude/projects/<slug>/**/*.jsonl` (+ legacy `~/.claude/transcripts/*.jsonl`) | Claude assistant tool calls with source, session, subagent, cwd, and timestamp provenance |
 | `work_tasks` | `~/.devsql/worklog.sqlite` | Durable tasks (title, project, status, agent, …) written via `devsql work` |
 | `work_events` | `~/.devsql/worklog.sqlite` | Day-timeline events (start/update/done/note) with `local_date` |
+
+### Shell History
+
+| Table | Source | Description |
+|-------|--------|-------------|
+| `shell_history` | Atuin, zsh, and bash | Normalized commands with source, source identity/order, timestamp, execution metadata, cwd, session, hostname, and history path |
+| `command_events` | `shell_history`, Claude Bash calls, and Codex exec/shell calls | Commands with channel, actor, provenance quality/reason, source identity, session/agent metadata, execution metadata, and source path |
+
+DevSQL reads shell history without modifying it. It excludes Atuin rows marked
+deleted, keeps duplicate commands across sources, and treats missing or
+unreadable sources as empty. Commands are returned exactly as stored, including
+credential-like text.
+
+`command_events` is a source-native union. It does not infer who typed an
+Atuin, zsh, or bash command and does not correlate or deduplicate rows across
+sources. Those rows use `channel = 'shell'`, `actor = 'unknown'`,
+`provenance_quality = 'unattributed'`, and
+`provenance_reason = 'unattributed_shell_history'`. Claude Bash calls and Codex
+`exec_command`/`shell` calls use `channel = 'agent_tool'`, `actor = 'agent'`,
+and `provenance_quality = 'exact'`.
+
+The stable `command_events` columns are `source`, `channel`, `actor`,
+`provenance_quality`, `provenance_reason`, `source_id`, `source_order`,
+`session_id`, `parent_session_id`, `agent_id`, `agent_role`, `originator`,
+`tool_name`, `timestamp`, `duration_ms`, `exit_code`, `command`, `cwd`,
+`hostname`, and `source_path`. Values are read without redaction.
+
+Source paths are discovered from Atuin's `db_path` setting and the standard
+Atuin, zsh, and bash locations. Set `DEVSQL_ATUIN_DB`,
+`DEVSQL_ZSH_HISTORY`, or `DEVSQL_BASH_HISTORY` to override a source path.
 
 ### Git
 

@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SyncStats {
@@ -613,17 +613,22 @@ fn normalize_tool_call(
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
         .unwrap_or_else(|| arguments.clone());
     let cmd = tool_name.and_then(|name| extract_command(name, &parsed_arguments));
+    let cwd = parsed_arguments
+        .get("workdir")
+        .or_else(|| parsed_arguments.get("cwd"))
+        .and_then(Value::as_str);
     tx.execute(
         "INSERT INTO codex_tool_executions
          (thread_id, call_id, call_record_index, tool_name, arguments_json, cmd,
-          called_at, source_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+          called_at, cwd, source_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(thread_id, call_id) DO UPDATE SET
            call_record_index = excluded.call_record_index,
            tool_name = excluded.tool_name,
            arguments_json = excluded.arguments_json,
            cmd = excluded.cmd,
            called_at = excluded.called_at,
+           cwd = excluded.cwd,
            source_path = excluded.source_path",
         params![
             thread_id,
@@ -633,6 +638,7 @@ fn normalize_tool_call(
             arguments_json,
             cmd,
             timestamp,
+            cwd,
             source_path
         ],
     )?;
@@ -733,10 +739,16 @@ fn update_thread_metadata(
         .map(str::to_owned)
         .or_else(|| source.as_str().map(str::to_owned))
         .or_else(|| source.as_object()?.keys().next().cloned());
-    let parent_thread_id = find_string_key(source, "parent_thread_id");
+    let parent_thread_id = string_field(payload, "parent_thread_id")
+        .or_else(|| find_string_key(source, "parent_thread_id"));
     let parent_record_index =
         find_i64_key(source, "parent_record_index").or_else(|| find_i64_key(source, "turn_index"));
-    let agent_path = find_string_key(source, "agent_path");
+    let agent_path =
+        string_field(payload, "agent_path").or_else(|| find_string_key(source, "agent_path"));
+    let agent_role =
+        string_field(payload, "agent_role").or_else(|| find_string_key(source, "agent_role"));
+    let originator =
+        string_field(payload, "originator").or_else(|| find_string_key(source, "originator"));
     let git_branch = payload
         .get("git")
         .and_then(|git| git.get("branch"))
@@ -748,10 +760,12 @@ fn update_thread_metadata(
            source_kind = COALESCE(?4, source_kind),
            source_json = ?5,
            agent_path = COALESCE(?6, agent_path),
-           cwd = COALESCE(?7, cwd),
-           git_branch = COALESCE(?8, git_branch),
-           cli_version = COALESCE(?9, cli_version),
-           started_at = COALESCE(?10, started_at)
+           agent_role = COALESCE(?7, agent_role),
+           originator = COALESCE(?8, originator),
+           cwd = COALESCE(?9, cwd),
+           git_branch = COALESCE(?10, git_branch),
+           cli_version = COALESCE(?11, cli_version),
+           started_at = COALESCE(?12, started_at)
          WHERE thread_id = ?1",
         params![
             thread_id,
@@ -760,6 +774,8 @@ fn update_thread_metadata(
             source_kind,
             serde_json::to_string(source).ok(),
             agent_path,
+            agent_role,
+            originator,
             string_field(payload, "cwd"),
             git_branch,
             string_field(payload, "cli_version"),
@@ -1010,7 +1026,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             value TEXT NOT NULL
         );
         INSERT OR REPLACE INTO index_meta (key, value)
-        VALUES ('schema_version', '2');
+        VALUES ('schema_version', '3');
 
         CREATE TABLE IF NOT EXISTS codex_threads (
             thread_id TEXT PRIMARY KEY,
@@ -1019,6 +1035,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             source_kind TEXT,
             source_json TEXT,
             agent_path TEXT,
+            agent_role TEXT,
+            originator TEXT,
             cwd TEXT,
             git_branch TEXT,
             cli_version TEXT,
