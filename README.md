@@ -1,8 +1,31 @@
 # DevSQL
 
-Unified SQL interface across AI coding history, shell history, Git repositories, source code, and durable worklogs.
+Code Mode for AI coding history, shell history, Git repositories, source code, and durable worklogs. Code Mode is the primary agent interface; the direct SQL CLI remains available for humans and scripts.
 
 DevSQL loads data from Claude Code, Codex CLI, shell history, Git, your source tree, and its durable worklog into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
+
+## Primary agent interface: Code Mode
+
+Run `devsql --mcp` and connect it as an stdio MCP server. Agents see five stable lifecycle tools instead of a wide direct-tool surface:
+
+| Tool | Purpose |
+|------|---------|
+| `codemode_search` | Discover typed `devsql.*` methods and saved snippets |
+| `codemode_execute` | Start JavaScript that can compose multiple DevSQL calls |
+| `codemode_execution` | Inspect a durable execution or fetch one artifact |
+| `codemode_decide` | Approve or reject a pending write |
+| `codemode_cancel` | Cancel a running or paused execution |
+
+For example, an agent can execute:
+
+```js
+const recent = await devsql.query({
+  query: "SELECT source, timestamp, command FROM shell_history ORDER BY timestamp DESC LIMIT 20"
+});
+recent
+```
+
+Read-only methods run without approval. Worklog writes pause for an explicit decision. Use direct `devsql` commands when working interactively in a terminal or writing a shell script.
 
 ## Overview
 
@@ -96,9 +119,9 @@ devsql day yesterday
 
 Events live in `~/.devsql/worklog.sqlite` (override with `DEVSQL_HOME`) and are also queryable as SQL tables `work_tasks` and `work_events`.
 
-### MCP server
+### Code Mode server
 
-Run `devsql --mcp` to start the stdio MCP server. It exposes the commands above as tools with typed input and output schemas. History/code tools are read-only; `work start|update|done|note` are write tools for the day log.
+Run `devsql --mcp` to start the primary agent interface described above. Direct commands remain the explicit CLI fallback.
 
 ## Tables
 

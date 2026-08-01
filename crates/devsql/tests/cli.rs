@@ -194,6 +194,19 @@ fn root_and_named_query_are_compatible() {
 }
 
 #[test]
+fn root_help_leads_agents_to_code_mode() {
+    Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PRIMARY AGENT INTERFACE"))
+        .stdout(predicate::str::contains("devsql --mcp"))
+        .stdout(predicate::str::contains(
+            "The direct CLI below is the human and scripting fallback.",
+        ));
+}
+
+#[test]
 fn table_and_csv_formats_remain_available() {
     Command::new(env!("CARGO_BIN_EXE_devsql"))
         .args(["SELECT 1 AS value", "--format", "table"])

@@ -4,12 +4,70 @@
 //! --help, --version, --llms, --llms-full, --mcp, --json, --format,
 //! --filter-output, --verbose, shell completions, and skills.
 
+use std::sync::Arc;
+
 use devsql::engine::detect_tables;
 use incurs::cli::Cli;
 use incurs::command::{CommandDef, Example, TypedContext, TypedResult};
-use incurs::mcp::{McpDiscovery, McpServeOptions, McpToolFilter};
+use incurs_codemode::{
+    CodeMode, CodeModeRunOptions, CodeModeService, ExecutionState, IncurConnector, MemoryStore,
+    SearchOutput,
+};
+use incurs_codemode_local::{LocalCodeModeService, LocalExecutor};
 use incurs_extras::{CliExtras, ExtraFormat};
 use serde_json::Value;
+
+#[derive(Clone)]
+struct DurableCodeModeService(LocalCodeModeService);
+
+fn durable_options(options: CodeModeRunOptions) -> CodeModeRunOptions {
+    CodeModeRunOptions {
+        request: options.request,
+        ..CodeModeRunOptions::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl CodeModeService for DurableCodeModeService {
+    async fn search(&self, query: String) -> Result<SearchOutput, String> {
+        self.0.search(query).await
+    }
+
+    async fn execute(
+        &self,
+        code: String,
+        options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        self.0.execute(code, durable_options(options)).await
+    }
+
+    async fn execution(&self, execution_id: String) -> Result<ExecutionState, String> {
+        self.0.execution(execution_id).await
+    }
+
+    async fn artifact(&self, execution_id: String, artifact_id: String) -> Result<Value, String> {
+        self.0.artifact(execution_id, artifact_id).await
+    }
+
+    async fn approve(
+        &self,
+        execution_id: String,
+        seq: u64,
+        options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        self.0
+            .approve(execution_id, seq, durable_options(options))
+            .await
+    }
+
+    async fn reject(&self, execution_id: String, seq: u64) -> Result<ExecutionState, String> {
+        self.0.reject(execution_id, seq).await
+    }
+
+    async fn cancel(&self, execution_id: String) -> Result<ExecutionState, String> {
+        self.0.cancel(execution_id).await
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Schemas (derive macros replace manual FieldMeta construction)
@@ -91,9 +149,9 @@ async fn run_query(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResul
     }
 }
 
-fn query_command(name: &str) -> CommandDef {
+fn query_command(name: &str, description: &str) -> CommandDef {
     CommandDef::typed::<QueryArgs, QueryOptions, (), QueryOutput, _, _>(name, run_query)
-        .description("Execute a SQL query against developer-local data")
+        .description(description)
         .examples(query_examples())
         .hint(query_hint())
         .mcp(devsql::tools::read_only_mcp())
@@ -130,7 +188,7 @@ fn query_examples() -> Vec<Example> {
 }
 
 fn query_hint() -> &'static str {
-    "TABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use devsql to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with devsql today\"\n\nLearn more: https://github.com/douglance/devsql"
+    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
 }
 
 // ---------------------------------------------------------------------------
@@ -140,26 +198,21 @@ fn query_hint() -> &'static str {
 fn build_cli() -> Cli {
     Cli::create("devsql")
         .description(
-            "Query AI coding, Git, source code, shell history, and worklog data with SQL.\n\n\
-             Join developer-local data to recall prior work and understand how changes were made.",
+            "Code Mode is the primary agent interface for querying AI coding, Git, source code, \
+             shell history, and worklog data.\n\n\
+             Run `devsql --mcp` for the Code Mode server. Use the direct CLI for human queries \
+             and scripts.",
         )
         .version(env!("CARGO_PKG_VERSION"))
         .default_extra_format(ExtraFormat::Table)
-        .mcp(McpServeOptions {
-            instructions: Some(
-                "Use DevSQL to query coding history, Git state, and source-code context. \
-                 Use work start/update/done/note to populate the user's cross-project day timeline; \
-                 use today/day/days to read it."
-                    .to_string(),
-            ),
-            tools: McpToolFilter {
-                discovery: McpDiscovery::Direct,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .root(query_command("devsql"))
-        .command("query", query_command("query"))
+        .root(query_command(
+            "devsql",
+            "Run a direct SQL query. For agents, prefer the Code Mode server: `devsql --mcp`.",
+        ))
+        .command(
+            "query",
+            query_command("query", "Execute a SQL query against developer-local data"),
+        )
         .command("diff", devsql::tools::diff::build())
         .command("search", devsql::tools::search::build())
         .command("context", devsql::tools::context::build())
@@ -173,10 +226,43 @@ fn build_cli() -> Cli {
         .command("days", devsql::tools::day::build_days())
 }
 
+fn code_mode_requested() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    args.next().is_some_and(|arg| arg == "--mcp") && args.next().is_none()
+}
+
+async fn serve_code_mode(cli: &Cli) -> Result<(), String> {
+    let connector = Arc::new(
+        IncurConnector::new(cli.tool_catalog())
+            .with_name("devsql")
+            .with_instructions(
+                "Use devsql.query for cross-source SQL; use devsql.gather when prior work and \
+                 repository context should be loaded together. Use devsql.work_start, \
+                 devsql.work_update, devsql.work_done, and devsql.work_note to maintain the \
+                 durable day timeline.",
+            ),
+    );
+    let service = LocalCodeModeService::spawn(move || {
+        CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            vec![connector],
+        )
+    })?;
+    incurs_codemode_mcp::serve_stdio(Arc::new(DurableCodeModeService(service))).await
+}
+
 #[tokio::main]
 async fn main() {
     let cli = build_cli();
-    if let Err(e) = cli.serve().await {
+    let result = if code_mode_requested() {
+        serve_code_mode(&cli)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+    } else {
+        cli.serve().await
+    };
+    if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }

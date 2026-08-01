@@ -1,6 +1,6 @@
 # DevSQL Claude Code Plugin
 
-Query your Claude Code history, Git data, and source code with SQL, right from Claude Code.
+Use DevSQL Code Mode to query Claude Code history, Codex CLI history, shell history, Git data, source code, and durable worklogs. Code Mode is the primary agent interface; slash commands and the direct CLI are fallbacks.
 
 ## Installation
 
@@ -14,6 +14,10 @@ Restart Claude Code to load the plugin.
 The plugin auto-installs the `devsql` binary via Homebrew on first session start.
 
 ## Usage
+
+### Code Mode
+
+Connect `devsql --mcp` as an stdio MCP server. Agents use the five `codemode_*` lifecycle tools to discover and compose typed `devsql.*` methods. Read-only methods run automatically; worklog writes require approval.
 
 ### Slash Command
 

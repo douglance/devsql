@@ -1,11 +1,17 @@
 ---
 name: devsql-querying
-description: Query and analyze Claude Code + Codex CLI history joined with Git data and source code using SQL. Use when user asks about conversation history, productivity patterns, commit correlation, session analytics, codebase analysis, symbol search, file context, or impact analysis.
+description: Query and analyze developer-local history, Git, and source code through DevSQL Code Mode. Use when the user asks about prior conversations, shell commands, productivity, commits, sessions, symbols, file context, or impact analysis.
 ---
 
 # DevSQL Querying Skill
 
-Query Claude Code and Codex CLI history joined with Git commits and source code to analyze productivity patterns and understand codebases.
+Use DevSQL Code Mode to query Claude Code and Codex CLI history, shell history, Git commits, source code, and durable worklogs.
+
+## Primary interface
+
+Prefer the connected DevSQL Code Mode server. Use `codemode_search` to discover typed `devsql.*` methods, then `codemode_execute` to compose them in JavaScript. Poll durable work with `codemode_execution`; approve writes with `codemode_decide` only when the user has authorized them.
+
+Use the direct commands below only when Code Mode is unavailable or when writing a shell script.
 
 ## When to Use
 

@@ -1,4 +1,4 @@
-//! End-to-end MCP stdio coverage for direct DevSQL tool discovery.
+//! End-to-end MCP stdio coverage for DevSQL's primary Code Mode interface.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -24,7 +24,7 @@ fn response(receiver: &Receiver<Value>, id: i64) -> Value {
 }
 
 #[test]
-fn discovers_all_direct_tools_and_calls_query() {
+fn exposes_code_mode_and_executes_a_devsql_query() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_devsql"))
         .arg("--mcp")
         .stdin(Stdio::piped())
@@ -78,39 +78,13 @@ fn discovers_all_direct_tools_and_calls_query() {
     assert_eq!(
         names,
         [
-            "context",
-            "day",
-            "days",
-            "diff",
-            "gather",
-            "history",
-            "impact",
-            "query",
-            "recall",
-            "search",
-            "today",
-            "work_done",
-            "work_list",
-            "work_note",
-            "work_start",
-            "work_update",
+            "codemode_cancel",
+            "codemode_decide",
+            "codemode_execute",
+            "codemode_execution",
+            "codemode_search",
         ]
     );
-    for tool in tools {
-        let name = tool["name"].as_str().expect("tool name");
-        let writes_worklog = name.starts_with("work_") && name != "work_list";
-        assert_eq!(
-            tool["annotations"]["readOnlyHint"], !writes_worklog,
-            "{tool}"
-        );
-        assert_eq!(tool["annotations"]["destructiveHint"], false, "{tool}");
-        assert_eq!(
-            tool["annotations"]["idempotentHint"], !writes_worklog,
-            "{tool}"
-        );
-        assert_eq!(tool["annotations"]["openWorldHint"], false, "{tool}");
-        assert!(tool.get("outputSchema").is_some(), "{tool}");
-    }
 
     send(
         &mut stdin,
@@ -118,14 +92,58 @@ fn discovers_all_direct_tools_and_calls_query() {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {"name": "query", "arguments": {"query": "SELECT 1 AS value"}}
+            "params": {"name": "codemode_search", "arguments": {"query": "query"}}
         }),
     );
-    let called = response(&receiver, 3);
-    assert!(called.get("error").is_none(), "{called}");
+    let searched = response(&receiver, 3);
+    assert!(searched.get("error").is_none(), "{searched}");
+    assert!(searched.to_string().contains("devsql.query"), "{searched}");
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "codemode_execute",
+                "arguments": {"code": "devsql.query({ query: 'SELECT 1 AS value' })"}
+            }
+        }),
+    );
+    let started = response(&receiver, 4);
+    assert!(started.get("error").is_none(), "{started}");
+    let execution_id = started["result"]["structuredContent"]["id"]
+        .as_str()
+        .expect("execution id")
+        .to_string();
+    let mut executed = started;
+    for id in 5..105 {
+        if executed["result"]["structuredContent"]["status"] == "completed" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "codemode_execution",
+                    "arguments": {"id": execution_id}
+                }
+            }),
+        );
+        executed = response(&receiver, id);
+    }
+    assert_eq!(
+        executed["result"]["structuredContent"]["status"], "completed",
+        "{executed}"
+    );
     assert!(
-        called.to_string().contains("value") && called.to_string().contains('1'),
-        "{called}"
+        executed.to_string().contains("value") && executed.to_string().contains('1'),
+        "{executed}"
     );
 
     drop(stdin);

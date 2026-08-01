@@ -3,7 +3,7 @@ name = "devsql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Unified SQL queries across AI coding, Git, source code, and shell history"
+description = "Code Mode across AI coding history, shell history, Git, source code, and worklogs"
 repository = "https://github.com/douglance/devsql"
 homepage = "https://github.com/douglance/devsql"
 keywords = ["claude", "git", "sql", "productivity", "developer-tools"]
@@ -11,8 +11,8 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Workspace crates
-ccql = { path = "../ccql", version = "0.3.2" }
-vcsql = { path = "../vcsql", version = "0.3.2" }
+ccql = { path = "../ccql", version = "0.4.0" }
+vcsql = { path = "../vcsql", version = "0.4.0" }
 
 # SQL engine - SQLite for unified queries
 rusqlite.workspace = true
@@ -23,6 +23,9 @@ git2.workspace = true
 # CLI framework
 incurs = { version = "0.4.0", features = ["mcp", "yaml"] }
 incurs-extras = "0.4.0"
+incurs-codemode = "0.1.1"
+incurs-codemode-local = "0.1.0"
+incurs-codemode-mcp = "0.1.0"
 async-trait = "0.1"
 schemars = "1"
 

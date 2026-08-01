@@ -4,7 +4,7 @@ description: Execute SQL queries against Claude Code, Codex CLI, Git, and source
 
 # DevSQL Query
 
-Execute SQL queries against your Claude Code and Codex CLI history joined with Git commit data and source code analysis.
+Execute a direct SQL query against developer-local data. This slash command is a convenience fallback; agents should prefer the DevSQL Code Mode server (`devsql --mcp`) when it is connected.
 
 ## Prerequisites
 
