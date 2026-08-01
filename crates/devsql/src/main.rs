@@ -102,6 +102,15 @@ struct QueryOptions {
 type QueryOutput = Vec<Value>;
 
 async fn run_query(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResult<QueryOutput> {
+    match tokio::task::spawn_blocking(move || run_query_blocking(ctx)).await {
+        Ok(result) => result,
+        Err(error) => {
+            TypedResult::error("QUERY_TASK_ERROR", format!("Query worker failed: {error}"))
+        }
+    }
+}
+
+fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResult<QueryOutput> {
     let query = ctx.args.query;
     let (mut engine, _) = match devsql::tools::engine_from_paths(
         &ctx.options.repo,

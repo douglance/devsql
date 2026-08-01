@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -19,6 +19,17 @@ fn response(receiver: &Receiver<Value>, id: i64) -> Value {
             .expect("MCP response before timeout");
         if message.get("id").and_then(Value::as_i64) == Some(id) {
             return message;
+        }
+    }
+}
+
+fn response_within(receiver: &Receiver<Value>, id: i64, timeout: Duration) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let message = receiver.recv_timeout(remaining).ok()?;
+        if message.get("id").and_then(Value::as_i64) == Some(id) {
+            return Some(message);
         }
     }
 }
@@ -145,6 +156,145 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
         executed.to_string().contains("value") && executed.to_string().contains('1'),
         "{executed}"
     );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for MCP server");
+    reader.join().expect("join MCP reader");
+    assert!(status.success(), "MCP server exited with {status}");
+}
+
+#[test]
+fn code_mode_stays_responsive_during_concurrent_queries() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .arg("--mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start DevSQL MCP server");
+    let mut stdin = child.stdin.take().expect("MCP stdin");
+    let stdout = child.stdout.take().expect("MCP stdout");
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read MCP line");
+            if let Ok(value) = serde_json::from_str(&line) {
+                sender.send(value).expect("forward MCP message");
+            }
+        }
+    });
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "devsql-test", "version": "1.0.0"}
+            }
+        }),
+    );
+    assert!(response(&receiver, 1).get("result").is_some());
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+
+    let slow_query = "WITH RECURSIVE cnt(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM cnt WHERE x < 10000000) SELECT sum(x) AS total FROM cnt";
+    let code = format!(
+        "Promise.all([devsql.query({{ query: {slow_query:?} }}), devsql.query({{ query: {slow_query:?} }})])"
+    );
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "codemode_execute", "arguments": {"code": code}}
+        }),
+    );
+    let started = response(&receiver, 2);
+    let execution_id = started["result"]["structuredContent"]["id"]
+        .as_str()
+        .expect("execution id")
+        .to_string();
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "codemode_execution",
+                "arguments": {"id": execution_id}
+            }
+        }),
+    );
+    let status = response_within(&receiver, 3, Duration::from_secs(1));
+    if status.is_none() {
+        child.kill().expect("stop unresponsive MCP server");
+    }
+    assert!(
+        status.is_some(),
+        "execution status was blocked by query work"
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "codemode_search", "arguments": {"query": "query"}}
+        }),
+    );
+    let search = response_within(&receiver, 4, Duration::from_secs(1));
+    if search.is_none() {
+        child.kill().expect("stop unresponsive MCP server");
+    }
+    assert!(
+        search.is_some(),
+        "Code Mode search was blocked by query work"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut executed = None;
+    for id in 5.. {
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "codemode_execution",
+                    "arguments": {"id": execution_id}
+                }
+            }),
+        );
+        let snapshot = response(&receiver, id);
+        if snapshot["result"]["structuredContent"]["status"] == "completed" {
+            executed = Some(snapshot);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "concurrent query execution did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let executed = executed.expect("completed execution");
+    let result = executed["result"]["structuredContent"]["result"]
+        .as_array()
+        .expect("Promise.all result");
+    assert_eq!(result.len(), 2, "{executed}");
+    assert!(result
+        .iter()
+        .all(|value| value.to_string().contains("total")));
 
     drop(stdin);
     let status = child.wait().expect("wait for MCP server");
