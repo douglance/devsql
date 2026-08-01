@@ -58,8 +58,9 @@ cargo install --path crates/devsql --features tree-sitter-ast
 
 ```bash
 devsql "<SQL>"                # Default table output
-devsql -f json "<SQL>"        # JSON output
-devsql -f csv "<SQL>"         # CSV output
+devsql --format json "<SQL>"  # JSON output
+devsql --format csv "<SQL>"   # CSV output
+devsql query "<SQL>"          # Named form for MCP and scripts
 ```
 
 ### Commands
@@ -75,8 +76,27 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql impact <file>` | Analyze exports and find potential dependents |
 | `devsql recall <terms>` | Load prior work (Claude sessions, Codex threads, commits, prompts) ranked by term-match count then recency |
 | `devsql gather <terms>` | Run prior_work, repo_state, code_search, symbols, excerpts, and activity concurrently and return one token-budgeted bundle |
+| `devsql work start\|update\|done\|note\|list` | Write structured work events to the durable day log (agents populate; humans read) |
+| `devsql today` / `day` / `days` | Cross-project day timeline (Today granular; past days summarized) |
 
 Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`). `gather` also takes `--budget` (default `8000` tokens; lowest-ranked rows are dropped round-robin per section, never mid-row, until the bundle fits).
+
+### Workday memory
+
+Agents write short work events so you can answer “what did I do today?” across every project:
+
+```bash
+devsql work start "Fix auth token refresh" --project velo --agent codex --body "Investigating 401s"
+devsql work done <task-id> --body "Shipped fix; tests green"
+devsql today
+devsql day yesterday
+```
+
+Events live in `~/.devsql/worklog.sqlite` (override with `DEVSQL_HOME`) and are also queryable as SQL tables `work_tasks` and `work_events`.
+
+### MCP server
+
+Run `devsql --mcp` to start the stdio MCP server. It exposes the commands above as tools with typed input and output schemas. History/code tools are read-only; `work start|update|done|note` are write tools for the day log.
 
 ## Tables
 
@@ -97,6 +117,9 @@ Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.
 | `codex_tool_calls` | Same rollout journals | Backward-compatible tool-call view: tool_name, arguments_json, cmd, session_id, cwd, timestamp |
 | `codex_compactions` | Same rollout journals | Compaction summaries and window metadata |
 | `codex_ingest_errors` | DevSQL Codex index | Nonfatal journal read and JSON parsing errors |
+| `tool_calls` | `~/.claude/projects/<slug>/**/*.jsonl` (+ legacy `~/.claude/transcripts/*.jsonl`) | Claude assistant tool calls (tool_name, input_json, target, session_id, `_project`, timestamp) |
+| `work_tasks` | `~/.devsql/worklog.sqlite` | Durable tasks (title, project, status, agent, …) written via `devsql work` |
+| `work_events` | `~/.devsql/worklog.sqlite` | Day-timeline events (start/update/done/note) with `local_date` |
 
 ### Git
 
@@ -197,6 +220,14 @@ WHERE message.is_canonical = 1
   AND message.text LIKE '%auth callback%'
 ORDER BY message.timestamp DESC;
 ```
+
+### Gather a context bundle
+```bash
+devsql gather "auth token refresh"
+devsql gather "auth token refresh" -r /path/to/repo --budget 4000
+```
+
+`gather` returns six independently computed sections: prior work, repository state, code search, symbols, excerpts, and recent activity. If one section fails, the remaining sections are still returned and the failed section includes a note.
 
 ### File context and impact
 ```bash

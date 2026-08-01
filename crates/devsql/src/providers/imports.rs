@@ -216,18 +216,15 @@ fn parse_ts_import_statement(
 
     let mut entries = 0usize;
     for child in named_children(node) {
-        match child.kind() {
-            "import_clause" => {
-                entries += parse_ts_import_clause(
-                    child,
-                    source,
-                    file_path,
-                    line_number,
-                    &module,
-                    rows,
-                );
-            }
-            _ => {}
+        if child.kind() == "import_clause" {
+            entries += parse_ts_import_clause(
+                child,
+                source,
+                file_path,
+                line_number,
+                &module,
+                rows,
+            );
         }
     }
 

@@ -1,15 +1,14 @@
 //! DevSQL CLI - Unified SQL queries across Claude/Codex + Git data
 //!
 //! Built on the incurs framework, giving devsql all built-in CLI features:
-//! --help, --version, --llms, --llms-full, --mcp, --json, --csv, --table,
-//! --format, --filter-output, --verbose, shell completions, and skills.
+//! --help, --version, --llms, --llms-full, --mcp, --json, --format,
+//! --filter-output, --verbose, shell completions, and skills.
 
-use std::path::PathBuf;
-
-use devsql::{engine::detect_tables, UnifiedEngine};
+use devsql::engine::detect_tables;
 use incurs::cli::Cli;
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
-use incurs::output::{CommandResult, Format};
+use incurs::command::{CommandDef, Example, TypedContext, TypedResult};
+use incurs::mcp::{McpDiscovery, McpServeOptions, McpToolFilter};
+use incurs_extras::{CliExtras, ExtraFormat};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -27,13 +26,14 @@ struct QueryArgs {
 #[allow(dead_code)]
 struct QueryOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Omit header row in table/csv output
-    #[incur(alias = "H")]
+    #[incurs(alias = "H")]
+    #[serde(default)]
     no_header: bool,
 }
 
@@ -41,115 +41,79 @@ struct QueryOptions {
 // Handler
 // ---------------------------------------------------------------------------
 
-struct SqlHandler;
+type QueryOutput = Vec<Value>;
 
-#[async_trait::async_trait]
-impl CommandHandler for SqlHandler {
-    async fn run(&self, ctx: CommandContext) -> CommandResult {
-        let query = match ctx.args.get("query").and_then(|v| v.as_str()) {
-            Some(q) if !q.is_empty() => q.to_string(),
-            _ => {
-                return CommandResult::Error {
-                    code: "MISSING_QUERY".to_string(),
-                    message: "No SQL query provided. Run `devsql --help` for usage examples."
-                        .to_string(),
-                    retryable: false,
-                    exit_code: Some(1),
-                    cta: None,
-                };
-            }
-        };
+async fn run_query(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResult<QueryOutput> {
+    let query = ctx.args.query;
+    let (mut engine, _) = match devsql::tools::engine_from_paths(
+        &ctx.options.repo,
+        ctx.options.data_dir.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return error.into_typed(),
+    };
 
-        let repo_str = ctx
-            .options
-            .get("repo")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+    let (claude_tables, git_tables, code_tables, work_tables) = detect_tables(&query);
+    let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
+    let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
+    let code_refs: Vec<&str> = code_tables.iter().map(|s| s.as_str()).collect();
+    let work_refs: Vec<&str> = work_tables.iter().map(|s| s.as_str()).collect();
 
-        let repo_path = if repo_str == "." {
-            match std::env::current_dir() {
-                Ok(p) => p,
-                Err(e) => {
-                    return CommandResult::Error {
-                        code: "PATH_ERROR".to_string(),
-                        message: format!("Cannot determine current directory: {e}"),
-                        retryable: false,
-                        exit_code: Some(1),
-                        cta: None,
-                    };
-                }
-            }
-        } else {
-            PathBuf::from(repo_str)
-        };
-
-        let claude_dir = match ctx.options.get("data_dir").and_then(|v| v.as_str()) {
-            Some(d) => PathBuf::from(d),
-            None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".claude"),
-        };
-
-        let mut engine = match UnifiedEngine::new(claude_dir, repo_path) {
-            Ok(e) => e,
-            Err(e) => {
-                return CommandResult::Error {
-                    code: "ENGINE_ERROR".to_string(),
-                    message: format!("Failed to create engine: {e}"),
-                    retryable: false,
-                    exit_code: Some(1),
-                    cta: None,
-                };
-            }
-        };
-
-        let (claude_tables, git_tables, code_tables) = detect_tables(&query);
-        let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
-        let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
-        let code_refs: Vec<&str> = code_tables.iter().map(|s| s.as_str()).collect();
-
-        if let Err(e) = engine.load_claude_tables(&claude_refs) {
-            return CommandResult::Error {
-                code: "LOAD_ERROR".to_string(),
-                message: format!("Failed to load AI history tables: {e}"),
-                retryable: false,
-                exit_code: Some(1),
-                cta: None,
-            };
-        }
-        if let Err(e) = engine.load_git_tables(&git_refs) {
-            return CommandResult::Error {
-                code: "LOAD_ERROR".to_string(),
-                message: format!("Failed to load Git tables: {e}"),
-                retryable: false,
-                exit_code: Some(1),
-                cta: None,
-            };
-        }
-        if let Err(e) = engine.load_code_tables(&code_refs) {
-            return CommandResult::Error {
-                code: "LOAD_ERROR".to_string(),
-                message: format!("Failed to load code tables: {e}"),
-                retryable: false,
-                exit_code: Some(1),
-                cta: None,
-            };
-        }
-
-        match engine.query(&query) {
-            Ok(results) => CommandResult::Ok {
-                data: Value::Array(results),
-                cta: None,
-            },
-            Err(e) => CommandResult::Error {
-                code: "QUERY_ERROR".to_string(),
-                message: format!("Query failed: {e}"),
-                retryable: false,
-                exit_code: Some(1),
-                cta: None,
-            },
-        }
+    if let Err(e) = engine.load_claude_tables(&claude_refs) {
+        return TypedResult::error("LOAD_ERROR", format!("Failed to load Claude tables: {e}"));
     }
+    if let Err(e) = engine.load_git_tables(&git_refs) {
+        return TypedResult::error("LOAD_ERROR", format!("Failed to load Git tables: {e}"));
+    }
+    if let Err(e) = engine.load_code_tables(&code_refs) {
+        return TypedResult::error("LOAD_ERROR", format!("Failed to load code tables: {e}"));
+    }
+    if let Err(e) = engine.load_work_tables(&work_refs) {
+        return TypedResult::error("LOAD_ERROR", format!("Failed to load work tables: {e}"));
+    }
+
+    match engine.query(&query) {
+        Ok(results) => TypedResult::ok(results),
+        Err(e) => TypedResult::error("QUERY_ERROR", format!("Query failed: {e}")),
+    }
+}
+
+fn query_command(name: &str) -> CommandDef {
+    CommandDef::typed::<QueryArgs, QueryOptions, (), QueryOutput, _, _>(name, run_query)
+        .description("Execute a SQL query against your Claude/Codex + Git data")
+        .examples(query_examples())
+        .hint(query_hint())
+        .mcp(devsql::tools::read_only_mcp())
+        .done()
+}
+
+fn query_examples() -> Vec<Example> {
+    vec![
+        Example {
+            command: r#""SELECT * FROM commits LIMIT 5""#.to_string(),
+            description: Some("List recent commits".to_string()),
+        },
+        Example {
+            command: r#""SELECT h.message, COUNT(c.id) as commits FROM history h LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at) GROUP BY h.message HAVING commits > 0 ORDER BY commits DESC LIMIT 10""#.to_string(),
+            description: Some("Most productive prompts".to_string()),
+        },
+        Example {
+            command: r#""SELECT DATE(h.timestamp) as day, COUNT(*) as prompts, COUNT(DISTINCT c.id) as commits FROM history h LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at) GROUP BY day ORDER BY prompts DESC LIMIT 10""#.to_string(),
+            description: Some("Struggle days".to_string()),
+        },
+        Example {
+            command: r#""SELECT datetime(timestamp/1000, 'unixepoch') as time, display FROM jhistory ORDER BY timestamp DESC LIMIT 10""#.to_string(),
+            description: Some("Recent Codex prompts".to_string()),
+        },
+        Example {
+            command: r#""SELECT thread_id, cwd, last_event_at FROM codex_threads ORDER BY last_event_at DESC LIMIT 10""#.to_string(),
+            description: Some("Recent Codex conversations".to_string()),
+        },
+    ]
+}
+
+fn query_hint() -> &'static str {
+    "TABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use devsql to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with devsql today\"\n\nLearn more: https://github.com/douglance/devsql"
 }
 
 // ---------------------------------------------------------------------------
@@ -164,49 +128,22 @@ fn build_cli() -> Cli {
              prompts, identify struggle sessions, and learn what actually works for you.",
         )
         .version(env!("CARGO_PKG_VERSION"))
-        .format(Format::Table)
-        .root(
-            CommandDef::build("devsql", SqlHandler)
-                .description("Execute a SQL query against your Claude/Codex + Git data")
-                .args::<QueryArgs>()
-                .options::<QueryOptions>()
-                .examples(vec![
-                    Example {
-                        command: r#""SELECT * FROM commits LIMIT 5""#.to_string(),
-                        description: Some("List recent commits".to_string()),
-                    },
-                    Example {
-                        command: r#""SELECT h.message, COUNT(c.id) as commits FROM history h LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at) GROUP BY h.message HAVING commits > 0 ORDER BY commits DESC LIMIT 10""#.to_string(),
-                        description: Some("Most productive prompts".to_string()),
-                    },
-                    Example {
-                        command: r#""SELECT DATE(h.timestamp) as day, COUNT(*) as prompts, COUNT(DISTINCT c.id) as commits FROM history h LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at) GROUP BY day ORDER BY prompts DESC LIMIT 10""#.to_string(),
-                        description: Some("Struggle days".to_string()),
-                    },
-                    Example {
-                        command: r#""SELECT datetime(timestamp/1000, 'unixepoch') as time, display FROM jhistory ORDER BY timestamp DESC LIMIT 10""#.to_string(),
-                        description: Some("Recent Codex prompts".to_string()),
-                    },
-                    Example {
-                        command: r#""SELECT thread_id, cwd, last_event_at FROM codex_threads ORDER BY last_event_at DESC LIMIT 10""#.to_string(),
-                        description: Some("Recent Codex conversations".to_string()),
-                    },
-                ])
-                .hint(
-                    "TABLES:\n  \
-                     Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  \
-                     Codex CLI:    jhistory / codex_history, codex_threads, codex_messages,\n                 \
-                                   codex_events, codex_tool_executions / codex_tool_calls,\n                 \
-                                   codex_compactions, codex_ingest_errors\n  \
-                     Git:          commits, diffs, diff_files, branches\n\n\
-                     TELL YOUR AI AGENT:\n  \
-                     \"Use devsql to find my most effective prompts from the past month\"\n  \
-                     \"Query my history to find when I struggled most\"\n  \
-                     \"Analyze what my productive days have in common using devsql\"\n\n\
-                     Learn more: https://github.com/douglance/devsql",
-                )
-                .done(),
-        )
+        .default_extra_format(ExtraFormat::Table)
+        .mcp(McpServeOptions {
+            instructions: Some(
+                "Use DevSQL to query coding history, Git state, and source-code context. \
+                 Use work start/update/done/note to populate the user's cross-project day timeline; \
+                 use today/day/days to read it."
+                    .to_string(),
+            ),
+            tools: McpToolFilter {
+                discovery: McpDiscovery::Direct,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .root(query_command("devsql"))
+        .command("query", query_command("query"))
         .command("diff", devsql::tools::diff::build())
         .command("search", devsql::tools::search::build())
         .command("context", devsql::tools::context::build())
@@ -214,6 +151,10 @@ fn build_cli() -> Cli {
         .command("impact", devsql::tools::impact::build())
         .command("recall", devsql::tools::recall::build())
         .command("gather", devsql::tools::gather::build())
+        .group(devsql::tools::work::build_group())
+        .command("today", devsql::tools::day::build_today())
+        .command("day", devsql::tools::day::build_day())
+        .command("days", devsql::tools::day::build_days())
 }
 
 #[tokio::main]

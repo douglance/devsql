@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params_from_iter, Connection};
@@ -13,31 +13,32 @@ use serde_json::{json, Value};
 
 use super::engine_from_options;
 use super::recall::{match_expr, score_expr};
+use super::{legacy_context, read_only_mcp, typed_from_result};
 use crate::UnifiedEngine;
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct GatherArgs {
     /// Space-separated terms to gather context for
     terms: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct GatherOptions {
     /// Git repository path (scopes repo_state, code_search, symbols, excerpts)
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Token budget for the bundle; lowest-ranked rows are dropped round-robin
     /// per section (never mid-row) until the bundle fits
-    #[incur(default = "8000")]
+    #[incurs(default = 8000)]
     budget: i64,
 }
 
@@ -58,9 +59,22 @@ const SECTION_ORDER: [&str; 6] = [
 // Section result
 // ---------------------------------------------------------------------------
 
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 struct SectionResult {
     rows: Vec<Value>,
     note: Option<String>,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct GatherOutput {
+    terms: Vec<String>,
+    budget: usize,
+    prior_work: SectionResult,
+    repo_state: SectionResult,
+    code_search: SectionResult,
+    symbols: SectionResult,
+    excerpts: SectionResult,
+    activity: SectionResult,
 }
 
 impl SectionResult {
@@ -774,30 +788,39 @@ fn redact_row_field(row: &mut Value, field: &str) {
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("gather", GatherHandler)
-        .description(
-            "Run every context-gathering action (prior work, repo state, code search, \
+    CommandDef::typed::<GatherArgs, GatherOptions, (), GatherOutput, _, _>(
+        "gather",
+        |ctx: TypedContext<GatherArgs, GatherOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(GatherHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description(
+        "Run every context-gathering action (prior work, repo state, code search, \
              symbols, excerpts, activity) concurrently and return one token-budgeted bundle",
-        )
-        .args::<GatherArgs>()
-        .options::<GatherOptions>()
-        .examples(vec![
-            Example {
-                command: "recall ranking --json".to_string(),
-                description: Some("Gather everything relevant to 'recall ranking'".to_string()),
-            },
-            Example {
-                command: "auth token refresh -r /path/to/repo --budget 4000".to_string(),
-                description: Some("Gather with a tighter token budget".to_string()),
-            },
-        ])
-        .hint(
-            "Each of the 6 sections (prior_work, repo_state, code_search, symbols, excerpts, \
+    )
+    .args::<GatherArgs>()
+    .options::<GatherOptions>()
+    .examples(vec![
+        Example {
+            command: "recall ranking --json".to_string(),
+            description: Some("Gather everything relevant to 'recall ranking'".to_string()),
+        },
+        Example {
+            command: "auth token refresh -r /path/to/repo --budget 4000".to_string(),
+            description: Some("Gather with a tighter token budget".to_string()),
+        },
+    ])
+    .hint(
+        "Each of the 6 sections (prior_work, repo_state, code_search, symbols, excerpts, \
              activity) is computed on its own connection concurrently, then materialized as a \
              `gather_<section>` table in the connection used to render this response -- a \
              section that errors yields an empty section with a `note` instead of failing the \
              whole bundle. Once the bundle exceeds --budget tokens, the lowest-ranked row is \
              dropped round-robin across sections (never mid-row) until it fits.",
-        )
-        .done()
+    )
+    .mcp(read_only_mcp())
+    .done()
 }

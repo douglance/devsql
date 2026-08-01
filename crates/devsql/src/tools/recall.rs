@@ -1,35 +1,44 @@
 //! `devsql recall` -- load prior work relevant to search terms, ranked by
 //! how many terms each row matches (then recency).
 
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use serde_json::{json, Value};
 
-use super::engine_from_options;
+use super::{engine_from_options, legacy_context, read_only_mcp, typed_from_result};
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct RecallArgs {
     /// Space-separated terms to recall prior work for
     query: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct RecallOptions {
     /// Git repository path (scopes the commits source)
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Maximum number of results per source
-    #[incur(alias = "n", default = "8")]
+    #[incurs(alias = "n", default = 8)]
     limit: i64,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct RecallOutput {
+    terms: Vec<String>,
+    sessions: Vec<Value>,
+    commits: Vec<Value>,
+    prompts: Vec<Value>,
+    total: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,24 +256,33 @@ fn query_error(source: &str, e: crate::Error) -> CommandResult {
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("recall", RecallHandler)
-        .description(
-            "Load prior work (Claude sessions, Codex threads, commits, prompts) relevant to search terms, \
+    CommandDef::typed::<RecallArgs, RecallOptions, (), RecallOutput, _, _>(
+        "recall",
+        |ctx: TypedContext<RecallArgs, RecallOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(RecallHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description(
+        "Load prior work (Claude sessions, Codex threads, commits, prompts) relevant to search terms, \
              ranked by term-match count then recency",
-        )
-        .args::<RecallArgs>()
-        .options::<RecallOptions>()
-        .examples(vec![
-            Example {
-                command: "vision simulator mute --json".to_string(),
-                description: Some(
-                    "Recall prior work about the Vision Pro simulator, ranked".to_string(),
-                ),
-            },
-            Example {
-                command: "auth token refresh -r /path/to/repo".to_string(),
-                description: Some("Recall prior work, scoping commits to a repo".to_string()),
-            },
-        ])
-        .done()
+    )
+    .args::<RecallArgs>()
+    .options::<RecallOptions>()
+    .examples(vec![
+        Example {
+            command: "vision simulator mute --json".to_string(),
+            description: Some(
+                "Recall prior work about the Vision Pro simulator, ranked".to_string(),
+            ),
+        },
+        Example {
+            command: "auth token refresh -r /path/to/repo".to_string(),
+            description: Some("Recall prior work, scoping commits to a repo".to_string()),
+        },
+    ])
+    .mcp(read_only_mcp())
+    .done()
 }

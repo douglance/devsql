@@ -178,3 +178,32 @@ fn recall_returns_ranked_redacted_codex_threads() {
     assert!(excerpt.contains("Bearer <redacted>"));
     assert!(!excerpt.contains("abc.def.ghi"));
 }
+
+#[test]
+fn root_and_named_query_are_compatible() {
+    for args in [
+        vec!["SELECT 1 AS value", "--format", "json"],
+        vec!["query", "SELECT 1 AS value", "--format", "json"],
+    ] {
+        Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"value\": 1"));
+    }
+}
+
+#[test]
+fn table_and_csv_formats_remain_available() {
+    Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .args(["SELECT 1 AS value", "--format", "table"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("value"));
+
+    Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .args(["SELECT 1 AS value", "--format", "csv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("value\n1"));
+}

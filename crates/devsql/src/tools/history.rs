@@ -1,34 +1,41 @@
 //! `devsql history` -- show Git commit history for a specific file.
 
-use incurs::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incurs::command::{CommandContext, CommandDef, CommandHandler, Example, TypedContext};
 use incurs::output::CommandResult;
 use serde_json::{json, Value};
 
-use super::engine_from_options;
+use super::{engine_from_options, legacy_context, read_only_mcp, typed_from_result};
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(incurs::Args, serde::Deserialize)]
+#[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct HistoryArgs {
     /// File path (or partial path) to get history for
     file: String,
 }
 
-#[derive(incurs::Options, serde::Deserialize)]
+#[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct HistoryOptions {
     /// Git repository path
-    #[incur(alias = "r", default = ".")]
+    #[incurs(alias = "r", default = ".")]
     repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[incur(alias = "d")]
+    #[incurs(alias = "d")]
     data_dir: Option<String>,
     /// Maximum number of commits to return
-    #[incur(alias = "n", default = "20")]
+    #[incurs(alias = "n", default = 20)]
     limit: i64,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+struct HistoryOutput {
+    file_pattern: String,
+    total: usize,
+    commits: Vec<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,19 +117,28 @@ impl CommandHandler for HistoryHandler {
 // ---------------------------------------------------------------------------
 
 pub fn build() -> CommandDef {
-    CommandDef::build("history", HistoryHandler)
-        .description("Show Git commit history for a specific file")
-        .args::<HistoryArgs>()
-        .options::<HistoryOptions>()
-        .examples(vec![
-            Example {
-                command: "src/engine.rs --json".to_string(),
-                description: Some("Show commit history for engine.rs".to_string()),
-            },
-            Example {
-                command: "Cargo.toml --limit 5 --json".to_string(),
-                description: Some("Show last 5 commits touching Cargo.toml".to_string()),
-            },
-        ])
-        .done()
+    CommandDef::typed::<HistoryArgs, HistoryOptions, (), HistoryOutput, _, _>(
+        "history",
+        |ctx: TypedContext<HistoryArgs, HistoryOptions, ()>| async move {
+            match legacy_context(ctx) {
+                Ok(ctx) => typed_from_result(HistoryHandler.run(ctx).await),
+                Err(error) => error.into_typed(),
+            }
+        },
+    )
+    .description("Show Git commit history for a specific file")
+    .args::<HistoryArgs>()
+    .options::<HistoryOptions>()
+    .examples(vec![
+        Example {
+            command: "src/engine.rs --json".to_string(),
+            description: Some("Show commit history for engine.rs".to_string()),
+        },
+        Example {
+            command: "Cargo.toml --limit 5 --json".to_string(),
+            description: Some("Show last 5 commits touching Cargo.toml".to_string()),
+        },
+    ])
+    .mcp(read_only_mcp())
+    .done()
 }

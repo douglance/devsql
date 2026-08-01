@@ -229,7 +229,10 @@ fn gather_enforces_token_budget() {
     let claude = create_claude_data_dir();
     let repo = create_git_repo();
     let codex_home = isolated_codex_home();
-    let budget = 90;
+    // The required six-section response envelope is roughly 130 tokens even
+    // after every row is trimmed, so keep the budget tight but above that
+    // irreducible minimum.
+    let budget = 160;
 
     // Sanity check: without a budget, this fixture produces a bundle well
     // over the tight budget below, so the assertion actually exercises

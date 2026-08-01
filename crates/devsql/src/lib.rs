@@ -10,6 +10,7 @@ pub mod error;
 pub mod providers;
 mod redaction;
 pub mod tools;
+pub mod worklog;
 
 pub use engine::UnifiedEngine;
 pub use error::Error;
