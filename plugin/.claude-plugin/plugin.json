@@ -9,6 +9,5 @@
   "homepage": "https://github.com/douglance/devsql",
   "repository": "https://github.com/douglance/devsql",
   "license": "MIT",
-  "keywords": ["sql", "claude-code", "history", "analytics", "productivity"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["sql", "claude-code", "history", "analytics", "productivity"]
 }
