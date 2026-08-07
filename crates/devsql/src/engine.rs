@@ -19,6 +19,7 @@ pub struct UnifiedEngine {
     codex_data_dir: PathBuf,
     git_repo_path: PathBuf,
     codex_loaded: bool,
+    macos_log_stats: Option<crate::providers::macos_logs::MacosLogStats>,
 }
 
 impl UnifiedEngine {
@@ -52,6 +53,7 @@ impl UnifiedEngine {
             codex_data_dir,
             git_repo_path,
             codex_loaded: false,
+            macos_log_stats: None,
         })
     }
 
@@ -100,6 +102,20 @@ impl UnifiedEngine {
     /// Load the normalized Atuin, zsh, and bash history table.
     pub fn load_shell_history(&mut self) -> Result<()> {
         crate::providers::shell_history::load(&mut self.conn)
+    }
+
+    /// Register the read-only macOS Unified Log virtual table for this query.
+    pub fn load_macos_logs(
+        &mut self,
+        config: crate::providers::macos_logs::MacosLogConfig,
+    ) -> Result<()> {
+        self.macos_log_stats = Some(crate::providers::macos_logs::register(&self.conn, config)?);
+        Ok(())
+    }
+
+    /// Return partial-result information from the most recent macOS log scan.
+    pub fn macos_log_truncation(&self) -> Option<(usize, String)> {
+        self.macos_log_stats.as_ref()?.truncation()
     }
 
     /// Load normalized shell and agent-issued command events with source-native provenance.
@@ -211,8 +227,7 @@ impl UnifiedEngine {
             Ok(Value::Object(obj))
         })?;
 
-        let results: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
-        Ok(results)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // --- Table loaders ---
@@ -1050,9 +1065,10 @@ fn query_mentions_table(query_upper: &str, table_name: &str) -> bool {
 
 /// Detect which tables are needed from a SQL query.
 ///
-/// Returns a 5-tuple:
-/// (claude_tables, git_tables, code_tables, shell_tables, work_tables).
+/// Returns a 6-tuple:
+/// (claude_tables, git_tables, code_tables, shell_tables, work_tables, system_tables).
 pub type TableRequirements = (
+    Vec<String>,
     Vec<String>,
     Vec<String>,
     Vec<String>,
@@ -1108,6 +1124,7 @@ pub fn detect_tables(query: &str) -> TableRequirements {
     ];
     let shell_tables = ["shell_history", "command_events"];
     let work_tables = ["work_tasks", "work_events"];
+    let system_tables = ["macos_logs"];
 
     let needed_claude: Vec<String> = claude_tables
         .iter()
@@ -1139,12 +1156,19 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         .map(|s| s.to_string())
         .collect();
 
+    let needed_system: Vec<String> = system_tables
+        .iter()
+        .filter(|t| query_mentions_table(&query_upper, t))
+        .map(|s| s.to_string())
+        .collect();
+
     (
         needed_claude,
         needed_git,
         needed_code,
         needed_shell,
         needed_work,
+        needed_system,
     )
 }
 
@@ -1155,7 +1179,8 @@ mod tests {
 
     #[test]
     fn detect_tables_handles_jhistory_without_history_false_positive() {
-        let (claude, _, _, _, _) = detect_tables("SELECT session_id, text FROM jhistory LIMIT 5");
+        let (claude, _, _, _, _, _) =
+            detect_tables("SELECT session_id, text FROM jhistory LIMIT 5");
 
         assert!(claude.contains(&"jhistory".to_string()));
         assert!(!claude.contains(&"history".to_string()));
@@ -1163,7 +1188,7 @@ mod tests {
 
     #[test]
     fn detect_tables_handles_codex_history_without_history_false_positive() {
-        let (claude, _, _, _, _) =
+        let (claude, _, _, _, _, _) =
             detect_tables("SELECT session_id, text FROM codex_history LIMIT 5");
 
         assert!(claude.contains(&"codex_history".to_string()));
@@ -1172,7 +1197,7 @@ mod tests {
 
     #[test]
     fn detect_tables_finds_code_tables() {
-        let (_, _, code, _, _) = detect_tables(
+        let (_, _, code, _, _, _) = detect_tables(
             "SELECT * FROM source_files JOIN symbols ON source_files.path = symbols.file_path",
         );
 
@@ -1183,7 +1208,7 @@ mod tests {
 
     #[test]
     fn detect_tables_finds_work_tables() {
-        let (_, _, _, _, work) = detect_tables(
+        let (_, _, _, _, work, _) = detect_tables(
             "SELECT * FROM work_events JOIN work_tasks ON work_events.task_id = work_tasks.id",
         );
         assert!(work.contains(&"work_events".to_string()));
@@ -1192,15 +1217,24 @@ mod tests {
 
     #[test]
     fn detect_tables_finds_shell_history_without_history_false_positive() {
-        let (claude, _, _, shell, _) = detect_tables("SELECT command FROM shell_history LIMIT 5");
+        let (claude, _, _, shell, _, _) =
+            detect_tables("SELECT command FROM shell_history LIMIT 5");
         assert_eq!(shell, vec!["shell_history".to_string()]);
         assert!(!claude.contains(&"history".to_string()));
     }
 
     #[test]
     fn detect_tables_finds_command_events() {
-        let (_, _, _, shell, _) = detect_tables("SELECT actor, command FROM command_events");
+        let (_, _, _, shell, _, _) = detect_tables("SELECT actor, command FROM command_events");
         assert_eq!(shell, vec!["command_events".to_string()]);
+    }
+
+    #[test]
+    fn detect_tables_finds_macos_logs() {
+        let (_, _, _, shell, _, system) =
+            detect_tables("SELECT subsystem, message FROM macos_logs");
+        assert!(shell.is_empty());
+        assert_eq!(system, vec!["macos_logs".to_string()]);
     }
 
     #[test]

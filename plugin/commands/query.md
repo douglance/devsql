@@ -1,10 +1,10 @@
 ---
-description: Execute SQL queries against Claude Code, Codex CLI, Git, and source code data. Usage: /devsql:query <SQL>
+description: Execute SQL queries against Claude Code, Codex CLI, macOS Unified Logs, Git, and source code data. Usage: /devsql:query <SQL>
 ---
 
 # DevSQL Query
 
-Execute a direct SQL query against developer-local data. This slash command is a convenience fallback; agents should prefer the DevSQL Code Mode server (`devsql --mcp`) when it is connected.
+Execute a direct SQL query against developer-local data, including macOS Unified Logs. This slash command is a convenience fallback; agents should prefer the DevSQL Code Mode server (`devsql --mcp`) when it is connected.
 
 ## Prerequisites
 
@@ -54,9 +54,20 @@ devsql impact src/lib.rs         # Exports and dependents
 - `imports` — Import/use statements (file_path, line_number, module, name, alias, kind, is_default, is_wildcard). Requires `tree-sitter-ast` feature for full extraction.
 - `ast_nodes` — Raw AST nodes. Requires `tree-sitter-ast` feature.
 
+### macOS Unified Log
+
+- `macos_logs` — Streamed events from the live log datastore or a `.logarchive`, with normalized process, subsystem, category, level, message, timestamp, provenance, and raw JSON fields. Bound scans with `--log-last`, paired `--log-start`/`--log-end`, `--log-predicate`, `--log-archive`, `--log-level`, `--log-max-rows`, and `--log-timeout`.
+
 ## Example Queries
 
 ```sql
+-- Recent errors; invoke with --log-last 10m --log-level info
+SELECT timestamp, process, subsystem, category, message
+FROM macos_logs
+WHERE process = 'ExampleApp' AND message LIKE '%error%'
+ORDER BY timestamp DESC
+LIMIT 100;
+
 -- Recent Claude prompts
 SELECT display, project
 FROM history

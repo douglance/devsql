@@ -14,7 +14,7 @@ repository = "https://github.com/douglance/devsql"
 
 [workspace.dependencies]
 # SQL engines
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions", "vtab"] }
 gluesql = "0.19"
 gluesql-json-storage = "0.19"
 

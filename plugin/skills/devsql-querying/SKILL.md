@@ -1,11 +1,11 @@
 ---
 name: devsql-querying
-description: Query and analyze developer-local history, Git, and source code through DevSQL Code Mode. Use when the user asks about prior conversations, shell commands, productivity, commits, sessions, symbols, file context, or impact analysis.
+description: Query and analyze developer-local history, macOS Unified Logs, Git, and source code through DevSQL Code Mode. Use when the user asks about prior conversations, shell commands, system logs, productivity, commits, sessions, symbols, file context, or impact analysis.
 ---
 
 # DevSQL Querying Skill
 
-Use DevSQL Code Mode to query Claude Code and Codex CLI history, shell history, Git commits, source code, and durable worklogs.
+Use DevSQL Code Mode to query Claude Code and Codex CLI history, shell history, macOS Unified Logs, Git commits, source code, and durable worklogs.
 
 ## Primary interface
 
@@ -24,6 +24,7 @@ Use the direct commands below only when Code Mode is unavailable or when writing
 - User asks "What's in this file?" or needs file context
 - User wants to understand what changed between commits
 - User asks about imports, dependencies, or impact of a file
+- User wants to diagnose recent macOS application or subsystem behavior
 
 ## Prerequisites
 
@@ -72,6 +73,19 @@ files. `_agent_id` is set only on subagent rows.
 | `diffs` | commit_id, files_changed, insertions, deletions |
 | `diff_files` | commit_id, path, status (A/D/M/R/C), insertions, deletions |
 
+### macOS Unified Log
+
+| Table | Columns |
+|-------|---------|
+| `macos_logs` | timestamp, event_type, subsystem, category, process, process_id, thread_id, sender, message, level, activity_id, trace_id, boot_uuid, raw_json, provenance, source, archive_path, source_order, timestamp_ms, image/signpost fields |
+
+Pass `log_last`, `log_start`/`log_end`, `log_predicate`, `log_archive`,
+`log_level`, `log_max_rows`, and `log_timeout` to `devsql.query`. Prefer a
+narrow time window plus process or subsystem filters. Defaults are 15 minutes,
+standard level, 50,000 rows, and 30 seconds. The provider streams with bounded
+memory, pushes safe filters into macOS `log show`, and returns partial rows with
+a warning when a timeout or configured row cap is reached.
+
 ### Code Tables (Source Analysis)
 | Table | Columns |
 |-------|---------|
@@ -101,6 +115,13 @@ Note: history.timestamp is in milliseconds. Use `datetime(timestamp/1000, 'unixe
 ## Example Queries
 
 ```sql
+-- Recent application errors (pass log_last: "10m", log_level: "info")
+SELECT timestamp, process, subsystem, category, message
+FROM macos_logs
+WHERE process = 'ExampleApp' AND message LIKE '%error%'
+ORDER BY timestamp DESC
+LIMIT 100;
+
 -- Recent prompts
 SELECT display as prompt, project
 FROM history ORDER BY timestamp DESC LIMIT 10;

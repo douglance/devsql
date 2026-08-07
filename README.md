@@ -1,8 +1,8 @@
 # DevSQL
 
-Code Mode for AI coding history, shell history, Git repositories, source code, and durable worklogs. Code Mode is the primary agent interface; the direct SQL CLI remains available for humans and scripts.
+Code Mode for AI coding history, shell history, macOS Unified Logs, Git repositories, source code, and durable worklogs. Code Mode is the primary agent interface; the direct SQL CLI remains available for humans and scripts.
 
-DevSQL loads data from Claude Code, Codex CLI, shell history, Git, your source tree, and its durable worklog into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
+DevSQL loads data from Claude Code, Codex CLI, shell history, macOS Unified Logs, Git, your source tree, and its durable worklog into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Unified Logs stream through a bounded virtual table rather than being materialized. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
 
 ## Primary agent interface: Code Mode
 
@@ -33,6 +33,7 @@ Read-only methods run without approval. Worklog writes pause for an explicit dec
 ~/.claude/       --+
 ~/.codex/        --+
 shell histories  --+
+macOS logs       --+
 worklog.sqlite   --+--> SQLite --> SQL queries / JSON / CSV
 .git/            --+
 src/**/*         --+
@@ -175,6 +176,46 @@ The stable `command_events` columns are `source`, `channel`, `actor`,
 Source paths are discovered from Atuin's `db_path` setting and the standard
 Atuin, zsh, and bash locations. Set `DEVSQL_ATUIN_DB`,
 `DEVSQL_ZSH_HISTORY`, or `DEVSQL_BASH_HISTORY` to override a source path.
+
+### macOS Unified Logs
+
+| Table | Source | Description |
+|-------|--------|-------------|
+| `macos_logs` | macOS live log datastore or a `.logarchive` | Normalized event fields, stable provenance, source ordering, and the original NDJSON record |
+
+Use it through Code Mode:
+
+```js
+await devsql.query({
+  query: "SELECT timestamp, process, subsystem, category, level, message FROM macos_logs WHERE subsystem = 'com.apple.runningboard' ORDER BY timestamp DESC LIMIT 100",
+  log_last: "10m",
+  log_level: "info"
+})
+```
+
+The direct CLI accepts `--log-last`, paired `--log-start`/`--log-end`,
+`--log-predicate`, `--log-archive`, `--log-level`, `--log-max-rows`, and
+`--log-timeout`. Defaults are the last 15 minutes, standard-level events,
+50,000 rows, and 30 seconds. `last` accepts `boot` or a positive value ending
+in `s`, `m`, `h`, or `d`.
+
+DevSQL safely pushes timestamp, process, PID, subsystem, category, level, event
+type, exact message, and simple `%literal%` message filters into `/usr/bin/log`.
+The child process writes through a bounded channel; DevSQL drains stderr and
+kills and reaps the process on timeout, SQL `LIMIT`, row cap, query error, or
+cursor teardown. A timeout or configured row cap returns the rows already read
+with a partial-scan warning. SQL `LIMIT` is treated as an intentional bound.
+
+The stable columns are `timestamp`, `event_type`, `subsystem`, `category`,
+`process`, `process_id`, `thread_id`, `sender`, `message`, `level`,
+`activity_id`, `trace_id`, `boot_uuid`, `raw_json`, `provenance`, `source`,
+`archive_path`, `source_order`, `timestamp_ms`, `format_string`,
+`process_image_path`, `sender_image_path`, `parent_activity_id`, signpost
+fields, `user_id`, and `mach_timestamp`. The hidden columns `start`, `end`,
+`predicate`, `archive`, `level_filter`, `max_rows`, and `timeout` can override
+the matching option inside SQL. This provider is read-only, macOS-only, and
+does not cache or persist logs. Messages and `raw_json` are returned without
+redaction.
 
 ### Git
 

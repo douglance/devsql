@@ -6,6 +6,24 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
+fn write_slow_mock_log(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("slow-mock-log");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' '{\"eventMessage\":\"during scan\"}'\nexec sleep 2\n",
+    )
+    .expect("mock log");
+    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod");
+    path
+}
 
 fn send(stdin: &mut impl Write, message: Value) {
     writeln!(stdin, "{message}").expect("write MCP message");
@@ -164,9 +182,13 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
 }
 
 #[test]
+#[cfg(unix)]
 fn code_mode_stays_responsive_during_concurrent_queries() {
+    let temp = TempDir::new().expect("temp");
+    let log_bin = write_slow_mock_log(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_devsql"))
         .arg("--mcp")
+        .env("DEVSQL_MACOS_LOG_BIN", log_bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -203,9 +225,9 @@ fn code_mode_stays_responsive_during_concurrent_queries() {
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    let slow_query = "WITH RECURSIVE cnt(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM cnt WHERE x < 10000000) SELECT sum(x) AS total FROM cnt";
+    let slow_query = "SELECT message FROM macos_logs WHERE timeout = 2 AND max_rows = 100";
     let code = format!(
-        "Promise.all([devsql.query({{ query: {slow_query:?} }}), devsql.query({{ query: {slow_query:?} }})])"
+        "Promise.all([devsql.query({{ query: {slow_query:?}, log_last: '1m', log_level: 'info' }}), devsql.query({{ query: {slow_query:?}, log_last: '1m', log_level: 'info' }})])"
     );
     send(
         &mut stdin,
@@ -294,7 +316,7 @@ fn code_mode_stays_responsive_during_concurrent_queries() {
     assert_eq!(result.len(), 2, "{executed}");
     assert!(result
         .iter()
-        .all(|value| value.to_string().contains("total")));
+        .all(|value| value.to_string().contains("during scan")));
 
     drop(stdin);
     let status = child.wait().expect("wait for MCP server");

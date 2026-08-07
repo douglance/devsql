@@ -9,6 +9,7 @@ use std::sync::Arc;
 use devsql::engine::detect_tables;
 use incurs::cli::Cli;
 use incurs::command::{CommandDef, Example, TypedContext, TypedResult};
+use incurs::output::{CtaBlock, CtaEntry};
 use incurs_codemode::{
     CodeMode, CodeModeRunOptions, CodeModeService, ExecutionState, IncurConnector, MemoryStore,
     SearchOutput,
@@ -93,6 +94,25 @@ struct QueryOptions {
     #[incurs(alias = "H")]
     #[serde(default)]
     no_header: bool,
+    /// Relative macOS Unified Log window (defaults to 15m)
+    log_last: Option<String>,
+    /// Absolute macOS Unified Log start time (requires --log-end)
+    log_start: Option<String>,
+    /// Absolute macOS Unified Log end time (requires --log-start)
+    log_end: Option<String>,
+    /// Additional macOS Unified Log NSPredicate
+    log_predicate: Option<String>,
+    /// Read a .logarchive instead of the live macOS log datastore
+    log_archive: Option<String>,
+    /// macOS Unified Log level: standard, info, or debug
+    #[incurs(default = "standard")]
+    log_level: String,
+    /// Maximum macOS Unified Log records to scan
+    #[incurs(default = 50000)]
+    log_max_rows: usize,
+    /// Maximum macOS Unified Log scan duration in seconds
+    #[incurs(default = 30)]
+    log_timeout: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +140,8 @@ fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedRe
         Err(error) => return error.into_typed(),
     };
 
-    let (claude_tables, git_tables, code_tables, shell_tables, work_tables) = detect_tables(&query);
+    let (claude_tables, git_tables, code_tables, shell_tables, work_tables, system_tables) =
+        detect_tables(&query);
     let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
     let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
     let code_refs: Vec<&str> = code_tables.iter().map(|s| s.as_str()).collect();
@@ -151,9 +172,46 @@ fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedRe
     if let Err(e) = engine.load_work_tables(&work_refs) {
         return TypedResult::error("LOAD_ERROR", format!("Failed to load work tables: {e}"));
     }
+    if system_tables.iter().any(|table| table == "macos_logs") {
+        let config = devsql::providers::macos_logs::MacosLogConfig {
+            last: ctx.options.log_last,
+            start: ctx.options.log_start,
+            end: ctx.options.log_end,
+            predicate: ctx.options.log_predicate,
+            archive: ctx.options.log_archive,
+            level: ctx.options.log_level,
+            max_rows: ctx.options.log_max_rows,
+            timeout: std::time::Duration::from_secs(ctx.options.log_timeout),
+        };
+        if let Err(error) = engine.load_macos_logs(config) {
+            return TypedResult::error(
+                "LOAD_ERROR",
+                format!("Failed to load macOS Unified Logs: {error}"),
+            );
+        }
+    }
 
     match engine.query(&query) {
-        Ok(results) => TypedResult::ok(results),
+        Ok(results) => {
+            if let Some((rows, reason)) = engine.macos_log_truncation() {
+                TypedResult::Ok {
+                    data: results,
+                    cta: Some(CtaBlock {
+                        commands: vec![CtaEntry::Detailed {
+                            command: "query <SQL> --log-last 5m".to_string(),
+                            description: Some(
+                                "Rerun with a narrower window or predicate".to_string(),
+                            ),
+                        }],
+                        description: Some(format!(
+                            "macos_logs returned a partial scan after {rows} rows: {reason}. Narrow the time window or predicate, or raise the relevant log bound."
+                        )),
+                    }),
+                }
+            } else {
+                TypedResult::ok(results)
+            }
+        }
         Err(e) => TypedResult::error("QUERY_ERROR", format!("Query failed: {e}")),
     }
 }
@@ -193,11 +251,15 @@ fn query_examples() -> Vec<Example> {
             command: r#""SELECT source, timestamp, command FROM shell_history ORDER BY timestamp DESC LIMIT 10""#.to_string(),
             description: Some("Recent Atuin, zsh, and bash commands".to_string()),
         },
+        Example {
+            command: r#""SELECT timestamp, process, subsystem, category, message FROM macos_logs WHERE process = 'ExampleApp' ORDER BY timestamp DESC LIMIT 100" --log-last 10m --log-level info"#.to_string(),
+            description: Some("Recent macOS Unified Log events".to_string()),
+        },
     ]
 }
 
 fn query_hint() -> &'static str {
-    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
+    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  macOS:        macos_logs (bounded live or .logarchive stream with provenance)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +270,7 @@ fn build_cli() -> Cli {
     Cli::create("devsql")
         .description(
             "Code Mode is the primary agent interface for querying AI coding, Git, source code, \
-             shell history, and worklog data.\n\n\
+             shell history, macOS Unified Logs, and worklog data.\n\n\
              Run `devsql --mcp` for the Code Mode server. Use the direct CLI for human queries \
              and scripts.",
         )

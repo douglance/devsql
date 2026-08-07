@@ -1,6 +1,6 @@
 # DevSQL Claude Code Plugin
 
-Use DevSQL Code Mode to query Claude Code history, Codex CLI history, shell history, Git data, source code, and durable worklogs. Code Mode is the primary agent interface; slash commands and the direct CLI are fallbacks.
+Use DevSQL Code Mode to query Claude Code history, Codex CLI history, shell history, macOS Unified Logs, Git data, source code, and durable worklogs. Code Mode is the primary agent interface; slash commands and the direct CLI are fallbacks.
 
 ## Installation
 
@@ -63,6 +63,10 @@ Claude will automatically use devsql to answer.
 - `branches` — Branch info (name, is_head, commit_id)
 - `diffs` — Commit-level diff stats (commit_id, files_changed, insertions, deletions)
 - `diff_files` — Per-file diff stats (commit_id, path, status, insertions, deletions)
+
+### macOS Unified Log
+
+- `macos_logs` — Bounded, streamed events from the live datastore or a `.logarchive`, including normalized fields, provenance, and raw JSON. Configure it through `devsql.query` with `log_last`, `log_start`/`log_end`, `log_predicate`, `log_archive`, `log_level`, `log_max_rows`, and `log_timeout`.
 
 ### Code (Source Analysis)
 - `source_files` — File inventory (path, name, extension, language, size_bytes, line_count)
