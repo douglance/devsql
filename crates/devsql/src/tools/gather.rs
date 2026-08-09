@@ -147,6 +147,9 @@ impl CommandHandler for GatherHandler {
         // expensive loaders. This avoids syncing Codex twice and reading every
         // source file three times for one gather request.
         let mut sections: HashMap<&'static str, SectionResult> = std::thread::scope(|scope| {
+            let tokenizer = scope.spawn(|| {
+                let _ = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
+            });
             let handles = [
                 scope.spawn(|| {
                     sections_prior_work_and_activity(&claude_dir, &repo_path, &terms, SECTION_LIMIT)
@@ -166,6 +169,7 @@ impl CommandHandler for GatherHandler {
                     }
                 }
             }
+            let _ = tokenizer.join();
             collected
         });
 
@@ -390,20 +394,83 @@ fn sections_prior_work_and_activity(
     terms: &[String],
     limit: i64,
 ) -> Vec<(&'static str, SectionResult)> {
-    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
-        Ok(engine) => engine,
-        Err(error) => {
-            let message = format!("engine init failed: {error}");
-            return vec![
-                ("prior_work", SectionResult::err(message.clone())),
-                ("activity", SectionResult::err(message)),
-            ];
-        }
-    };
+    if terms.is_empty() {
+        return vec![
+            ("prior_work", SectionResult::ok(Vec::new())),
+            ("activity", SectionResult::ok(Vec::new())),
+        ];
+    }
 
-    let prior_work = section_prior_work(&mut engine, terms, limit);
-    let activity = section_activity(&mut engine, terms, limit);
+    let (prior_work, activity) = std::thread::scope(|scope| {
+        let (claude_ready_tx, claude_ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (codex_ready_tx, codex_ready_rx) = std::sync::mpsc::sync_channel(0);
+        let non_codex = scope.spawn(move || {
+            prior_work_non_codex(claude_dir, repo_path, terms, limit, claude_ready_tx)
+        });
+        let codex = scope
+            .spawn(move || prior_work_codex(claude_dir, repo_path, terms, limit, codex_ready_tx));
+        let activity = scope.spawn(move || {
+            let claude_cache_ready = claude_ready_rx.recv().is_ok();
+            let codex_cache_ready = codex_ready_rx.recv().is_ok();
+            let mut engine =
+                match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        return SectionResult::err(format!("engine init failed: {error}"));
+                    }
+                };
+            if claude_cache_ready {
+                if let Err(error) = engine.load_current_claude_tool_calls() {
+                    return SectionResult::err(format!("failed to load command events: {error}"));
+                }
+            }
+            if codex_cache_ready {
+                if let Err(error) = engine.load_current_codex_tables() {
+                    return SectionResult::err(format!("failed to load command events: {error}"));
+                }
+            }
+            section_activity(&mut engine, terms, limit)
+        });
+
+        let non_codex = non_codex
+            .join()
+            .unwrap_or_else(|_| Err("prior-work source panicked".to_string()));
+        let codex = codex
+            .join()
+            .unwrap_or_else(|_| Err("Codex prior-work source panicked".to_string()));
+        let activity = activity
+            .join()
+            .unwrap_or_else(|_| SectionResult::err("activity source panicked"));
+
+        let prior_work = match (non_codex, codex) {
+            (Ok((sessions, commits, prompts)), Ok(codex)) => SectionResult::ok(
+                merge_prior_work_rows(sessions, codex, commits, prompts, limit),
+            ),
+            (Err(error), _) | (_, Err(error)) => SectionResult::err(error),
+        };
+        (prior_work, activity)
+    });
+
     vec![("prior_work", prior_work), ("activity", activity)]
+}
+
+fn merge_prior_work_rows(
+    mut sessions: Vec<Value>,
+    codex: Vec<Value>,
+    commits: Vec<Value>,
+    prompts: Vec<Value>,
+    limit: i64,
+) -> Vec<Value> {
+    sessions.extend(codex);
+    sessions.extend(commits);
+    sessions.extend(prompts);
+    sessions.sort_by(|a, b| {
+        let sa = a.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
+        let sb = b.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
+        sb.cmp(&sa)
+    });
+    sessions.truncate(limit as usize);
+    sessions
 }
 
 fn sections_code(
@@ -456,22 +523,25 @@ fn sections_code(
     ]
 }
 
-/// 1. prior_work -- reuse recall's ranking (sessions, commits, prompts).
-fn section_prior_work(engine: &mut UnifiedEngine, terms: &[String], limit: i64) -> SectionResult {
-    if terms.is_empty() {
-        return SectionResult::ok(Vec::new());
-    }
+/// Load and rank the non-Codex prior-work sources.
+type NonCodexPriorWork = (Vec<Value>, Vec<Value>, Vec<Value>);
 
-    if let Err(e) =
-        engine.load_claude_tables(&["sessions", "history", "codex_threads", "codex_messages"])
-    {
-        return SectionResult::err(format!("failed to load claude tables: {e}"));
-    }
-    if let Err(e) = engine.load_git_tables(&["commits"]) {
-        return SectionResult::err(format!("failed to load git tables: {e}"));
-    }
-
-    let mut rows = Vec::new();
+fn prior_work_non_codex(
+    claude_dir: &Path,
+    repo_path: &Path,
+    terms: &[String],
+    limit: i64,
+    ready: std::sync::mpsc::SyncSender<()>,
+) -> std::result::Result<NonCodexPriorWork, String> {
+    let mut engine = UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf())
+        .map_err(|error| format!("engine init failed: {error}"))?;
+    engine
+        .load_claude_tables(&["sessions", "history"])
+        .map_err(|error| format!("failed to load claude tables: {error}"))?;
+    let _ = ready.send(());
+    engine
+        .load_git_tables(&["commits"])
+        .map_err(|error| format!("failed to load git tables: {error}"))?;
 
     let sessions_sql = format!(
         "SELECT 'session' AS kind, title AS text, substr(last_timestamp, 1, 10) AS date, \
@@ -480,10 +550,49 @@ fn section_prior_work(engine: &mut UnifiedEngine, terms: &[String], limit: i64) 
         score = score_expr("title", terms),
         matches = match_expr("title", terms),
     );
-    match engine.query(&sessions_sql) {
-        Ok(r) => rows.extend(r),
-        Err(e) => return SectionResult::err(format!("sessions query failed: {e}")),
-    }
+    let sessions = engine
+        .query(&sessions_sql)
+        .map_err(|error| format!("sessions query failed: {error}"))?;
+
+    let commit_expr = "(summary || ' ' || coalesce(message, ''))";
+    let commits_sql = format!(
+        "SELECT 'commit' AS kind, substr(summary, 1, 90) AS text, substr(authored_at, 1, 10) AS date, \
+                {score} AS score \
+         FROM commits WHERE {matches} ORDER BY score DESC, authored_at DESC LIMIT {limit}",
+        score = score_expr(commit_expr, terms),
+        matches = match_expr(commit_expr, terms),
+    );
+    let commits = engine
+        .query(&commits_sql)
+        .map_err(|error| format!("commits query failed: {error}"))?;
+
+    let prompts_sql = format!(
+        "SELECT 'prompt' AS kind, substr(replace(display, char(10), ' '), 1, 110) AS text, \
+                date(timestamp / 1000, 'unixepoch') AS date, {score} AS score \
+         FROM history WHERE {matches} ORDER BY score DESC, timestamp DESC LIMIT {limit}",
+        score = score_expr("display", terms),
+        matches = match_expr("display", terms),
+    );
+    let prompts = engine
+        .query(&prompts_sql)
+        .map_err(|error| format!("prompts query failed: {error}"))?;
+
+    Ok((sessions, commits, prompts))
+}
+
+fn prior_work_codex(
+    claude_dir: &Path,
+    repo_path: &Path,
+    terms: &[String],
+    limit: i64,
+    ready: std::sync::mpsc::SyncSender<()>,
+) -> std::result::Result<Vec<Value>, String> {
+    let mut engine = UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf())
+        .map_err(|error| format!("engine init failed: {error}"))?;
+    engine
+        .load_claude_tables(&["codex_threads", "codex_messages"])
+        .map_err(|error| format!("failed to load claude tables: {error}"))?;
+    let _ = ready.send(());
 
     let codex_score = score_expr("message.text", terms);
     let codex_sql = format!(
@@ -517,49 +626,13 @@ fn section_prior_work(engine: &mut UnifiedEngine, terms: &[String], limit: i64) 
         matches = match_expr("message.text", terms),
         recent_limit = RECENT_CODEX_SEARCH_LIMIT,
     );
-    match engine.query(&codex_sql) {
-        Ok(mut codex_rows) => {
-            for row in &mut codex_rows {
-                redact_row_field(row, "text");
-            }
-            rows.extend(codex_rows);
-        }
-        Err(e) => return SectionResult::err(format!("codex threads query failed: {e}")),
+    let mut rows = engine
+        .query(&codex_sql)
+        .map_err(|error| format!("codex threads query failed: {error}"))?;
+    for row in &mut rows {
+        redact_row_field(row, "text");
     }
-
-    let commit_expr = "(summary || ' ' || coalesce(message, ''))";
-    let commits_sql = format!(
-        "SELECT 'commit' AS kind, substr(summary, 1, 90) AS text, substr(authored_at, 1, 10) AS date, \
-                {score} AS score \
-         FROM commits WHERE {matches} ORDER BY score DESC, authored_at DESC LIMIT {limit}",
-        score = score_expr(commit_expr, terms),
-        matches = match_expr(commit_expr, terms),
-    );
-    match engine.query(&commits_sql) {
-        Ok(r) => rows.extend(r),
-        Err(e) => return SectionResult::err(format!("commits query failed: {e}")),
-    }
-
-    let prompts_sql = format!(
-        "SELECT 'prompt' AS kind, substr(replace(display, char(10), ' '), 1, 110) AS text, \
-                date(timestamp / 1000, 'unixepoch') AS date, {score} AS score \
-         FROM history WHERE {matches} ORDER BY score DESC, timestamp DESC LIMIT {limit}",
-        score = score_expr("display", terms),
-        matches = match_expr("display", terms),
-    );
-    match engine.query(&prompts_sql) {
-        Ok(r) => rows.extend(r),
-        Err(e) => return SectionResult::err(format!("prompts query failed: {e}")),
-    }
-
-    rows.sort_by(|a, b| {
-        let sa = a.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
-        let sb = b.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
-        sb.cmp(&sa)
-    });
-    rows.truncate(limit as usize);
-
-    SectionResult::ok(rows)
+    Ok(rows)
 }
 
 /// 2. repo_state -- branch, ahead/behind, dirty files, working-diff stats,
@@ -939,4 +1012,27 @@ pub fn build() -> CommandDef {
     )
     .mcp(read_only_mcp())
     .done()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_prior_work_rows;
+    use serde_json::json;
+
+    #[test]
+    fn prior_work_parallel_merge_preserves_original_tie_order() {
+        let rows = merge_prior_work_rows(
+            vec![json!({"kind": "session", "score": 3})],
+            vec![json!({"kind": "codex", "score": 3})],
+            vec![json!({"kind": "commit", "score": 3})],
+            vec![json!({"kind": "prompt", "score": 3})],
+            3,
+        );
+
+        let kinds = rows
+            .iter()
+            .map(|row| row["kind"].as_str().expect("kind"))
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["session", "codex", "commit"]);
+    }
 }

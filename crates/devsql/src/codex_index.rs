@@ -645,24 +645,24 @@ fn sync_journal(
 
     if append {
         let old = existing.as_ref().expect("append requires existing source");
-        let progress = parse_journal(
+        let first_new_record_index = old.last_record_index + 1;
+        let parsed = parse_journal(
             tx,
             journal,
             &thread_id,
             old.last_complete_offset,
-            old.last_record_index + 1,
+            first_new_record_index,
             stats,
         )?;
-        update_source_file(
+        update_appended_source_file(
             tx,
-            journal,
             &thread_id,
             size,
             modified_ns,
-            &fingerprint,
-            progress.last_complete_offset,
-            progress.last_record_index,
+            parsed.progress.last_complete_offset,
+            parsed.progress.last_record_index,
         )?;
+        update_appended_thread(tx, &thread_id, &parsed.delta)?;
     } else {
         tx.execute(
             "DELETE FROM codex_ingest_errors
@@ -674,7 +674,7 @@ fn sync_journal(
             [&thread_id],
         )?;
         insert_thread_shell(tx, journal, &thread_id)?;
-        let progress = parse_journal(tx, journal, &thread_id, 0, 0, stats)?;
+        let parsed = parse_journal(tx, journal, &thread_id, 0, 0, stats)?;
         update_source_file(
             tx,
             journal,
@@ -682,13 +682,61 @@ fn sync_journal(
             size,
             modified_ns,
             &fingerprint,
-            progress.last_complete_offset,
-            progress.last_record_index,
+            parsed.progress.last_complete_offset,
+            parsed.progress.last_record_index,
         )?;
+        recompute_thread(tx, &thread_id)?;
     }
-    recompute_thread(tx, &thread_id)?;
     stats.parsed_journals += 1;
     Ok(Some(thread_id))
+}
+
+#[derive(Default)]
+struct ThreadDelta {
+    first_timestamp: Option<String>,
+    last_timestamp: Option<String>,
+    first_user_text: Option<String>,
+    event_count: i64,
+    user_message_count: i64,
+    assistant_message_count: i64,
+    tool_call_count: i64,
+    compaction_count: i64,
+}
+
+impl ThreadDelta {
+    fn merge(&mut self, other: Self) {
+        if let Some(timestamp) = other.first_timestamp {
+            if self
+                .first_timestamp
+                .as_ref()
+                .is_none_or(|current| timestamp < *current)
+            {
+                self.first_timestamp = Some(timestamp);
+            }
+        }
+        if let Some(timestamp) = other.last_timestamp {
+            if self
+                .last_timestamp
+                .as_ref()
+                .is_none_or(|current| timestamp > *current)
+            {
+                self.last_timestamp = Some(timestamp);
+            }
+        }
+        if self.first_user_text.is_none() {
+            self.first_user_text = other.first_user_text;
+        }
+        self.event_count += other.event_count;
+        self.user_message_count += other.user_message_count;
+        self.assistant_message_count += other.assistant_message_count;
+        self.tool_call_count += other.tool_call_count;
+        self.compaction_count += other.compaction_count;
+    }
+}
+
+struct ParsedJournal {
+    progress: ccql::datasources::codex_journal::JournalProgress,
+    delta: ThreadDelta,
 }
 
 fn parse_journal(
@@ -698,8 +746,9 @@ fn parse_journal(
     start_offset: u64,
     start_record_index: i64,
     stats: &mut SyncStats,
-) -> Result<ccql::datasources::codex_journal::JournalProgress> {
+) -> Result<ParsedJournal> {
     let source_path = journal.path.to_string_lossy().into_owned();
+    let mut delta = ThreadDelta::default();
     let progress = visit_journal_records(journal, start_offset, start_record_index, |record| {
         stats.parsed_records += 1;
         if let Some(error) = &record.parse_error {
@@ -719,11 +768,15 @@ fn parse_journal(
                 error,
             )
             .map_err(sql_to_io)?;
+            delta.event_count += 1;
             return Ok(());
         }
-        normalize_record(tx, thread_id, &source_path, &record).map_err(sql_to_io)
+        let record_delta =
+            normalize_record(tx, thread_id, &source_path, &record).map_err(sql_to_io)?;
+        delta.merge(record_delta);
+        Ok(())
     })?;
-    Ok(progress)
+    Ok(ParsedJournal { progress, delta })
 }
 
 fn normalize_record(
@@ -731,9 +784,9 @@ fn normalize_record(
     thread_id: &str,
     source_path: &str,
     record: &CodexJournalRecord,
-) -> Result<()> {
+) -> Result<ThreadDelta> {
     let Some(value) = record.value.as_ref() else {
-        return Ok(());
+        return Ok(ThreadDelta::default());
     };
     let timestamp = value.get("timestamp").and_then(Value::as_str);
     let record_type = value.get("type").and_then(Value::as_str);
@@ -761,10 +814,22 @@ fn normalize_record(
         ],
     )?;
 
+    let mut delta = ThreadDelta {
+        first_timestamp: timestamp.map(str::to_owned),
+        last_timestamp: timestamp.map(str::to_owned),
+        event_count: 1,
+        ..ThreadDelta::default()
+    };
     if record_type == Some("session_meta") {
         update_thread_metadata(tx, thread_id, payload, timestamp)?;
     }
     if let Some(message) = normalize_message(record_type, payload_type, payload) {
+        if message.canonical && message.role == "user" {
+            delta.user_message_count += 1;
+            delta.first_user_text = Some(message.text.clone());
+        } else if message.canonical && message.role == "assistant" {
+            delta.assistant_message_count += 1;
+        }
         tx.execute(
             "INSERT OR REPLACE INTO codex_messages
              (thread_id, record_index, timestamp, role, text, content_json, is_canonical, source_path)
@@ -782,14 +847,16 @@ fn normalize_record(
         )?;
     }
     if is_tool_call(payload_type) {
-        normalize_tool_call(
+        if normalize_tool_call(
             tx,
             thread_id,
             source_path,
             record.record_index,
             timestamp,
             payload,
-        )?;
+        )? {
+            delta.tool_call_count += 1;
+        }
     } else if is_tool_output(payload_type) {
         normalize_tool_output(
             tx,
@@ -801,6 +868,7 @@ fn normalize_record(
         )?;
     }
     if record_type == Some("compacted") {
+        delta.compaction_count += 1;
         tx.execute(
             "INSERT OR REPLACE INTO codex_compactions
              (thread_id, record_index, timestamp, window_id, previous_window_id,
@@ -819,7 +887,7 @@ fn normalize_record(
             ],
         )?;
     }
-    Ok(())
+    Ok(delta)
 }
 
 struct NormalizedMessage {
@@ -913,12 +981,22 @@ fn normalize_tool_call(
     record_index: i64,
     timestamp: Option<&str>,
     payload: &Value,
-) -> Result<()> {
+) -> Result<bool> {
     let call_id = payload
         .get("call_id")
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| format!("record:{record_index}"));
+    let was_counted = tx
+        .query_row(
+            "SELECT 1 FROM codex_tool_executions
+             WHERE thread_id = ?1 AND call_id = ?2
+               AND call_record_index IS NOT NULL",
+            params![thread_id, call_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
     let tool_name = payload
         .get("name")
         .or_else(|| payload.get("tool_name"))
@@ -965,7 +1043,7 @@ fn normalize_tool_call(
             source_path
         ],
     )?;
-    Ok(())
+    Ok(!was_counted)
 }
 
 fn normalize_tool_output(
@@ -1148,7 +1226,17 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
     })
 }
 
+const THREAD_MESSAGE_COUNTS_SQL: &str = "SELECT
+       COALESCE(SUM(CASE WHEN role = 'user' AND is_canonical = 1 THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN role = 'assistant' AND is_canonical = 1 THEN 1 ELSE 0 END), 0)
+     FROM codex_messages
+     WHERE thread_id = ?1";
+
 fn recompute_thread(tx: &Transaction<'_>, thread_id: &str) -> Result<()> {
+    let (user_message_count, assistant_message_count) =
+        tx.query_row(THREAD_MESSAGE_COUNTS_SQL, [thread_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
     tx.execute(
         "UPDATE codex_threads SET
            started_at = COALESCE(started_at, (
@@ -1165,14 +1253,8 @@ fn recompute_thread(tx: &Transaction<'_>, thread_id: &str) -> Result<()> {
            event_count = (
              SELECT COUNT(*) FROM codex_events WHERE thread_id = ?1
            ),
-           user_message_count = (
-             SELECT COUNT(*) FROM codex_messages
-             WHERE thread_id = ?1 AND role = 'user' AND is_canonical = 1
-           ),
-           assistant_message_count = (
-             SELECT COUNT(*) FROM codex_messages
-             WHERE thread_id = ?1 AND role = 'assistant' AND is_canonical = 1
-           ),
+           user_message_count = ?2,
+           assistant_message_count = ?3,
            tool_call_count = (
              SELECT COUNT(*) FROM codex_tool_executions
              WHERE thread_id = ?1 AND call_record_index IS NOT NULL
@@ -1181,7 +1263,42 @@ fn recompute_thread(tx: &Transaction<'_>, thread_id: &str) -> Result<()> {
              SELECT COUNT(*) FROM codex_compactions WHERE thread_id = ?1
            )
          WHERE thread_id = ?1",
-        [thread_id],
+        params![thread_id, user_message_count, assistant_message_count],
+    )?;
+    Ok(())
+}
+
+fn update_appended_thread(
+    tx: &Transaction<'_>,
+    thread_id: &str,
+    delta: &ThreadDelta,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE codex_threads SET
+           started_at = COALESCE(started_at, ?2),
+           last_event_at = CASE
+             WHEN ?3 IS NULL THEN last_event_at
+             WHEN last_event_at IS NULL OR ?3 > last_event_at THEN ?3
+             ELSE last_event_at
+           END,
+           first_user_text = COALESCE(first_user_text, ?4),
+           event_count = event_count + ?5,
+           user_message_count = user_message_count + ?6,
+           assistant_message_count = assistant_message_count + ?7,
+           tool_call_count = tool_call_count + ?8,
+           compaction_count = compaction_count + ?9
+         WHERE thread_id = ?1",
+        params![
+            thread_id,
+            delta.first_timestamp,
+            delta.last_timestamp,
+            delta.first_user_text,
+            delta.event_count,
+            delta.user_message_count,
+            delta.assistant_message_count,
+            delta.tool_call_count,
+            delta.compaction_count
+        ],
     )?;
     Ok(())
 }
@@ -1198,10 +1315,19 @@ fn update_source_file(
     last_record_index: i64,
 ) -> Result<()> {
     tx.execute(
-        "INSERT OR REPLACE INTO source_files
+        "INSERT INTO source_files
          (thread_id, journal_path, state, compressed, size, modified_ns,
           leading_fingerprint, last_complete_offset, last_record_index)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(thread_id) DO UPDATE SET
+           journal_path = excluded.journal_path,
+           state = excluded.state,
+           compressed = excluded.compressed,
+           size = excluded.size,
+           modified_ns = excluded.modified_ns,
+           leading_fingerprint = excluded.leading_fingerprint,
+           last_complete_offset = excluded.last_complete_offset,
+           last_record_index = excluded.last_record_index",
         params![
             thread_id,
             journal.path.to_string_lossy(),
@@ -1244,6 +1370,32 @@ fn update_thread_location(
             params![thread_id, path],
         )?;
     }
+    Ok(())
+}
+
+fn update_appended_source_file(
+    tx: &Transaction<'_>,
+    thread_id: &str,
+    size: u64,
+    modified_ns: i64,
+    last_complete_offset: u64,
+    last_record_index: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE source_files SET
+           size = ?2,
+           modified_ns = ?3,
+           last_complete_offset = ?4,
+           last_record_index = ?5
+         WHERE thread_id = ?1",
+        params![
+            thread_id,
+            size as i64,
+            modified_ns,
+            last_complete_offset as i64,
+            last_record_index
+        ],
+    )?;
     Ok(())
 }
 
@@ -1549,8 +1701,8 @@ mod tests {
         write(
             &journal,
             concat!(
-                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-2\"}}\n",
-                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"first\"}]}}\n"
+                "{\"timestamp\":\"2026-07-27T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-2\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"first\"}]}}\n"
             ),
         );
         let cache = temp.path().join("cache/index.sqlite");
@@ -1566,21 +1718,81 @@ mod tests {
             .open(&journal)
             .expect("append");
         file.write_all(
-            b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n",
+            concat!(
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-2\",\"output\":\"arrived first\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-2\",\"arguments\":\"{}\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-2\",\"arguments\":\"{\\\"cmd\\\":\\\"updated\\\"}\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:04Z\",\"type\":\"compacted\",\"payload\":{\"window_id\":\"w1\"}}\n",
+                "not-json\n"
+            )
+            .as_bytes(),
         )
         .expect("append line");
 
         let appended = index.sync().expect("append sync");
-        assert_eq!(appended.parsed_records, 1);
-        let count: i64 = index
+        assert_eq!(appended.parsed_records, 6);
+        let aggregate: (String, String, String, i64, i64, i64, i64, i64) = index
             .connection()
             .query_row(
-                "SELECT event_count FROM codex_threads WHERE thread_id = 'thread-2'",
+                "SELECT started_at, last_event_at, first_user_text, event_count,
+                        user_message_count, assistant_message_count, tool_call_count,
+                        compaction_count
+                 FROM codex_threads WHERE thread_id = 'thread-2'",
                 [],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
             )
-            .expect("count");
-        assert_eq!(count, 3);
+            .expect("aggregate");
+        assert_eq!(
+            aggregate,
+            (
+                "2026-07-27T10:00:00Z".into(),
+                "2026-07-27T10:00:04Z".into(),
+                "first".into(),
+                8,
+                1,
+                1,
+                1,
+                1,
+            )
+        );
+    }
+
+    #[test]
+    fn thread_message_counts_use_the_thread_primary_key() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        let cache = temp.path().join("cache/index.sqlite");
+        let index = CodexIndex::open_at(&codex_home, &cache).expect("open");
+        let plan = index
+            .connection()
+            .prepare(&format!("EXPLAIN QUERY PLAN {THREAD_MESSAGE_COUNTS_SQL}"))
+            .expect("prepare plan")
+            .query_map(["thread"], |row| row.get::<_, String>(3))
+            .expect("query plan")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect plan");
+
+        assert!(
+            plan.iter().any(|detail| detail.contains("(thread_id=?)")),
+            "message count plan must be scoped by thread: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("idx_codex_messages_role_timestamp")),
+            "message count plan must not scan the global role index: {plan:?}"
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ impl UnifiedEngine {
         codex_data_dir: PathBuf,
     ) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
 
         // Register custom DATE function that handles both epoch ms and ISO dates
         conn.create_scalar_function(
@@ -381,6 +382,25 @@ impl UnifiedEngine {
 
         let files = discover_transcript_files(&config);
         self.ensure_claude_cache(&files, false)?;
+        self.create_tool_calls_view()
+    }
+
+    pub(crate) fn load_current_claude_tool_calls(&mut self) -> Result<()> {
+        if self.claude_tool_calls_loaded {
+            return Ok(());
+        }
+        if self.ccql_config().is_none() {
+            create_empty_tool_calls_table(&self.conn)?;
+            self.claude_tool_calls_loaded = true;
+            return Ok(());
+        }
+
+        let cache_path = claude_tool_cache_path(&self.claude_data_dir);
+        self.attach_claude_cache(&cache_path)?;
+        self.create_tool_calls_view()
+    }
+
+    fn create_tool_calls_view(&mut self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TEMP VIEW tool_calls AS
              SELECT rowid, tool_name, input_json, target, source_id, command,
@@ -403,6 +423,10 @@ impl UnifiedEngine {
         sync_claude_tool_cache(&mut cache, files, include_sessions)?;
         drop(cache);
 
+        self.attach_claude_cache(&cache_path)
+    }
+
+    fn attach_claude_cache(&mut self, cache_path: &Path) -> Result<()> {
         if !self.claude_cache_attached {
             self.conn.execute(
                 "ATTACH DATABASE ?1 AS claude_tool_index",
@@ -426,6 +450,21 @@ impl UnifiedEngine {
         let cache_path = index.cache_path().to_string_lossy().into_owned();
         drop(index);
 
+        self.attach_codex_tables(cache_path)
+    }
+
+    pub(crate) fn load_current_codex_tables(&mut self) -> Result<()> {
+        if self.codex_loaded {
+            return Ok(());
+        }
+        let index = crate::codex_index::CodexIndex::open(&self.codex_data_dir)?;
+        let cache_path = index.cache_path().to_string_lossy().into_owned();
+        drop(index);
+
+        self.attach_codex_tables(cache_path)
+    }
+
+    fn attach_codex_tables(&mut self, cache_path: String) -> Result<()> {
         self.conn
             .execute("ATTACH DATABASE ?1 AS codex_index", [cache_path])?;
         self.conn.execute_batch(
