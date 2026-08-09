@@ -6,9 +6,9 @@ use rusqlite::{params, Connection, Statement};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use super::{detect_language, walk_source_files};
 #[cfg(feature = "tree-sitter-ast")]
 use super::LineIndex;
+use super::{detect_language, walk_source_files};
 
 #[cfg(feature = "tree-sitter-ast")]
 use super::tree_sitter::{symbol_query, TsLanguageKind, TsParser};
@@ -118,7 +118,13 @@ fn load_with_tree_sitter(conn: &Connection, repo_path: &Path) -> Result<()> {
         }
 
         if rows.is_empty() {
-            rows = extract_symbols_with_regex(language, &content, &file_info.path, language, &mut next_id);
+            rows = extract_symbols_with_regex(
+                language,
+                &content,
+                &file_info.path,
+                language,
+                &mut next_id,
+            );
         }
 
         for row in rows {
@@ -150,7 +156,8 @@ fn load_with_regex(conn: &Connection, repo_path: &Path) -> Result<()> {
         let Ok(content) = std::fs::read_to_string(&abs_path) else {
             continue;
         };
-        let rows = extract_symbols_with_regex(language, &content, &file_info.path, language, &mut next_id);
+        let rows =
+            extract_symbols_with_regex(language, &content, &file_info.path, language, &mut next_id);
         for row in rows {
             insert_symbol(&mut insert_stmt, &row)?;
         }
@@ -171,7 +178,9 @@ fn create_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
          CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
-         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);",
+         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
+         CREATE INDEX IF NOT EXISTS idx_symbols_file_line
+           ON symbols(file_path, line_start);",
     )?;
     Ok(())
 }
@@ -336,7 +345,12 @@ fn visibility_text(language: TsLanguageKind, node: Node, source: &str) -> String
         TsLanguageKind::Go => {
             if let Some(name) = node.child_by_field_name("name") {
                 let text = node_text(name, source);
-                if text.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                if text
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
                     "export".to_string()
                 } else {
                     "private".to_string()
@@ -379,7 +393,10 @@ fn return_type_text(language: TsLanguageKind, node: Node, source: &str) -> Strin
             }
             String::new()
         }
-        TsLanguageKind::TypeScript | TsLanguageKind::Tsx | TsLanguageKind::JavaScript | TsLanguageKind::Jsx => {
+        TsLanguageKind::TypeScript
+        | TsLanguageKind::Tsx
+        | TsLanguageKind::JavaScript
+        | TsLanguageKind::Jsx => {
             if let Some(ret) = node.child_by_field_name("return_type") {
                 return node_text(ret, source);
             }
@@ -471,7 +488,10 @@ fn line_number_at(content: &str, byte_offset: usize) -> usize {
 }
 
 fn line_text(content: &str, line_num: usize) -> &str {
-    content.lines().nth(line_num.saturating_sub(1)).unwrap_or("")
+    content
+        .lines()
+        .nth(line_num.saturating_sub(1))
+        .unwrap_or("")
 }
 
 // --- Regex fallback extractors (unchanged logic) ---
@@ -504,7 +524,11 @@ fn extract_rust(content: &str) -> Vec<SymbolMatch> {
         if kind == "impl" {
             continue;
         }
-        let kind_str = if kind == "macro_rules!" { "macro" } else { kind };
+        let kind_str = if kind == "macro_rules!" {
+            "macro"
+        } else {
+            kind
+        };
         let name = caps.get(5).map(|m| m.as_str()).unwrap_or("");
 
         rows.push(SymbolMatch {
@@ -584,7 +608,12 @@ fn extract_go(content: &str) -> Vec<SymbolMatch> {
         let line_start = line_number_at(content, full_match.start());
         let signature = line_text(content, line_start).trim().to_string();
         let name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+        let visibility = if name
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
+        {
             "export"
         } else {
             ""

@@ -3,18 +3,22 @@ use ccql::datasources::codex_journal::{
     discover_codex_journals, read_first_journal_record, visit_journal_records, CodexJournalFile,
     CodexJournalRecord, JournalState,
 };
-use chrono::Utc;
+use chrono::{Days, Utc};
 use rusqlite::{
     params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const SCHEMA_VERSION: i64 = 3;
+const LARGE_INDEX_REFRESH_THRESHOLD: i64 = 1_000;
+const LARGE_INDEX_REFRESH_INTERVAL_MS: i64 = 30_000;
+const FULL_RECONCILIATION_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SyncStats {
@@ -57,14 +61,28 @@ impl CodexIndex {
             }
             Err(error) => return Err(error),
         };
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 0 && version != SCHEMA_VERSION {
+        let version: i64 = match conn.pragma_query_value(None, "user_version", |row| row.get(0)) {
+            Ok(version) => version,
+            Err(error) if is_corrupt_sql_error(&error) => {
+                drop(conn);
+                remove_cache_files(cache_path)?;
+                conn = open_cache_connection(cache_path)?;
+                0
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if version == 0 {
+            ensure_wal_mode(&conn)?;
+            create_schema(&conn)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if version != SCHEMA_VERSION {
             drop(conn);
             remove_cache_files(cache_path)?;
             conn = open_cache_connection(cache_path)?;
+            ensure_wal_mode(&conn)?;
+            create_schema(&conn)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        create_schema(&conn)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
             conn,
             codex_home: codex_home.to_path_buf(),
@@ -76,19 +94,57 @@ impl CodexIndex {
         if !self.codex_home.exists() {
             return Ok(SyncStats::default());
         }
-        let journals = discover_codex_journals(&self.codex_home)?;
+        if large_index_was_recently_synced(&self.conn)? {
+            return Ok(SyncStats::default());
+        }
+        let scan = journal_scan(&self.conn, &self.codex_home)?;
+        let inventory = journal_inventory(&scan.journals);
+        if cache_matches_inventory(&self.conn, &inventory, &scan)? {
+            if scan.full {
+                mark_full_scan_completed(&mut self.conn)?;
+            }
+            return Ok(SyncStats {
+                unchanged_journals: scan.journals.len(),
+                ..SyncStats::default()
+            });
+        }
         let mut stats = SyncStats::default();
-        let tx = self
+        self.conn.busy_timeout(Duration::from_millis(100))?;
+        let tx = match self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+        {
+            Ok(tx) => tx,
+            Err(error) if is_busy_sql_error(&error) => return Ok(stats),
+            Err(error) => return Err(error.into()),
+        };
+        if cache_matches_inventory(&tx, &inventory, &scan)? {
+            tx.commit()?;
+            return Ok(SyncStats {
+                unchanged_journals: scan.journals.len(),
+                ..SyncStats::default()
+            });
+        }
         let mut seen_threads = HashSet::new();
         let mut seen_paths = HashSet::new();
         let mut all_journals_readable = true;
+        let cached = cached_journal_states(&tx)?;
 
-        for journal in journals {
-            seen_paths.insert(journal.path.to_string_lossy().into_owned());
+        for journal in &scan.journals {
+            let path = journal.path.to_string_lossy().into_owned();
+            seen_paths.insert(path.clone());
+            let Some((size, modified_ns)) = inventory.get(&path).and_then(Option::as_ref) else {
+                continue;
+            };
+            if let Some(cached) = cached.get(&path) {
+                if cached.size == *size && cached.modified_ns == *modified_ns {
+                    stats.unchanged_journals += 1;
+                    seen_threads.insert(cached.thread_id.clone());
+                    continue;
+                }
+            }
             tx.execute_batch("SAVEPOINT codex_journal_sync")?;
-            match sync_journal(&tx, &journal, &mut stats) {
+            match sync_journal(&tx, journal, &mut stats) {
                 Ok(Some(thread_id)) => {
                     tx.execute_batch("RELEASE SAVEPOINT codex_journal_sync")?;
                     seen_threads.insert(thread_id);
@@ -120,16 +176,11 @@ impl CodexIndex {
         }
 
         if all_journals_readable {
-            let cached_threads = {
-                let mut statement = tx.prepare("SELECT thread_id FROM source_files")?;
-                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            for thread_id in cached_threads {
-                if !seen_threads.contains(&thread_id) {
+            for (path, cached) in &cached {
+                if scan.includes(path) && !seen_threads.contains(&cached.thread_id) {
                     stats.pruned_threads += tx.execute(
                         "DELETE FROM codex_threads WHERE thread_id = ?1",
-                        [thread_id],
+                        [&cached.thread_id],
                     )?;
                 }
             }
@@ -140,13 +191,25 @@ impl CodexIndex {
                 rows.collect::<std::result::Result<Vec<_>, _>>()?
             };
             for path in error_paths {
-                if !seen_paths.contains(&path) {
+                if scan.includes(&path) && !seen_paths.contains(&path) {
                     tx.execute(
                         "DELETE FROM codex_ingest_errors WHERE journal_path = ?1",
                         [path],
                     )?;
                 }
             }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value)
+             VALUES ('last_sync_completed_ms', ?1)",
+            [Utc::now().timestamp_millis().to_string()],
+        )?;
+        if scan.full {
+            tx.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value)
+                 VALUES ('last_full_scan_ms', ?1)",
+                [Utc::now().timestamp_millis().to_string()],
+            )?;
         }
         tx.commit()?;
         Ok(stats)
@@ -162,12 +225,265 @@ impl CodexIndex {
     }
 }
 
+#[derive(Debug)]
+struct CachedJournalState {
+    thread_id: String,
+    size: u64,
+    modified_ns: i64,
+}
+
+type JournalInventory = HashMap<String, Option<(u64, i64)>>;
+
+struct JournalScan {
+    journals: Vec<CodexJournalFile>,
+    scanned_directories: HashSet<PathBuf>,
+    full: bool,
+}
+
+impl JournalScan {
+    fn includes(&self, path: &str) -> bool {
+        self.full
+            || Path::new(path)
+                .parent()
+                .is_some_and(|parent| self.scanned_directories.contains(parent))
+    }
+}
+
+fn journal_scan(conn: &Connection, codex_home: &Path) -> Result<JournalScan> {
+    let cached_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM source_files", [], |row| row.get(0))?;
+    if cached_count == 0 {
+        return Ok(JournalScan {
+            journals: discover_codex_journals(codex_home)?,
+            scanned_directories: HashSet::new(),
+            full: true,
+        });
+    }
+    if full_reconciliation_is_due(conn)? {
+        return Ok(JournalScan {
+            journals: discover_codex_journals(codex_home)?,
+            scanned_directories: HashSet::new(),
+            full: true,
+        });
+    }
+
+    let mut journals = Vec::new();
+    let mut scanned_directories = HashSet::new();
+    let sessions_root = codex_home.join("sessions");
+    scanned_directories.insert(sessions_root.clone());
+    journals.extend(discover_direct_journals(
+        &sessions_root,
+        JournalState::Active,
+    )?);
+
+    let today = Utc::now().date_naive();
+    for days_ago in 0..30 {
+        let Some(date) = today.checked_sub_days(Days::new(days_ago)) else {
+            continue;
+        };
+        let directory = sessions_root
+            .join(date.format("%Y").to_string())
+            .join(date.format("%m").to_string())
+            .join(date.format("%d").to_string());
+        scanned_directories.insert(directory.clone());
+        journals.extend(discover_direct_journals(&directory, JournalState::Active)?);
+    }
+
+    let archived_root = codex_home.join("archived_sessions");
+    scanned_directories.insert(archived_root.clone());
+    journals.extend(discover_direct_journals(
+        &archived_root,
+        JournalState::Archived,
+    )?);
+    journals.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(JournalScan {
+        journals,
+        scanned_directories,
+        full: false,
+    })
+}
+
+fn discover_direct_journals(
+    directory: &Path,
+    state: JournalState,
+) -> Result<Vec<CodexJournalFile>> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Ok(Vec::new());
+    };
+    let mut journals = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let compressed = name.ends_with(".jsonl.zst");
+        if !compressed && !name.ends_with(".jsonl") {
+            continue;
+        }
+        journals.push(CodexJournalFile {
+            path,
+            state,
+            compressed,
+        });
+    }
+    Ok(journals)
+}
+
+fn journal_inventory(journals: &[CodexJournalFile]) -> JournalInventory {
+    if journals.is_empty() {
+        return HashMap::new();
+    }
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(32)
+        .min(journals.len().max(1));
+    let chunk_size = journals.len().div_ceil(workers);
+    thread::scope(|scope| {
+        let handles = journals
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|journal| {
+                            let path = journal.path.to_string_lossy().into_owned();
+                            let metadata = fs::metadata(&journal.path)
+                                .ok()
+                                .map(|metadata| (metadata.len(), modified_ns(&metadata)));
+                            (path, metadata)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut inventory = HashMap::with_capacity(journals.len());
+        for handle in handles {
+            inventory.extend(handle.join().expect("journal metadata worker panicked"));
+        }
+        inventory
+    })
+}
+
+fn cached_journal_states(conn: &Connection) -> Result<HashMap<String, CachedJournalState>> {
+    let mut statement = conn.prepare(
+        "SELECT journal_path, thread_id, size, modified_ns
+         FROM source_files",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            CachedJournalState {
+                thread_id: row.get(1)?,
+                size: row.get::<_, i64>(2)? as u64,
+                modified_ns: row.get(3)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
+}
+
+fn large_index_was_recently_synced(conn: &Connection) -> Result<bool> {
+    let source_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM source_files", [], |row| row.get(0))?;
+    if source_count < LARGE_INDEX_REFRESH_THRESHOLD {
+        return Ok(false);
+    }
+    let synced_at = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = 'last_sync_completed_ms'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<i64>().ok());
+    let Some(synced_at) = synced_at else {
+        return Ok(false);
+    };
+    let age = Utc::now().timestamp_millis().saturating_sub(synced_at);
+    Ok((0..LARGE_INDEX_REFRESH_INTERVAL_MS).contains(&age))
+}
+
+fn full_reconciliation_is_due(conn: &Connection) -> Result<bool> {
+    let scanned_at = conn
+        .query_row(
+            "SELECT value FROM index_meta
+             WHERE key IN ('last_full_scan_ms', 'last_sync_completed_ms')
+             ORDER BY key = 'last_full_scan_ms' DESC
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<i64>().ok());
+    let Some(scanned_at) = scanned_at else {
+        return Ok(true);
+    };
+    let age = Utc::now().timestamp_millis().saturating_sub(scanned_at);
+    Ok(!(0..FULL_RECONCILIATION_INTERVAL_MS).contains(&age))
+}
+
+fn mark_full_scan_completed(conn: &mut Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_millis(100))?;
+    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(error) if is_busy_sql_error(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let now = Utc::now().timestamp_millis().to_string();
+    tx.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value)
+         VALUES ('last_full_scan_ms', ?1)",
+        [&now],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value)
+         VALUES ('last_sync_completed_ms', ?1)",
+        [&now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn cache_matches_inventory(
+    conn: &Connection,
+    inventory: &JournalInventory,
+    scan: &JournalScan,
+) -> Result<bool> {
+    let cached = cached_journal_states(conn)?;
+    if scan.full && cached.len() != inventory.len() {
+        return Ok(false);
+    }
+    for (path, metadata) in inventory {
+        let Some((size, modified_ns)) = metadata else {
+            return Ok(false);
+        };
+        let Some(cached) = cached.get(path) else {
+            return Ok(false);
+        };
+        if cached.size != *size || cached.modified_ns != *modified_ns {
+            return Ok(false);
+        }
+    }
+    if cached
+        .keys()
+        .any(|path| scan.includes(path) && !inventory.contains_key(path))
+    {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
 fn open_cache_connection(cache_path: &Path) -> Result<Connection> {
     let conn = Connection::open(cache_path)?;
     set_private_file_permissions(cache_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(Duration::from_secs(30))?;
-    ensure_wal_mode(&conn)?;
     set_private_file_permissions(cache_path)?;
     set_cache_sidecar_permissions(cache_path)?;
     Ok(conn)
@@ -207,7 +523,14 @@ fn is_busy_sql_error(error: &rusqlite::Error) -> bool {
 fn is_corrupt_cache_error(error: &crate::Error) -> bool {
     matches!(
         error,
-        crate::Error::Sql(rusqlite::Error::SqliteFailure(code, _))
+        crate::Error::Sql(error) if is_corrupt_sql_error(error)
+    )
+}
+
+fn is_corrupt_sql_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
             if matches!(code.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
     )
 }
@@ -1126,6 +1449,21 @@ fn create_schema(conn: &Connection) -> Result<()> {
             message TEXT NOT NULL,
             observed_at TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_codex_threads_last_event_at
+            ON codex_threads(last_event_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_codex_threads_cwd_last_event_at
+            ON codex_threads(cwd, last_event_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_codex_messages_canonical_timestamp
+            ON codex_messages(is_canonical, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_codex_messages_role_timestamp
+            ON codex_messages(role, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_codex_tool_executions_tool_called_at
+            ON codex_tool_executions(tool_name, called_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_codex_tool_executions_called_at
+            ON codex_tool_executions(called_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_codex_ingest_errors_journal_path
+            ON codex_ingest_errors(journal_path);
         ",
     )?;
     let _ = SCHEMA_VERSION;
@@ -1243,6 +1581,172 @@ mod tests {
             )
             .expect("count");
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn daily_reconciliation_refreshes_cached_journals_outside_the_hot_window() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        let journal = codex_home.join("sessions/2025/01/01/rollout-thread-old.jsonl");
+        write(
+            &journal,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-old\"}}\n",
+        );
+        let cache = temp.path().join("cache/index.sqlite");
+        let mut index = CodexIndex::open_at(&codex_home, &cache).expect("open");
+        index.sync().expect("first sync");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("open old journal")
+            .write_all(b"{\"timestamp\":\"2026-08-09T15:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"resumed\"}}\n")
+            .expect("append old journal");
+
+        let deferred = index.sync().expect("defer old journal refresh");
+        assert_eq!(deferred.parsed_records, 0);
+        index
+            .connection()
+            .execute(
+                "UPDATE index_meta SET value = '0'
+                 WHERE key IN ('last_full_scan_ms', 'last_sync_completed_ms')",
+                [],
+            )
+            .expect("expire reconciliation marker");
+
+        let refreshed = index.sync().expect("reconcile old journal");
+        assert_eq!(refreshed.parsed_records, 1);
+        let count: i64 = index
+            .connection()
+            .query_row(
+                "SELECT event_count FROM codex_threads WHERE thread_id = 'thread-old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("event count");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn unchanged_sync_does_not_wait_for_the_cache_writer_lock() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        let journal = codex_home.join("sessions/rollout-thread-lock.jsonl");
+        write(
+            &journal,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-lock\"}}\n",
+        );
+        let cache = temp.path().join("cache/index.sqlite");
+        let mut index = CodexIndex::open_at(&codex_home, &cache).expect("open");
+        index.sync().expect("first sync");
+        index
+            .connection()
+            .busy_timeout(Duration::from_millis(50))
+            .expect("short test timeout");
+
+        let writer = Connection::open(&cache).expect("writer connection");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+
+        let started = Instant::now();
+        let unchanged = index
+            .sync()
+            .expect("metadata-identical sync should remain read-only");
+        let elapsed = started.elapsed();
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+
+        assert_eq!(unchanged.unchanged_journals, 1);
+        assert_eq!(unchanged.parsed_records, 0);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "warm sync waited for the writer lock: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn changed_sync_serves_the_last_good_index_when_the_writer_is_busy() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        let journal = codex_home.join("sessions/rollout-thread-busy.jsonl");
+        write(
+            &journal,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-busy\"}}\n",
+        );
+        let cache = temp.path().join("cache/index.sqlite");
+        let mut index = CodexIndex::open_at(&codex_home, &cache).expect("open");
+        index.sync().expect("first sync");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("open journal")
+            .write_all(b"{\"timestamp\":\"2026-08-09T15:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"new\"}}\n")
+            .expect("append journal");
+
+        let writer = Connection::open(&cache).expect("writer connection");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+        let started = Instant::now();
+        let deferred = index.sync().expect("serve last good cache");
+        let elapsed = started.elapsed();
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+
+        assert_eq!(deferred.parsed_records, 0);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "busy sync waited too long: {elapsed:?}"
+        );
+        let refreshed = index.sync().expect("refresh after writer release");
+        assert_eq!(refreshed.parsed_records, 1);
+    }
+
+    #[test]
+    fn schema_indexes_cover_consumer_filters_and_ordering() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        let cache = temp.path().join("cache/index.sqlite");
+        let index = CodexIndex::open_at(&codex_home, &cache).expect("open");
+
+        let message_plan: String = index
+            .connection()
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT thread_id, timestamp
+                 FROM codex_messages
+                 WHERE is_canonical = 1
+                 ORDER BY timestamp DESC
+                 LIMIT 8",
+                [],
+                |row| row.get(3),
+            )
+            .expect("message query plan");
+        assert!(
+            message_plan.contains("idx_codex_messages_canonical_timestamp"),
+            "unexpected message plan: {message_plan}"
+        );
+
+        let thread_plan: String = index
+            .connection()
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT thread_id, last_event_at
+                 FROM codex_threads
+                 ORDER BY last_event_at DESC
+                 LIMIT 8",
+                [],
+                |row| row.get(3),
+            )
+            .expect("thread query plan");
+        assert!(
+            thread_plan.contains("idx_codex_threads_last_event_at"),
+            "unexpected thread plan: {thread_plan}"
+        );
     }
 
     #[cfg(unix)]

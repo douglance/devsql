@@ -2,15 +2,17 @@
 
 use crate::{Error, Result};
 use ccql::datasources::transcript::{
-    discover_transcript_files, flattened_usage_fields, SessionAggregate,
+    discover_transcript_files, flattened_usage_fields, SessionAggregate, TranscriptFile,
 };
 use chrono::DateTime;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, Metadata};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 
 /// Unified query engine that loads data from both Claude Code and Git
 pub struct UnifiedEngine {
@@ -18,6 +20,9 @@ pub struct UnifiedEngine {
     claude_data_dir: PathBuf,
     codex_data_dir: PathBuf,
     git_repo_path: PathBuf,
+    claude_cache_attached: bool,
+    claude_sessions_loaded: bool,
+    claude_tool_calls_loaded: bool,
     codex_loaded: bool,
     macos_log_stats: Option<crate::providers::macos_logs::MacosLogStats>,
 }
@@ -52,6 +57,9 @@ impl UnifiedEngine {
             claude_data_dir,
             codex_data_dir,
             git_repo_path,
+            claude_cache_attached: false,
+            claude_sessions_loaded: false,
+            claude_tool_calls_loaded: false,
             codex_loaded: false,
             macos_log_stats: None,
         })
@@ -121,7 +129,7 @@ impl UnifiedEngine {
     /// Load normalized shell and agent-issued command events with source-native provenance.
     pub fn load_command_events(&mut self) -> Result<()> {
         self.load_shell_history()?;
-        if !table_exists(&self.conn, "tool_calls")? {
+        if !self.claude_tool_calls_loaded {
             self.load_tool_calls()?;
         }
         if !self.codex_loaded {
@@ -129,43 +137,25 @@ impl UnifiedEngine {
         }
 
         self.conn.execute_batch(
-            "DROP TABLE IF EXISTS command_events;
-             CREATE TABLE command_events (
-                source TEXT,
-                channel TEXT,
-                actor TEXT,
-                provenance_quality TEXT,
-                provenance_reason TEXT,
-                source_id TEXT,
-                source_order INTEGER,
-                session_id TEXT,
-                parent_session_id TEXT,
-                agent_id TEXT,
-                agent_role TEXT,
-                originator TEXT,
-                tool_name TEXT,
-                timestamp TEXT,
-                duration_ms INTEGER,
-                exit_code INTEGER,
-                command TEXT,
-                cwd TEXT,
-                hostname TEXT,
-                source_path TEXT
-             );
-             INSERT INTO command_events
+            "CREATE TEMP VIEW IF NOT EXISTS command_events (
+                source, channel, actor, provenance_quality, provenance_reason,
+                source_id, source_order, session_id, parent_session_id, agent_id,
+                agent_role, originator, tool_name, timestamp, duration_ms,
+                exit_code, command, cwd, hostname, source_path
+             ) AS
              SELECT source, 'shell', 'unknown', 'unattributed',
                     'unattributed_shell_history', source_id, source_order,
                     session_id, NULL, NULL, NULL, NULL, NULL, timestamp,
                     duration_ms, exit_code, command, cwd, hostname, history_path
-             FROM shell_history;
-             INSERT INTO command_events
+             FROM shell_history
+             UNION ALL
              SELECT 'claude', 'agent_tool', 'agent', 'exact', NULL,
                     source_id, rowid, session_id, parent_session_id, agent_id,
                     agent_role, originator, tool_name, timestamp, NULL, NULL,
                     command, cwd, NULL, source_path
              FROM tool_calls
-             WHERE tool_name = 'Bash' AND command IS NOT NULL;
-             INSERT INTO command_events
+             WHERE tool_name = 'Bash' AND command IS NOT NULL
+             UNION ALL
              SELECT 'codex', 'agent_tool', 'agent', 'exact', NULL,
                     execution.call_id, execution.call_record_index,
                     execution.thread_id, thread.parent_thread_id, thread.agent_path,
@@ -264,6 +254,12 @@ impl UnifiedEngine {
                 }
             }
         }
+
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp DESC);
+             CREATE INDEX IF NOT EXISTS idx_history_project_timestamp
+               ON history(project, timestamp DESC);",
+        )?;
 
         Ok(())
     }
@@ -374,79 +370,46 @@ impl UnifiedEngine {
     }
 
     fn load_tool_calls(&mut self) -> Result<()> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS tool_calls (
-                rowid INTEGER PRIMARY KEY,
-                tool_name TEXT,
-                input_json TEXT,
-                target TEXT,
-                source_id TEXT,
-                command TEXT,
-                session_id TEXT,
-                parent_session_id TEXT,
-                agent_id TEXT,
-                agent_role TEXT,
-                originator TEXT,
-                cwd TEXT,
-                source_path TEXT,
-                _project TEXT,
-                timestamp TEXT
-            )",
-            [],
-        )?;
-
+        if self.claude_tool_calls_loaded {
+            return Ok(());
+        }
         let Some(config) = self.ccql_config() else {
+            create_empty_tool_calls_table(&self.conn)?;
+            self.claude_tool_calls_loaded = true;
             return Ok(());
         };
 
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO tool_calls (
-                    tool_name, input_json, target, source_id, command, session_id,
-                    parent_session_id, agent_id, agent_role, originator, cwd,
-                    source_path, _project, timestamp
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
-                 )",
+        let files = discover_transcript_files(&config);
+        self.ensure_claude_cache(&files, false)?;
+        self.conn.execute_batch(
+            "CREATE TEMP VIEW tool_calls AS
+             SELECT rowid, tool_name, input_json, target, source_id, command,
+                    session_id, parent_session_id, agent_id, agent_role,
+                    originator, cwd, source_path, project AS _project, timestamp
+             FROM claude_tool_index.tool_calls;",
+        )?;
+        self.claude_tool_calls_loaded = true;
+
+        Ok(())
+    }
+
+    fn ensure_claude_cache(
+        &mut self,
+        files: &[TranscriptFile],
+        include_sessions: bool,
+    ) -> Result<()> {
+        let cache_path = claude_tool_cache_path(&self.claude_data_dir);
+        let mut cache = open_claude_tool_cache(&cache_path)?;
+        sync_claude_tool_cache(&mut cache, files, include_sessions)?;
+        drop(cache);
+
+        if !self.claude_cache_attached {
+            self.conn.execute(
+                "ATTACH DATABASE ?1 AS claude_tool_index",
+                [cache_path.to_string_lossy().as_ref()],
             )?;
-
-            for file in discover_transcript_files(&config) {
-                let source_path = file.path.to_string_lossy().into_owned();
-                visit_jsonl_candidates(&file.path, &[b"\"tool_use\""], |entry| {
-                    let record_session_id = string_field(&entry, "sessionId")
-                        .or_else(|| string_field(&entry, "session_id"))
-                        .unwrap_or_else(|| file.session_id.clone());
-                    let parent_session_id = file.agent_id.as_ref().map(|_| file.session_id.clone());
-                    let agent_role = string_field(&entry, "agentName");
-                    let originator = string_field(&entry, "originator")
-                        .or_else(|| nested_string_field(&entry, "origin", "kind"))
-                        .or_else(|| string_field(&entry, "entrypoint"));
-                    let cwd = string_field(&entry, "cwd");
-                    for call in ccql::datasources::tool_calls::extract_tool_calls(&entry) {
-                        stmt.execute(params![
-                            call.tool_name,
-                            call.input_json,
-                            call.target,
-                            call.source_id,
-                            call.command,
-                            record_session_id,
-                            parent_session_id,
-                            file.agent_id,
-                            agent_role,
-                            originator,
-                            cwd,
-                            source_path,
-                            file.project,
-                            call.timestamp,
-                        ])?;
-                    }
-                    Ok(())
-                })?;
-            }
+            self.claude_cache_attached = true;
         }
-        tx.commit()?;
-
         Ok(())
     }
 
@@ -507,92 +470,27 @@ impl UnifiedEngine {
     }
 
     fn load_sessions(&mut self) -> Result<()> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT,
-                project TEXT,
-                cwd TEXT,
-                git_branch TEXT,
-                version TEXT,
-                title TEXT,
-                first_timestamp TEXT,
-                last_timestamp TEXT,
-                user_message_count INTEGER,
-                assistant_message_count INTEGER,
-                subagent_count INTEGER,
-                total_input_tokens INTEGER,
-                total_output_tokens INTEGER,
-                total_cache_read_input_tokens INTEGER,
-                total_cache_creation_input_tokens INTEGER,
-                pr_url TEXT,
-                pr_number INTEGER
-            )",
-            [],
-        )?;
-
+        if self.claude_sessions_loaded {
+            return Ok(());
+        }
         let Some(config) = self.ccql_config() else {
+            create_empty_sessions_table(&self.conn)?;
+            self.claude_sessions_loaded = true;
             return Ok(());
         };
 
         let files = discover_transcript_files(&config);
-
-        // Subagent file counts keyed by (project, parent session id)
-        let mut subagent_counts: HashMap<(Option<String>, String), i64> = HashMap::new();
-        for file in &files {
-            if file.agent_id.is_some() {
-                *subagent_counts
-                    .entry((file.project.clone(), file.session_id.clone()))
-                    .or_insert(0) += 1;
-            }
-        }
-
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO sessions VALUES
-                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            )?;
-
-            for file in files.iter().filter(|f| f.agent_id.is_none()) {
-                let content = match std::fs::read_to_string(&file.path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                let mut agg = SessionAggregate::default();
-                for line in content.lines() {
-                    if let Ok(json) = serde_json::from_str::<Value>(line) {
-                        agg.observe(&json);
-                    }
-                }
-
-                let subagent_count = subagent_counts
-                    .get(&(file.project.clone(), file.session_id.clone()))
-                    .copied()
-                    .unwrap_or(0);
-
-                stmt.execute(params![
-                    file.session_id,
-                    file.project,
-                    agg.cwd,
-                    agg.git_branch,
-                    agg.version,
-                    agg.title,
-                    agg.first_timestamp,
-                    agg.last_timestamp,
-                    agg.user_message_count,
-                    agg.assistant_message_count,
-                    subagent_count,
-                    agg.total_input_tokens,
-                    agg.total_output_tokens,
-                    agg.total_cache_read_input_tokens,
-                    agg.total_cache_creation_input_tokens,
-                    agg.pr_url,
-                    agg.pr_number,
-                ])?;
-            }
-        }
-        tx.commit()?;
+        self.ensure_claude_cache(&files, true)?;
+        self.conn.execute_batch(
+            "CREATE TEMP VIEW sessions AS
+             SELECT session_id, project, cwd, git_branch, version, title,
+                    first_timestamp, last_timestamp, user_message_count,
+                    assistant_message_count, subagent_count, total_input_tokens,
+                    total_output_tokens, total_cache_read_input_tokens,
+                    total_cache_creation_input_tokens, pr_url, pr_number
+             FROM claude_tool_index.sessions;",
+        )?;
+        self.claude_sessions_loaded = true;
 
         Ok(())
     }
@@ -655,6 +553,12 @@ impl UnifiedEngine {
             }
         }
 
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_jhistory_timestamp ON jhistory(timestamp DESC);
+             CREATE INDEX IF NOT EXISTS idx_jhistory_session_timestamp
+               ON jhistory(session_id, timestamp DESC);",
+        )?;
+
         Ok(())
     }
 
@@ -702,6 +606,11 @@ impl UnifiedEngine {
                 }
             }
         }
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status)",
+            [],
+        )?;
 
         Ok(())
     }
@@ -755,6 +664,11 @@ impl UnifiedEngine {
                 }
             }
         }
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_commits_authored_at ON commits(authored_at DESC)",
+            [],
+        )?;
 
         Ok(())
     }
@@ -936,6 +850,660 @@ impl UnifiedEngine {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClaudeCacheFileState {
+    size: u64,
+    modified_ns: i64,
+}
+
+fn create_empty_tool_calls_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tool_calls (
+            rowid INTEGER PRIMARY KEY,
+            tool_name TEXT,
+            input_json TEXT,
+            target TEXT,
+            source_id TEXT,
+            command TEXT,
+            session_id TEXT,
+            parent_session_id TEXT,
+            agent_id TEXT,
+            agent_role TEXT,
+            originator TEXT,
+            cwd TEXT,
+            source_path TEXT,
+            _project TEXT,
+            timestamp TEXT
+        );",
+    )?;
+    Ok(())
+}
+
+fn create_empty_sessions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT,
+            project TEXT,
+            cwd TEXT,
+            git_branch TEXT,
+            version TEXT,
+            title TEXT,
+            first_timestamp TEXT,
+            last_timestamp TEXT,
+            user_message_count INTEGER,
+            assistant_message_count INTEGER,
+            subagent_count INTEGER,
+            total_input_tokens INTEGER,
+            total_output_tokens INTEGER,
+            total_cache_read_input_tokens INTEGER,
+            total_cache_creation_input_tokens INTEGER,
+            pr_url TEXT,
+            pr_number INTEGER
+        );",
+    )?;
+    Ok(())
+}
+
+fn claude_tool_cache_path(claude_data_dir: &Path) -> PathBuf {
+    let cache_root = dirs::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("devsql-cache"))
+        .join("devsql")
+        .join("claude-tool-index");
+    let canonical_dir = claude_data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| claude_data_dir.to_path_buf());
+    let digest = Sha256::digest(canonical_dir.to_string_lossy().as_bytes());
+    cache_root.join(format!("{digest:x}.sqlite"))
+}
+
+fn open_claude_tool_cache(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        set_private_directory_permissions(parent)?;
+    }
+    let mut conn = Connection::open(path)?;
+    set_private_file_permissions(path)?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    if !claude_cache_schema_ready(&conn)? {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         CREATE TABLE IF NOT EXISTS source_files (
+            source_path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            modified_ns INTEGER NOT NULL,
+            tail_hash TEXT
+         );
+         CREATE TABLE IF NOT EXISTS session_source_files (
+            source_path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            modified_ns INTEGER NOT NULL,
+            tail_hash TEXT
+         );
+         CREATE TABLE IF NOT EXISTS tool_calls (
+            rowid INTEGER PRIMARY KEY,
+            tool_name TEXT,
+            input_json TEXT,
+            target TEXT,
+            source_id TEXT,
+            command TEXT,
+            session_id TEXT,
+            parent_session_id TEXT,
+            agent_id TEXT,
+            agent_role TEXT,
+            originator TEXT,
+            cwd TEXT,
+            source_path TEXT NOT NULL,
+            project TEXT,
+            timestamp TEXT
+         );
+         CREATE TABLE IF NOT EXISTS sessions (
+            source_path TEXT PRIMARY KEY,
+            session_id TEXT,
+            project TEXT,
+            cwd TEXT,
+            git_branch TEXT,
+            version TEXT,
+            title TEXT,
+            first_timestamp TEXT,
+            last_timestamp TEXT,
+            user_message_count INTEGER,
+            assistant_message_count INTEGER,
+            subagent_count INTEGER,
+            total_input_tokens INTEGER,
+            total_output_tokens INTEGER,
+            total_cache_read_input_tokens INTEGER,
+            total_cache_creation_input_tokens INTEGER,
+            pr_url TEXT,
+            pr_number INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_claude_tool_calls_source
+           ON tool_calls(source_path);
+         CREATE INDEX IF NOT EXISTS idx_claude_tool_calls_tool_timestamp
+           ON tool_calls(tool_name, timestamp DESC);
+         CREATE INDEX IF NOT EXISTS idx_claude_tool_calls_session_timestamp
+           ON tool_calls(session_id, timestamp DESC);
+         CREATE INDEX IF NOT EXISTS idx_claude_tool_calls_timestamp
+           ON tool_calls(timestamp DESC);
+         CREATE INDEX IF NOT EXISTS idx_claude_sessions_last_timestamp
+           ON sessions(last_timestamp DESC);
+         CREATE INDEX IF NOT EXISTS idx_claude_sessions_project_last_timestamp
+           ON sessions(project, last_timestamp DESC);",
+        )?;
+        ensure_cache_tail_hash_columns(&conn)?;
+        backfill_cache_tail_hashes(&mut conn)?;
+    }
+    set_private_cache_sidecar_permissions(path)?;
+    Ok(conn)
+}
+
+fn claude_cache_schema_ready(conn: &Connection) -> Result<bool> {
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN ('source_files', 'session_source_files', 'tool_calls', 'sessions')",
+        [],
+        |row| row.get(0),
+    )?;
+    let indexes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index'
+           AND name IN (
+             'idx_claude_tool_calls_source',
+             'idx_claude_tool_calls_tool_timestamp',
+             'idx_claude_tool_calls_session_timestamp',
+             'idx_claude_tool_calls_timestamp',
+             'idx_claude_sessions_last_timestamp',
+             'idx_claude_sessions_project_last_timestamp'
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(tables == 4
+        && indexes == 6
+        && table_has_column(conn, "source_files", "tail_hash")?
+        && table_has_column(conn, "session_source_files", "tail_hash")?)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|candidate| candidate == column))
+}
+
+const CACHE_TAIL_BYTES: u64 = 64 * 1024;
+
+fn ensure_cache_tail_hash_columns(conn: &Connection) -> Result<()> {
+    for table in ["source_files", "session_source_files"] {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "tail_hash") {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN tail_hash TEXT"))?;
+        }
+    }
+    Ok(())
+}
+
+fn backfill_cache_tail_hashes(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for table in ["source_files", "session_source_files"] {
+        let rows = {
+            let mut statement = tx.prepare(&format!(
+                "SELECT source_path, size FROM {table} WHERE tail_hash IS NULL"
+            ))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut update = tx.prepare(&format!(
+            "UPDATE {table} SET tail_hash = ?1 WHERE source_path = ?2"
+        ))?;
+        for (source_path, size) in rows {
+            if let Some(tail_hash) = file_tail_hash(Path::new(&source_path), size) {
+                update.execute(params![tail_hash, source_path])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn file_tail_hash(path: &Path, end: u64) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() < end {
+        return None;
+    }
+    let start = end.saturating_sub(CACHE_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity((end - start) as usize);
+    file.take(end - start).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 != end - start {
+        return None;
+    }
+    Some(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn cached_tail_hash(conn: &Connection, table: &str, source_path: &str) -> Result<Option<String>> {
+    let sql = match table {
+        "source_files" => "SELECT tail_hash FROM source_files WHERE source_path = ?1",
+        "session_source_files" => {
+            "SELECT tail_hash FROM session_source_files WHERE source_path = ?1"
+        }
+        _ => unreachable!("fixed cache metadata table"),
+    };
+    Ok(conn
+        .query_row(sql, [source_path], |row| row.get(0))
+        .optional()?
+        .flatten())
+}
+
+fn append_offset(
+    conn: &Connection,
+    table: &str,
+    path: &Path,
+    source_path: &str,
+    cached: Option<&ClaudeCacheFileState>,
+    current: &ClaudeCacheFileState,
+) -> Result<Option<u64>> {
+    let Some(cached) = cached.filter(|cached| cached.size < current.size) else {
+        return Ok(None);
+    };
+    if cached.size > 0 {
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(cached.size - 1))?;
+        let mut last_byte = [0_u8; 1];
+        file.read_exact(&mut last_byte)?;
+        if last_byte[0] != b'\n' {
+            return Ok(None);
+        }
+    }
+    let Some(cached_hash) = cached_tail_hash(conn, table, source_path)? else {
+        return Ok(None);
+    };
+    Ok(
+        (file_tail_hash(path, cached.size).as_deref() == Some(cached_hash.as_str()))
+            .then_some(cached.size),
+    )
+}
+
+fn cached_session_aggregate(
+    conn: &Connection,
+    source_path: &str,
+) -> Result<Option<SessionAggregate>> {
+    Ok(conn
+        .query_row(
+            "SELECT cwd, git_branch, version, title, first_timestamp, last_timestamp,
+                    user_message_count, assistant_message_count, total_input_tokens,
+                    total_output_tokens, total_cache_read_input_tokens,
+                    total_cache_creation_input_tokens, pr_url, pr_number
+             FROM sessions WHERE source_path = ?1",
+            [source_path],
+            |row| {
+                Ok(SessionAggregate {
+                    cwd: row.get(0)?,
+                    git_branch: row.get(1)?,
+                    version: row.get(2)?,
+                    title: row.get(3)?,
+                    first_timestamp: row.get(4)?,
+                    last_timestamp: row.get(5)?,
+                    user_message_count: row.get(6)?,
+                    assistant_message_count: row.get(7)?,
+                    total_input_tokens: row.get(8)?,
+                    total_output_tokens: row.get(9)?,
+                    total_cache_read_input_tokens: row.get(10)?,
+                    total_cache_creation_input_tokens: row.get(11)?,
+                    pr_url: row.get(12)?,
+                    pr_number: row.get(13)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn sync_claude_tool_cache(
+    cache: &mut Connection,
+    files: &[TranscriptFile],
+    include_sessions: bool,
+) -> Result<()> {
+    let current = claude_file_states(files);
+    let current_sessions = claude_session_file_states(files);
+    if claude_cache_matches(cache, &current, &current_sessions, include_sessions)? {
+        return Ok(());
+    }
+
+    cache.busy_timeout(Duration::from_millis(100))?;
+    let tx = match cache.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(error) if is_busy_sql_error(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if claude_cache_matches(&tx, &current, &current_sessions, include_sessions)? {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let cached = claude_cached_file_states(&tx)?;
+    let cached_sessions = claude_cached_session_file_states(&tx)?;
+    for file in files {
+        let source_path = file.path.to_string_lossy().into_owned();
+        let Some(state) = current.get(&source_path) else {
+            continue;
+        };
+        if cached.get(&source_path) == Some(state) {
+            continue;
+        }
+
+        let offset = append_offset(
+            &tx,
+            "source_files",
+            &file.path,
+            &source_path,
+            cached.get(&source_path),
+            state,
+        )?;
+        if offset.is_none() {
+            tx.execute(
+                "DELETE FROM tool_calls WHERE source_path = ?1",
+                [&source_path],
+            )?;
+        }
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO tool_calls (
+                    tool_name, input_json, target, source_id, command, session_id,
+                    parent_session_id, agent_id, agent_role, originator, cwd,
+                    source_path, project, timestamp
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                 )",
+            )?;
+            visit_jsonl_candidates_from_offset(
+                &file.path,
+                &[b"\"tool_use\""],
+                offset.unwrap_or(0),
+                |entry| {
+                    let record_session_id = string_field(&entry, "sessionId")
+                        .or_else(|| string_field(&entry, "session_id"))
+                        .unwrap_or_else(|| file.session_id.clone());
+                    let parent_session_id = file.agent_id.as_ref().map(|_| file.session_id.clone());
+                    let agent_role = string_field(&entry, "agentName");
+                    let originator = string_field(&entry, "originator")
+                        .or_else(|| nested_string_field(&entry, "origin", "kind"))
+                        .or_else(|| string_field(&entry, "entrypoint"));
+                    let cwd = string_field(&entry, "cwd");
+                    for call in ccql::datasources::tool_calls::extract_tool_calls(&entry) {
+                        insert.execute(params![
+                            call.tool_name,
+                            call.input_json,
+                            call.target,
+                            call.source_id,
+                            call.command,
+                            record_session_id,
+                            parent_session_id,
+                            file.agent_id,
+                            agent_role,
+                            originator,
+                            cwd,
+                            source_path,
+                            file.project,
+                            call.timestamp,
+                        ])?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        let tail_hash = file_tail_hash(&file.path, state.size);
+        tx.execute(
+            "INSERT OR REPLACE INTO source_files (source_path, size, modified_ns, tail_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![source_path, state.size as i64, state.modified_ns, tail_hash],
+        )?;
+    }
+
+    for file in files
+        .iter()
+        .filter(|file| include_sessions && file.agent_id.is_none())
+    {
+        let source_path = file.path.to_string_lossy().into_owned();
+        let Some(state) = current_sessions.get(&source_path) else {
+            continue;
+        };
+        if cached_sessions.get(&source_path) == Some(state) {
+            continue;
+        }
+
+        let offset = append_offset(
+            &tx,
+            "session_source_files",
+            &file.path,
+            &source_path,
+            cached_sessions.get(&source_path),
+            state,
+        )?;
+        let mut aggregate = if offset.is_some() {
+            cached_session_aggregate(&tx, &source_path)?.unwrap_or_default()
+        } else {
+            SessionAggregate::default()
+        };
+        visit_jsonl_candidates_from_offset(&file.path, &[], offset.unwrap_or(0), |entry| {
+            aggregate.observe(&entry);
+            Ok(())
+        })?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sessions (
+                source_path, session_id, project, cwd, git_branch, version, title,
+                first_timestamp, last_timestamp, user_message_count,
+                assistant_message_count, subagent_count, total_input_tokens,
+                total_output_tokens, total_cache_read_input_tokens,
+                total_cache_creation_input_tokens, pr_url, pr_number
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0,
+                ?12, ?13, ?14, ?15, ?16, ?17
+             )",
+            params![
+                source_path,
+                file.session_id,
+                file.project,
+                aggregate.cwd,
+                aggregate.git_branch,
+                aggregate.version,
+                aggregate.title,
+                aggregate.first_timestamp,
+                aggregate.last_timestamp,
+                aggregate.user_message_count,
+                aggregate.assistant_message_count,
+                aggregate.total_input_tokens,
+                aggregate.total_output_tokens,
+                aggregate.total_cache_read_input_tokens,
+                aggregate.total_cache_creation_input_tokens,
+                aggregate.pr_url,
+                aggregate.pr_number,
+            ],
+        )?;
+        let tail_hash = file_tail_hash(&file.path, state.size);
+        tx.execute(
+            "INSERT OR REPLACE INTO session_source_files
+                (source_path, size, modified_ns, tail_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![source_path, state.size as i64, state.modified_ns, tail_hash],
+        )?;
+    }
+
+    for source_path in cached.keys() {
+        if current.contains_key(source_path) {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM tool_calls WHERE source_path = ?1",
+            [source_path],
+        )?;
+        tx.execute(
+            "DELETE FROM source_files WHERE source_path = ?1",
+            [source_path],
+        )?;
+    }
+
+    if include_sessions {
+        for source_path in cached_sessions.keys() {
+            if current_sessions.contains_key(source_path) {
+                continue;
+            }
+            tx.execute("DELETE FROM sessions WHERE source_path = ?1", [source_path])?;
+            tx.execute(
+                "DELETE FROM session_source_files WHERE source_path = ?1",
+                [source_path],
+            )?;
+        }
+
+        let mut subagent_counts: HashMap<(Option<String>, String), i64> = HashMap::new();
+        for file in files.iter().filter(|file| file.agent_id.is_some()) {
+            *subagent_counts
+                .entry((file.project.clone(), file.session_id.clone()))
+                .or_insert(0) += 1;
+        }
+        tx.execute("UPDATE sessions SET subagent_count = 0", [])?;
+        let mut update_subagents = tx.prepare(
+            "UPDATE sessions
+             SET subagent_count = ?1
+             WHERE project IS ?2 AND session_id = ?3",
+        )?;
+        for ((project, session_id), count) in subagent_counts {
+            update_subagents.execute(params![count, project, session_id])?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+fn is_busy_sql_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn claude_file_states(files: &[TranscriptFile]) -> HashMap<String, ClaudeCacheFileState> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let metadata = fs::metadata(&file.path).ok()?;
+            Some((
+                file.path.to_string_lossy().into_owned(),
+                ClaudeCacheFileState {
+                    size: metadata.len(),
+                    modified_ns: metadata_modified_ns(&metadata),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn claude_session_file_states(files: &[TranscriptFile]) -> HashMap<String, ClaudeCacheFileState> {
+    claude_file_states(
+        &files
+            .iter()
+            .filter(|file| file.agent_id.is_none())
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn claude_cached_file_states(conn: &Connection) -> Result<HashMap<String, ClaudeCacheFileState>> {
+    let mut statement = conn.prepare("SELECT source_path, size, modified_ns FROM source_files")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ClaudeCacheFileState {
+                size: row.get::<_, i64>(1)? as u64,
+                modified_ns: row.get(2)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
+}
+
+fn claude_cached_session_file_states(
+    conn: &Connection,
+) -> Result<HashMap<String, ClaudeCacheFileState>> {
+    let mut statement =
+        conn.prepare("SELECT source_path, size, modified_ns FROM session_source_files")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ClaudeCacheFileState {
+                size: row.get::<_, i64>(1)? as u64,
+                modified_ns: row.get(2)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
+}
+
+fn claude_cache_matches(
+    conn: &Connection,
+    current: &HashMap<String, ClaudeCacheFileState>,
+    current_sessions: &HashMap<String, ClaudeCacheFileState>,
+    include_sessions: bool,
+) -> Result<bool> {
+    Ok(claude_cached_file_states(conn)? == *current
+        && (!include_sessions || claude_cached_session_file_states(conn)? == *current_sessions))
+}
+
+fn metadata_modified_ns(metadata: &Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn set_private_cache_sidecar_permissions(path: &Path) -> Result<()> {
+    for sidecar in [
+        PathBuf::from(format!("{}-wal", path.to_string_lossy())),
+        PathBuf::from(format!("{}-shm", path.to_string_lossy())),
+    ] {
+        if sidecar.exists() {
+            set_private_file_permissions(&sidecar)?;
+        }
+    }
+    Ok(())
+}
+
 /// Normalize dates from various formats to YYYY-MM-DD
 fn normalize_date(value: &str) -> String {
     // Epoch milliseconds (13 digits)
@@ -1004,22 +1572,21 @@ fn normalize_ts_seconds(raw_ts: i64) -> i64 {
     }
 }
 
-fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        [table_name],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
-}
-
-fn visit_jsonl_candidates<F>(path: &Path, markers: &[&[u8]], mut visit: F) -> Result<()>
+fn visit_jsonl_candidates_from_offset<F>(
+    path: &Path,
+    markers: &[&[u8]],
+    offset: u64,
+    mut visit: F,
+) -> Result<()>
 where
     F: FnMut(Value) -> Result<()>,
 {
-    let Ok(file) = File::open(path) else {
+    let Ok(mut file) = File::open(path) else {
         return Ok(());
     };
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return Ok(());
+    }
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut line = Vec::new();
 
@@ -1032,9 +1599,10 @@ where
         if bytes_read == 0 {
             return Ok(());
         }
-        if !markers
-            .iter()
-            .any(|marker| memchr::memmem::find(&line, marker).is_some())
+        if !markers.is_empty()
+            && !markers
+                .iter()
+                .any(|marker| memchr::memmem::find(&line, marker).is_some())
         {
             continue;
         }
@@ -1246,6 +1814,147 @@ mod tests {
     fn write(path: &std::path::Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
         std::fs::write(path, contents).expect("write");
+    }
+
+    #[test]
+    fn claude_tool_cache_is_incremental_lock_free_and_indexed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let journal = temp.path().join("claude-session.jsonl");
+        write(
+            &journal,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-07-12T10:00:00.000Z","sessionId":"claude-session","message":{"content":[{"type":"tool_use","id":"toolu_bash_1","name":"Bash","input":{"command":"first"}}]}}"#,
+                "\n",
+            ),
+        );
+        let files = vec![TranscriptFile {
+            path: journal.clone(),
+            source_file: "claude-session.jsonl".into(),
+            session_id: "claude-session".into(),
+            project: Some("-work-claude".into()),
+            agent_id: None,
+        }];
+        let cache_path = temp.path().join("cache/tool-calls.sqlite");
+        let mut cache = open_claude_tool_cache(&cache_path).expect("open cache");
+
+        sync_claude_tool_cache(&mut cache, &files, true).expect("initial sync");
+        let count: i64 = cache
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1);
+        let session_count: i64 = cache
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("session count");
+        assert_eq!(session_count, 1);
+
+        cache
+            .busy_timeout(Duration::from_millis(50))
+            .expect("short test timeout");
+        let writer = Connection::open(&cache_path).expect("writer connection");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+        let started = std::time::Instant::now();
+        sync_claude_tool_cache(&mut cache, &files, true).expect("warm sync remains read-only");
+        let elapsed = started.elapsed();
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "warm cache waited for the writer lock: {elapsed:?}"
+        );
+
+        let plan: String = cache
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT source_id, timestamp FROM tool_calls
+                 WHERE tool_name = 'Bash'
+                 ORDER BY timestamp DESC LIMIT 10",
+                [],
+                |row| row.get(3),
+            )
+            .expect("query plan");
+        assert!(
+            plan.contains("idx_claude_tool_calls_tool_timestamp"),
+            "unexpected tool-call plan: {plan}"
+        );
+        let session_plan: String = cache
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT session_id, last_timestamp FROM sessions
+                 WHERE project = '-work-claude'
+                 ORDER BY last_timestamp DESC LIMIT 10",
+                [],
+                |row| row.get(3),
+            )
+            .expect("session query plan");
+        assert!(
+            session_plan.contains("idx_claude_sessions_project_last_timestamp"),
+            "unexpected session plan: {session_plan}"
+        );
+
+        let mut contents = std::fs::read_to_string(&journal).expect("read journal");
+        contents.push_str(concat!(
+            r#"{"type":"assistant","timestamp":"2026-07-12T10:00:01.000Z","sessionId":"claude-session","message":{"content":[{"type":"tool_use","id":"toolu_read_1","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
+            "\n",
+        ));
+        std::fs::write(&journal, contents).expect("append tool call");
+        let writer = Connection::open(&cache_path).expect("second writer connection");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE")
+            .expect("hold writer lock for changed journal");
+        let started = std::time::Instant::now();
+        sync_claude_tool_cache(&mut cache, &files, true).expect("serve last good cache");
+        let elapsed = started.elapsed();
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release changed-journal writer lock");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "changed cache waited for the writer lock: {elapsed:?}"
+        );
+        let stale_count: i64 = cache
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("stale count");
+        assert_eq!(stale_count, 1);
+
+        sync_claude_tool_cache(&mut cache, &files, true).expect("incremental sync");
+        let count: i64 = cache
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("updated count");
+        assert_eq!(count, 2);
+        let last_timestamp: String = cache
+            .query_row(
+                "SELECT last_timestamp FROM sessions WHERE session_id = 'claude-session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("updated session");
+        assert_eq!(last_timestamp, "2026-07-12T10:00:01.000Z");
+    }
+
+    #[test]
+    fn opening_claude_cache_restores_missing_consumer_index() {
+        let temp = tempfile::tempdir().expect("temp");
+        let cache_path = temp.path().join("cache/tool-calls.sqlite");
+        let cache = open_claude_tool_cache(&cache_path).expect("open cache");
+        cache
+            .execute_batch("DROP INDEX idx_claude_tool_calls_tool_timestamp")
+            .expect("drop index");
+        drop(cache);
+
+        let cache = open_claude_tool_cache(&cache_path).expect("reopen cache");
+        let restored: i64 = cache
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'idx_claude_tool_calls_tool_timestamp'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("restored index");
+        assert_eq!(restored, 1);
     }
 
     #[test]

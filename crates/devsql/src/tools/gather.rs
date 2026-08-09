@@ -44,6 +44,11 @@ struct GatherOptions {
 
 /// Rows fetched per section before budget trimming.
 const SECTION_LIMIT: i64 = 10;
+const RECENT_CODEX_SEARCH_LIMIT: i64 = 50_000;
+const RECENT_ACTIVITY_SEARCH_LIMIT: i64 = 10_000;
+const RECENT_COMMAND_SEARCH_LIMIT: i64 = 2_000;
+const RECENT_AGENT_COMMANDS_PER_SOURCE: i64 = RECENT_COMMAND_SEARCH_LIMIT / 2;
+const RECENT_CODEX_COMMAND_SCAN_LIMIT: i64 = 5_000;
 
 /// Section names, in materialization/round-robin-trim order.
 const SECTION_ORDER: [&str; 6] = [
@@ -138,49 +143,27 @@ impl CommandHandler for GatherHandler {
         };
         let claude_dir = resolve_claude_dir(&ctx.options);
 
-        // Run all 6 sections concurrently, each on its own engine/connection.
+        // Run independent data domains concurrently while sharing each domain's
+        // expensive loaders. This avoids syncing Codex twice and reading every
+        // source file three times for one gather request.
         let mut sections: HashMap<&'static str, SectionResult> = std::thread::scope(|scope| {
             let handles = [
                 scope.spawn(|| {
-                    (
-                        "prior_work",
-                        section_prior_work(&claude_dir, &repo_path, &terms, SECTION_LIMIT),
-                    )
+                    sections_prior_work_and_activity(&claude_dir, &repo_path, &terms, SECTION_LIMIT)
                 }),
-                scope.spawn(|| ("repo_state", section_repo_state(&repo_path))),
-                scope.spawn(|| {
-                    (
-                        "code_search",
-                        section_code_search(&claude_dir, &repo_path, &terms, SECTION_LIMIT),
-                    )
-                }),
-                scope.spawn(|| {
-                    (
-                        "symbols",
-                        section_symbols(&claude_dir, &repo_path, &terms, SECTION_LIMIT),
-                    )
-                }),
-                scope.spawn(|| {
-                    (
-                        "excerpts",
-                        section_excerpts(&claude_dir, &repo_path, &terms),
-                    )
-                }),
-                scope.spawn(|| {
-                    (
-                        "activity",
-                        section_activity(&claude_dir, &repo_path, &terms, SECTION_LIMIT),
-                    )
-                }),
+                scope.spawn(|| vec![("repo_state", section_repo_state(&repo_path))]),
+                scope.spawn(|| sections_code(&claude_dir, &repo_path, &terms, SECTION_LIMIT)),
             ];
 
             let mut collected: HashMap<&'static str, SectionResult> = HashMap::new();
             for handle in handles {
-                let (name, result) = handle
+                let results = handle
                     .join()
-                    .unwrap_or_else(|_| ("unknown", SectionResult::err("section panicked")));
-                if SECTION_ORDER.contains(&name) {
-                    collected.insert(name, result);
+                    .unwrap_or_else(|_| vec![("unknown", SectionResult::err("section panicked"))]);
+                for (name, result) in results {
+                    if SECTION_ORDER.contains(&name) {
+                        collected.insert(name, result);
+                    }
                 }
             }
             collected
@@ -401,21 +384,84 @@ fn resolve_claude_dir(options: &Value) -> PathBuf {
 // Sections
 // ---------------------------------------------------------------------------
 
-/// 1. prior_work -- reuse recall's ranking (sessions, commits, prompts).
-fn section_prior_work(
+fn sections_prior_work_and_activity(
     claude_dir: &Path,
     repo_path: &Path,
     terms: &[String],
     limit: i64,
-) -> SectionResult {
+) -> Vec<(&'static str, SectionResult)> {
+    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
+        Ok(engine) => engine,
+        Err(error) => {
+            let message = format!("engine init failed: {error}");
+            return vec![
+                ("prior_work", SectionResult::err(message.clone())),
+                ("activity", SectionResult::err(message)),
+            ];
+        }
+    };
+
+    let prior_work = section_prior_work(&mut engine, terms, limit);
+    let activity = section_activity(&mut engine, terms, limit);
+    vec![("prior_work", prior_work), ("activity", activity)]
+}
+
+fn sections_code(
+    claude_dir: &Path,
+    repo_path: &Path,
+    terms: &[String],
+    limit: i64,
+) -> Vec<(&'static str, SectionResult)> {
+    if terms.is_empty() {
+        return vec![
+            ("code_search", SectionResult::ok(Vec::new())),
+            ("symbols", SectionResult::ok(Vec::new())),
+            ("excerpts", SectionResult::ok(Vec::new())),
+        ];
+    }
+
+    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
+        Ok(engine) => engine,
+        Err(error) => {
+            let message = format!("engine init failed: {error}");
+            return vec![
+                ("code_search", SectionResult::err(message.clone())),
+                ("symbols", SectionResult::err(message.clone())),
+                ("excerpts", SectionResult::err(message)),
+            ];
+        }
+    };
+
+    let (code_search, excerpts) = match engine.load_code_tables(&["source_lines"]) {
+        Ok(()) => (
+            section_code_search(&engine, terms, limit),
+            section_excerpts(&engine, terms),
+        ),
+        Err(error) => {
+            let message = format!("failed to load source_lines: {error}");
+            (
+                SectionResult::err(message.clone()),
+                SectionResult::err(message),
+            )
+        }
+    };
+    let symbols = match engine.load_code_tables(&["symbols"]) {
+        Ok(()) => section_symbols(&engine, terms, limit),
+        Err(error) => SectionResult::err(format!("failed to load symbols: {error}")),
+    };
+    vec![
+        ("code_search", code_search),
+        ("symbols", symbols),
+        ("excerpts", excerpts),
+    ]
+}
+
+/// 1. prior_work -- reuse recall's ranking (sessions, commits, prompts).
+fn section_prior_work(engine: &mut UnifiedEngine, terms: &[String], limit: i64) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
     }
 
-    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
-        Ok(e) => e,
-        Err(e) => return SectionResult::err(format!("engine init failed: {e}")),
-    };
     if let Err(e) =
         engine.load_claude_tables(&["sessions", "history", "codex_threads", "codex_messages"])
     {
@@ -441,7 +487,14 @@ fn section_prior_work(
 
     let codex_score = score_expr("message.text", terms);
     let codex_sql = format!(
-        "WITH ranked AS (
+        "WITH recent_messages AS MATERIALIZED (
+           SELECT thread_id, timestamp, text
+           FROM codex_messages
+           WHERE is_canonical = 1
+           ORDER BY timestamp DESC
+           LIMIT {recent_limit}
+         ),
+         ranked AS (
            SELECT 'codex_thread' AS kind,
                   substr(replace(message.text, char(10), ' '), 1, 200) AS text,
                   substr(COALESCE(message.timestamp, thread.last_event_at), 1, 10) AS date,
@@ -450,10 +503,10 @@ fn section_prior_work(
                     PARTITION BY message.thread_id
                     ORDER BY {score} DESC, message.timestamp DESC
                   ) AS rank
-           FROM codex_messages AS message
+           FROM recent_messages AS message
            JOIN codex_threads AS thread
              ON thread.thread_id = message.thread_id
-           WHERE message.is_canonical = 1 AND {matches}
+           WHERE {matches}
          )
          SELECT kind, text, date, score
          FROM ranked
@@ -462,6 +515,7 @@ fn section_prior_work(
          LIMIT {limit}",
         score = codex_score,
         matches = match_expr("message.text", terms),
+        recent_limit = RECENT_CODEX_SEARCH_LIMIT,
     );
     match engine.query(&codex_sql) {
         Ok(mut codex_rows) => {
@@ -587,22 +641,9 @@ fn section_repo_state(repo_path: &Path) -> SectionResult {
 
 /// 3. code_search -- term hits from `source_lines`, ranked by match count
 ///    per file.
-fn section_code_search(
-    claude_dir: &Path,
-    repo_path: &Path,
-    terms: &[String],
-    limit: i64,
-) -> SectionResult {
+fn section_code_search(engine: &UnifiedEngine, terms: &[String], limit: i64) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
-    }
-
-    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
-        Ok(e) => e,
-        Err(e) => return SectionResult::err(format!("engine init failed: {e}")),
-    };
-    if let Err(e) = engine.load_code_tables(&["source_lines"]) {
-        return SectionResult::err(format!("failed to load source_lines: {e}"));
     }
 
     let sql = format!(
@@ -618,22 +659,9 @@ fn section_code_search(
 }
 
 /// 4. symbols -- matching symbols from the regex-based symbols provider.
-fn section_symbols(
-    claude_dir: &Path,
-    repo_path: &Path,
-    terms: &[String],
-    limit: i64,
-) -> SectionResult {
+fn section_symbols(engine: &UnifiedEngine, terms: &[String], limit: i64) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
-    }
-
-    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
-        Ok(e) => e,
-        Err(e) => return SectionResult::err(format!("engine init failed: {e}")),
-    };
-    if let Err(e) = engine.load_code_tables(&["symbols"]) {
-        return SectionResult::err(format!("failed to load symbols: {e}"));
     }
 
     let sql = format!(
@@ -651,17 +679,9 @@ fn section_symbols(
 
 /// 5. excerpts -- top-5 files by match count, with matched line ranges
 ///    (+/-3 lines) from `source_lines`.
-fn section_excerpts(claude_dir: &Path, repo_path: &Path, terms: &[String]) -> SectionResult {
+fn section_excerpts(engine: &UnifiedEngine, terms: &[String]) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
-    }
-
-    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
-        Ok(e) => e,
-        Err(e) => return SectionResult::err(format!("engine init failed: {e}")),
-    };
-    if let Err(e) = engine.load_code_tables(&["source_lines"]) {
-        return SectionResult::err(format!("failed to load source_lines: {e}"));
     }
 
     let matches = match_expr("content", terms);
@@ -728,20 +748,11 @@ fn section_excerpts(claude_dir: &Path, repo_path: &Path, terms: &[String]) -> Se
 }
 
 /// 6. activity -- open todos, tool calls, and shell commands matching terms.
-fn section_activity(
-    claude_dir: &Path,
-    repo_path: &Path,
-    terms: &[String],
-    limit: i64,
-) -> SectionResult {
+fn section_activity(engine: &mut UnifiedEngine, terms: &[String], limit: i64) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
     }
 
-    let mut engine = match UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf()) {
-        Ok(e) => e,
-        Err(e) => return SectionResult::err(format!("engine init failed: {e}")),
-    };
     if let Err(e) = engine.load_claude_tables(&["todos"]) {
         return SectionResult::err(format!("failed to load activity tables: {e}"));
     }
@@ -762,11 +773,18 @@ fn section_activity(
     }
 
     let tools_sql = format!(
-        "SELECT 'tool' AS kind, tool_name AS text, target, COUNT(*) AS count \
-         FROM tool_calls \
+        "WITH recent_tools AS MATERIALIZED (
+           SELECT tool_name, target
+           FROM tool_calls
+           ORDER BY timestamp DESC
+           LIMIT {recent_limit}
+         )
+         SELECT 'tool' AS kind, tool_name AS text, target, COUNT(*) AS count \
+         FROM recent_tools \
          WHERE tool_name != 'Bash' AND {matches} \
          GROUP BY tool_name, target ORDER BY count DESC LIMIT {limit}",
         matches = match_expr("target", terms),
+        recent_limit = RECENT_ACTIVITY_SEARCH_LIMIT,
     );
     match engine.query(&tools_sql) {
         Ok(r) => rows.extend(r),
@@ -775,12 +793,19 @@ fn section_activity(
 
     let codex_tool_expr = "(tool_name || ' ' || coalesce(arguments_json, ''))";
     let codex_sql = format!(
-        "SELECT 'tool' AS kind, tool_name AS text, \
+        "WITH recent_tools AS MATERIALIZED (
+           SELECT tool_name, arguments_json
+           FROM codex_tool_executions
+           ORDER BY called_at DESC
+           LIMIT {recent_limit}
+         )
+         SELECT 'tool' AS kind, tool_name AS text, \
                 substr(arguments_json, 1, 240) AS target, COUNT(*) AS count \
-         FROM codex_tool_calls \
+         FROM recent_tools \
          WHERE tool_name NOT IN ('exec_command', 'shell') AND {matches} \
          GROUP BY tool_name, arguments_json ORDER BY count DESC LIMIT {limit}",
         matches = match_expr(codex_tool_expr, terms),
+        recent_limit = RECENT_ACTIVITY_SEARCH_LIMIT,
     );
     match engine.query(&codex_sql) {
         Ok(mut codex_rows) => {
@@ -794,14 +819,47 @@ fn section_activity(
 
     let command_expr = "(command || ' ' || coalesce(cwd, ''))";
     let agent_sql = format!(
-        "SELECT 'agent_command' AS kind, source, source AS text, actor, agent_role, \
+        "WITH claude_commands AS MATERIALIZED (
+           SELECT 'claude' AS source, 'agent' AS actor, agent_role, tool_name,
+                  command, cwd, timestamp, rowid AS source_order
+           FROM tool_calls
+           WHERE tool_name = 'Bash' AND command IS NOT NULL
+           ORDER BY timestamp DESC
+           LIMIT {per_source_limit}
+         ),
+         codex_commands AS MATERIALIZED (
+           SELECT 'codex' AS source, 'agent' AS actor, thread.agent_role,
+                  execution.tool_name, execution.cmd AS command,
+                  COALESCE(execution.cwd, thread.cwd) AS cwd,
+                  execution.called_at AS timestamp,
+                  execution.call_record_index AS source_order
+           FROM (
+             SELECT * FROM codex_tool_executions
+             ORDER BY called_at DESC
+             LIMIT {codex_scan_limit}
+           ) AS execution
+           LEFT JOIN codex_threads AS thread
+             ON thread.thread_id = execution.thread_id
+           WHERE execution.tool_name IN ('exec_command', 'shell')
+             AND execution.cmd IS NOT NULL
+           ORDER BY execution.called_at DESC
+           LIMIT {per_source_limit}
+         ),
+         recent_commands AS MATERIALIZED (
+           SELECT * FROM claude_commands
+           UNION ALL
+           SELECT * FROM codex_commands
+         )
+         SELECT 'agent_command' AS kind, source, source AS text, actor, agent_role, \
                 tool_name, command, cwd, timestamp, {score} AS score \
-         FROM command_events \
-         WHERE channel = 'agent_tool' AND {matches} \
+         FROM recent_commands \
+         WHERE {matches} \
          ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
          LIMIT {limit}",
         score = score_expr(command_expr, terms),
         matches = match_expr(command_expr, terms),
+        per_source_limit = RECENT_AGENT_COMMANDS_PER_SOURCE,
+        codex_scan_limit = RECENT_CODEX_COMMAND_SCAN_LIMIT,
     );
     match engine.query(&agent_sql) {
         Ok(r) => rows.extend(r),
@@ -809,14 +867,21 @@ fn section_activity(
     }
 
     let shell_sql = format!(
-        "SELECT 'shell_command' AS kind, source, source AS text, command, cwd, exit_code, \
+        "WITH recent_commands AS MATERIALIZED (
+           SELECT source, command, cwd, exit_code, timestamp, source_order
+           FROM shell_history
+           ORDER BY timestamp DESC
+           LIMIT {recent_limit}
+         )
+         SELECT 'shell_command' AS kind, source, source AS text, command, cwd, exit_code, \
                 timestamp, {score} AS score \
-         FROM command_events \
-         WHERE channel = 'shell' AND {matches} \
+         FROM recent_commands \
+         WHERE {matches} \
          ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
          LIMIT {limit}",
         score = score_expr(command_expr, terms),
         matches = match_expr(command_expr, terms),
+        recent_limit = RECENT_COMMAND_SEARCH_LIMIT,
     );
     match engine.query(&shell_sql) {
         Ok(r) => rows.extend(r),

@@ -79,6 +79,14 @@ pub fn load(conn: &mut Connection) -> Result<()> {
         }
     }
     tx.commit()?;
+    conn.execute_batch(
+        "CREATE INDEX idx_shell_history_timestamp
+           ON shell_history(timestamp DESC);
+         CREATE INDEX idx_shell_history_source_timestamp
+           ON shell_history(source, timestamp DESC);
+         CREATE INDEX idx_shell_history_cwd_timestamp
+           ON shell_history(cwd, timestamp DESC);",
+    )?;
     Ok(())
 }
 
