@@ -136,6 +136,8 @@ impl ShellFixtures {
                 "\n",
                 r#"{"timestamp":"2026-07-12T11:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo provenance-agent-term\",\"workdir\":\"/work/codex-call\"}","call_id":"call_exec_1"}}"#,
                 "\n",
+                r#"{"timestamp":"2026-07-12T11:00:01.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec_1","output":"Process exited with code 17\nFinal output:\nprovenance-agent-term"}}"#,
+                "\n",
                 r#"{"timestamp":"2026-07-12T11:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait_1"}}"#,
                 "\n",
             ),
@@ -315,6 +317,91 @@ fn command_events_preserve_exact_source_native_provenance() {
         .as_str()
         .unwrap()
         .ends_with("rollout-provenance.jsonl"));
+}
+
+#[test]
+fn command_events_project_codex_exit_code_without_changing_nullable_sources() {
+    let fixtures = ShellFixtures::new();
+    let (claude, codex) = fixtures.agent_history();
+    let output = fixtures
+        .command()
+        .env("CODEX_HOME", codex)
+        .args([
+            "SELECT source, source_id, exit_code \
+             FROM command_events \
+             WHERE source_id IN ('call_exec_1', 'toolu_bash_1') \
+                OR command = 'echo shared-shell-term TOKEN=super-secret' \
+             ORDER BY source, source_id",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = parse_json(&output);
+    let rows = rows.as_array().expect("rows");
+    assert!(rows.iter().any(|row| {
+        row["source"] == "atuin" && row["source_id"] == "atuin-1" && row["exit_code"] == 0
+    }));
+    assert!(rows.iter().any(|row| {
+        row["source"] == "claude"
+            && row["source_id"] == "toolu_bash_1"
+            && row["exit_code"].is_null()
+    }));
+    assert!(rows.iter().any(|row| {
+        row["source"] == "codex" && row["source_id"] == "call_exec_1" && row["exit_code"] == 17
+    }));
+}
+
+#[test]
+fn command_events_compound_provenance_join_uses_codex_execution_primary_key() {
+    let fixtures = ShellFixtures::new();
+    let (claude, codex) = fixtures.agent_history();
+    let output = fixtures
+        .command()
+        .env("CODEX_HOME", codex)
+        .args([
+            "EXPLAIN QUERY PLAN \
+             SELECT execution.exit_code \
+             FROM command_events AS event \
+             JOIN codex_tool_executions AS execution \
+               ON execution.thread_id = event.session_id \
+              AND execution.call_id = event.source_id \
+             WHERE event.source = 'codex' \
+               AND event.session_id = 'codex-session' \
+               AND event.source_id = 'call_exec_1'",
+            "--data-dir",
+            claude.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows = parse_json(&output);
+    let details: Vec<&str> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|row| row["detail"].as_str())
+        .collect();
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("codex_tool_executions")
+                && detail.contains("sqlite_autoindex_codex_tool_executions_1")
+                && detail.contains("thread_id=?")
+                && detail.contains("call_id=?")
+        }),
+        "compound provenance join should use the codex_tool_executions primary key: {details:?}"
+    );
 }
 
 #[test]

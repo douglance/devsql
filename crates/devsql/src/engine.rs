@@ -161,7 +161,7 @@ impl UnifiedEngine {
                     execution.call_id, execution.call_record_index,
                     execution.thread_id, thread.parent_thread_id, thread.agent_path,
                     thread.agent_role, thread.originator, execution.tool_name,
-                    execution.called_at, NULL, NULL, execution.cmd,
+                    execution.called_at, NULL, execution.exit_code, execution.cmd,
                     COALESCE(execution.cwd, thread.cwd), NULL, execution.source_path
              FROM codex_tool_executions AS execution
              LEFT JOIN codex_threads AS thread

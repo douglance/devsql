@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const LARGE_INDEX_REFRESH_THRESHOLD: i64 = 1_000;
 const LARGE_INDEX_REFRESH_INTERVAL_MS: i64 = 30_000;
 const FULL_RECONCILIATION_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -1067,14 +1067,17 @@ fn normalize_tool_output(
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| serde_json::to_string(output).unwrap_or_default());
+    let exit_code = extract_codex_host_exit_code(&output_text);
     tx.execute(
         "INSERT INTO codex_tool_executions
-         (thread_id, call_id, output_record_index, output_text, completed_at, source_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         (thread_id, call_id, output_record_index, output_text, completed_at, exit_code,
+          source_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(thread_id, call_id) DO UPDATE SET
            output_record_index = excluded.output_record_index,
            output_text = excluded.output_text,
            completed_at = excluded.completed_at,
+           exit_code = excluded.exit_code,
            source_path = excluded.source_path",
         params![
             thread_id,
@@ -1082,10 +1085,25 @@ fn normalize_tool_output(
             record_index,
             output_text,
             timestamp,
+            exit_code,
             source_path
         ],
     )?;
     Ok(())
+}
+
+fn extract_codex_host_exit_code(output_text: &str) -> Option<i64> {
+    let (header, _) = output_text.split_once("Final output:")?;
+    header.lines().find_map(parse_codex_host_exit_line)
+}
+
+fn parse_codex_host_exit_line(line: &str) -> Option<i64> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let code = line.strip_prefix("Process exited with code ")?;
+    if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
 }
 
 fn extract_command(tool_name: &str, arguments: &Value) -> Option<String> {
@@ -1501,7 +1519,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             value TEXT NOT NULL
         );
         INSERT OR REPLACE INTO index_meta (key, value)
-        VALUES ('schema_version', '3');
+        VALUES ('schema_version', '4');
 
         CREATE TABLE IF NOT EXISTS codex_threads (
             thread_id TEXT PRIMARY KEY,
@@ -1575,6 +1593,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             output_text TEXT,
             called_at TEXT,
             completed_at TEXT,
+            exit_code INTEGER,
             cwd TEXT,
             source_path TEXT NOT NULL,
             PRIMARY KEY (thread_id, call_id)
@@ -1691,6 +1710,78 @@ mod tests {
                 "tests passed".into()
             )
         );
+    }
+
+    #[test]
+    fn sync_extracts_codex_exec_exit_codes_from_host_wrapper() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        let journal = codex_home.join("sessions/rollout-exit-codes.jsonl");
+        write(
+            &journal,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"exit-thread\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-zero\",\"arguments\":\"{\\\"cmd\\\":\\\"true\\\"}\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-zero\",\"output\":\"Process exited with code 0\\nFinal output:\\nok\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-nonzero\",\"arguments\":\"{\\\"cmd\\\":\\\"false\\\"}\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-nonzero\",\"output\":\"Process exited with code 42\\nFinal output:\\nfailed\"}}\n"
+            ),
+        );
+        let cache = temp.path().join("cache/index.sqlite");
+        let mut index = CodexIndex::open_at(&codex_home, &cache).expect("open");
+
+        index.sync().expect("sync");
+
+        let rows = index
+            .connection()
+            .prepare(
+                "SELECT call_id, exit_code FROM codex_tool_executions
+                 ORDER BY call_id",
+            )
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![("call-nonzero".into(), 42), ("call-zero".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn sync_leaves_malformed_and_child_output_exit_markers_nullable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        let journal = codex_home.join("sessions/rollout-no-exit-code.jsonl");
+        write(
+            &journal,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"nullable-exit-thread\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-malformed\",\"arguments\":\"{\\\"cmd\\\":\\\"weird\\\"}\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-malformed\",\"output\":\"Process exited with code nope\\nFinal output:\\nignored\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-deceptive\",\"arguments\":\"{\\\"cmd\\\":\\\"echo marker\\\"}\"}}\n",
+                "{\"timestamp\":\"2026-07-27T10:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-deceptive\",\"output\":\"Final output:\\nProcess exited with code 7\"}}\n"
+            ),
+        );
+        let cache = temp.path().join("cache/index.sqlite");
+        let mut index = CodexIndex::open_at(&codex_home, &cache).expect("open");
+
+        index.sync().expect("sync");
+
+        let null_count: i64 = index
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM codex_tool_executions
+                 WHERE call_id IN ('call-malformed', 'call-deceptive')
+                   AND exit_code IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(null_count, 2);
     }
 
     #[test]
@@ -2028,6 +2119,16 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION);
+        let exit_code_column_count: i64 = rebuilt
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('codex_tool_executions')
+                 WHERE name = 'exit_code'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("columns");
+        assert_eq!(exit_code_column_count, 1);
     }
 
     #[test]

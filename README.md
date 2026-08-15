@@ -167,11 +167,21 @@ sources. Those rows use `channel = 'shell'`, `actor = 'unknown'`,
 `exec_command`/`shell` calls use `channel = 'agent_tool'`, `actor = 'agent'`,
 and `provenance_quality = 'exact'`.
 
+The stable event identity is `(source, session_id, source_id)`. Shell rows use
+their native history source and command identity; Claude and Codex rows use the
+session/thread ID plus the tool call ID. For Codex commands, that pair maps back
+to `codex_tool_executions(thread_id, call_id)`.
+
 The stable `command_events` columns are `source`, `channel`, `actor`,
 `provenance_quality`, `provenance_reason`, `source_id`, `source_order`,
 `session_id`, `parent_session_id`, `agent_id`, `agent_role`, `originator`,
 `tool_name`, `timestamp`, `duration_ms`, `exit_code`, `command`, `cwd`,
 `hostname`, and `source_path`. Values are read without redaction.
+
+`exit_code` is nullable. Shell history reports source-native exit status when
+available, Claude Bash rows leave it `NULL`, and Codex command rows report it
+only when DevSQL recognizes Codex's host wrapper line before the `Final output:`
+delimiter.
 
 Source paths are discovered from Atuin's `db_path` setting and the standard
 Atuin, zsh, and bash locations. Set `DEVSQL_ATUIN_DB`,
