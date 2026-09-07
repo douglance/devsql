@@ -146,6 +146,39 @@ Run `devsql --mcp` to start the primary agent interface described above. Direct 
 | `tool_calls` | `~/.claude/projects/<slug>/**/*.jsonl` (+ legacy `~/.claude/transcripts/*.jsonl`) | Claude assistant tool calls with source, session, subagent, cwd, and timestamp provenance |
 | `work_tasks` | `~/.devsql/worklog.sqlite` | Durable tasks (title, project, status, agent, …) written via `devsql work` |
 | `work_events` | `~/.devsql/worklog.sqlite` | Day-timeline events (start/update/done/note) with `local_date` |
+| `grok_bots` | `~/Library/Application Support/Grok Bot/sand-client-persistence/*.blob` | One row per Grok Bot: name, roster presence, remote store path, entry counts, first/last entry, local replica and gateway backfill state |
+| `grok_entries` | Same replicas (+ optional gateway backfill) | Every transcript entry: kind, role, direction, text, agents, request/batch IDs, `raw_json`, and `provenance` (`local_replica`, `gateway`, or `both`) |
+| `grok_messages` | View over `grok_entries` | Entries that carry real text, joined to the bot name |
+| `grok_ingest_errors` | DevSQL Grok index | Nonfatal blob read, parse, and gateway errors, deduplicated with an occurrence count |
+
+### Grok Bots
+
+Grok Bots are cloud agents on a Grok Bot Sand gateway. Unlike every other source,
+they have **no working directory and no repo** — their only path is a remote
+`/home/box/sand-data/agents/<uuid>/store.db`. They are therefore **global**, and
+are deliberately excluded from `recall`, `gather`, and `command_events`: reach
+them explicitly through `devsql grok` or by querying the `grok_*` tables.
+
+The desktop app's local replicas are *truncated client-side windows*, so the
+index is append-only and never prunes: an entry the app evicts, or a bot deleted
+from the roster, stays queryable. Set `DEVSQL_GROK_DIR` to override the data
+directory (point it at the app-support root, not `sand-client-persistence`).
+
+```bash
+devsql grok status                      # coverage, sync state, ingest errors
+devsql grok search "standup card"       # global search across all bots
+devsql grok search release --bot Terri  # one bot
+devsql grok sync --offline true         # refresh local replicas, no network
+devsql grok sync --bot Terri --full     # backfill full history via grokctl
+```
+
+`grok sync` optionally backfills complete history from the gateway by shelling
+out to [`grokctl`](https://github.com/douglance/grokctl) (`--grokctl <path>` or
+`DEVSQL_GROKCTL_BIN`). Only read-classified `grokctl` commands are used. If
+`grokctl` is missing or the gateway is unreachable, the command still succeeds:
+local replicas are committed and the result reports `gateway.reachable = false`.
+Entries are deduplicated across both paths by `(bot_id, entry_id)`, so a row seen
+from both is marked `provenance = 'both'`.
 
 ### Shell History
 

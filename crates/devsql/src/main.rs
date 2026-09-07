@@ -140,12 +140,13 @@ fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedRe
         Err(error) => return error.into_typed(),
     };
 
-    let (claude_tables, git_tables, code_tables, shell_tables, work_tables, system_tables) =
-        detect_tables(&query);
-    let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
-    let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
-    let code_refs: Vec<&str> = code_tables.iter().map(|s| s.as_str()).collect();
-    let work_refs: Vec<&str> = work_tables.iter().map(|s| s.as_str()).collect();
+    let needed = detect_tables(&query);
+    let (shell_tables, system_tables) = (needed.shell, needed.system);
+    let claude_refs: Vec<&str> = needed.claude.iter().map(|s| s.as_str()).collect();
+    let git_refs: Vec<&str> = needed.git.iter().map(|s| s.as_str()).collect();
+    let code_refs: Vec<&str> = needed.code.iter().map(|s| s.as_str()).collect();
+    let work_refs: Vec<&str> = needed.work.iter().map(|s| s.as_str()).collect();
+    let grok_refs: Vec<&str> = needed.grok.iter().map(|s| s.as_str()).collect();
 
     if let Err(e) = engine.load_claude_tables(&claude_refs) {
         return TypedResult::error("LOAD_ERROR", format!("Failed to load Claude tables: {e}"));
@@ -171,6 +172,9 @@ fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedRe
     }
     if let Err(e) = engine.load_work_tables(&work_refs) {
         return TypedResult::error("LOAD_ERROR", format!("Failed to load work tables: {e}"));
+    }
+    if let Err(e) = engine.load_grok_tables(&grok_refs) {
+        return TypedResult::error("LOAD_ERROR", format!("Failed to load Grok tables: {e}"));
     }
     if system_tables.iter().any(|table| table == "macos_logs") {
         let config = devsql::providers::macos_logs::MacosLogConfig {
@@ -259,7 +263,7 @@ fn query_examples() -> Vec<Example> {
 }
 
 fn query_hint() -> &'static str {
-    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  macOS:        macos_logs (bounded live or .logarchive stream with provenance)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
+    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Grok Bots:    grok_bots, grok_entries, grok_messages, grok_ingest_errors (global; see `devsql grok`)\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  macOS:        macos_logs (bounded live or .logarchive stream with provenance)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nGROK BOTS (explicit search target, never in recall/gather):\n  devsql grok status | search <terms> | sync\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +296,7 @@ fn build_cli() -> Cli {
         .command("recall", devsql::tools::recall::build())
         .command("gather", devsql::tools::gather::build())
         .group(devsql::tools::work::build_group())
+        .group(devsql::tools::grok::build_group())
         .command("today", devsql::tools::day::build_today())
         .command("day", devsql::tools::day::build_day())
         .command("days", devsql::tools::day::build_days())

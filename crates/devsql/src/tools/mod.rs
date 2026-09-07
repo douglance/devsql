@@ -7,6 +7,7 @@ pub mod context;
 pub mod day;
 pub mod diff;
 pub mod gather;
+pub mod grok;
 pub mod history;
 pub mod impact;
 pub mod recall;
@@ -42,6 +43,23 @@ pub fn read_only_mcp() -> McpCommandOptions {
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Like `read_only_mcp`, but honest that the command reaches the network.
+///
+/// It reads rather than mutates, so `read_only_hint` still holds; only
+/// `open_world_hint` differs.
+pub fn network_read_mcp() -> McpCommandOptions {
+    McpCommandOptions {
+        annotations: Some(McpAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(true),
             ..Default::default()
         }),
         ..Default::default()

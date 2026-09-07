@@ -25,6 +25,7 @@ Use the direct commands below only when Code Mode is unavailable or when writing
 - User wants to understand what changed between commits
 - User asks about imports, dependencies, or impact of a file
 - User wants to diagnose recent macOS application or subsystem behavior
+- User asks what a Grok Bot said or decided (use `devsql grok search`, not `recall`/`gather`)
 
 ## Prerequisites
 
@@ -44,6 +45,9 @@ For structured queries, prefer these subcommands (they return JSON):
 | `devsql history <file>` | Showing Git commit history for a specific file with diff stats. |
 | `devsql diff <base> <head>` | Comparing two Git refs with file-level and symbol-level change analysis. |
 | `devsql impact <file>` | Analyzing a file's exports and finding potential dependents via imports. |
+| `devsql grok search "<terms>"` | Searching Grok Bot conversations. Supports `--bot` and `--limit`. |
+| `devsql grok status` | Checking Grok Bot index coverage and ingest errors. |
+| `devsql grok sync` | Refreshing local replicas, and optionally backfilling full history from the gateway. |
 
 All commands accept `--repo` / `-r` and `--data-dir` / `-d` options.
 
@@ -85,6 +89,26 @@ narrow time window plus process or subsystem filters. Defaults are 15 minutes,
 standard level, 50,000 rows, and 30 seconds. The provider streams with bounded
 memory, pushes safe filters into macOS `log show`, and returns partial rows with
 a warning when a timeout or configured row cap is reached.
+
+### Grok Bot Tables
+| Table | Columns |
+|-------|---------|
+| `grok_bots` | bot_id, name, title, description, is_group, origin, remote_store_path, created_at, updated_at, last_activity_at, newest_entry_id, roster_present, entry_count, first_entry_at, last_entry_at, local_replica_path, gateway_backfilled_to_seq, gateway_complete |
+| `grok_entries` | bot_id, entry_id, kind, role, direction, turn_ordinal, timestamp, timestamp_ms, message_type, text, from_agent, to_agent, author, event_type, raw_json, provenance, source_order |
+| `grok_messages` | bot_id, bot_name, entry_id, kind, role, direction, message_type, text, timestamp, provenance (entries with real text only) |
+| `grok_ingest_errors` | source, error_kind, bot_id, message, occurrences, first_observed_at, observed_at |
+
+Grok Bots are **global**: they have no cwd and no repo, so `--repo` does not
+scope them. They are deliberately absent from `recall`, `gather`, and
+`command_events` — treat them as an explicit search target.
+
+Two caveats worth knowing when interpreting results:
+
+- Local replicas are truncated windows. `entry_count` below `newest_entry_id`
+  means history exists on the gateway that is not indexed yet; run
+  `devsql grok sync --bot <name> --full` to backfill.
+- `roster_present = 0` marks a bot deleted in the Grok UI whose history devsql
+  still holds.
 
 ### Code Tables (Source Analysis)
 | Table | Columns |
@@ -199,6 +223,27 @@ FROM diff_files df
 GROUP BY df.path
 ORDER BY commits DESC
 LIMIT 10;
+```
+
+### Find what a Grok Bot said about a topic
+```bash
+devsql grok search "release" --bot Terri --limit 10
+```
+
+```sql
+SELECT bot_name, substr(timestamp, 1, 10) AS day, role, substr(text, 1, 120) AS excerpt
+FROM grok_messages
+WHERE text LIKE '%deploy%'
+ORDER BY timestamp_ms DESC
+LIMIT 20;
+```
+
+### See which bots need a gateway backfill
+```sql
+SELECT name, entry_count, newest_entry_id, gateway_complete
+FROM grok_bots
+WHERE roster_present = 1
+ORDER BY entry_count;
 ```
 
 ## Output Formats
