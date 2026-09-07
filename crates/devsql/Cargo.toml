@@ -3,6 +3,7 @@ name = "devsql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "../../README.md"
 description = "Code Mode across AI coding history, shell history, Git, source code, and worklogs"
 repository = "https://github.com/douglance/devsql"
 homepage = "https://github.com/douglance/devsql"
