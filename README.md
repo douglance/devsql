@@ -146,6 +146,52 @@ Run `devsql --mcp` to start the primary agent interface described above. Direct 
 | `tool_calls` | `~/.claude/projects/<slug>/**/*.jsonl` (+ legacy `~/.claude/transcripts/*.jsonl`) | Claude assistant tool calls with source, session, subagent, cwd, and timestamp provenance |
 | `work_tasks` | `~/.devsql/worklog.sqlite` | Durable tasks (title, project, status, agent, …) written via `devsql work` |
 | `work_events` | `~/.devsql/worklog.sqlite` | Day-timeline events (start/update/done/note) with `local_date` |
+| `grok_bots` | `~/Library/Application Support/Grok Bot/sand-client-persistence/*.blob` | One row per Grok Bot: name, roster presence, remote store path, entry counts, first/last entry, local replica and gateway backfill state |
+| `grok_entries` | Replicas, in-box `store.db`, and optional gateway backfill | Every transcript entry: kind, role, direction, text, agents, request/batch IDs, `raw_json`, and `provenance` (`local_replica`, `store_db`, `gateway`, or `both`) |
+| `grok_messages` | View over `grok_entries` | Entries that carry real text, joined to the bot name |
+| `grok_ingest_errors` | DevSQL Grok index | Nonfatal blob read, parse, and gateway errors, deduplicated with an occurrence count |
+
+### Grok Bots
+
+Grok Bots are cloud agents on a Grok Bot Sand gateway. Unlike every other source,
+they have **no working directory and no repo** — their only path is a remote
+`/home/box/sand-data/agents/<uuid>/store.db`. They are therefore **global**, and
+are deliberately excluded from `recall`, `gather`, and `command_events`: reach
+them explicitly through `devsql grok` or by querying the `grok_*` tables.
+
+devsql reads three sources into one index, deduplicated on `(bot_id, entry_id)`;
+a row seen from more than one is marked `provenance = 'both'`:
+
+| Source | Where | Notes |
+|--------|-------|-------|
+| Desktop replicas | `~/Library/Application Support/Grok Bot/sand-client-persistence/*.blob` | Offline and zero-config, but **truncated client-side windows** |
+| Per-bot stores | `/home/box/sand-data/agents/<uuid>/store.db` | The server of record. Only present **inside a Grok Bot sandbox**, where it is the complete, offline source |
+| Gateway | `grokctl bot transcript-tail` | Full history from anywhere, but needs a reachable gateway |
+
+Because replicas are truncated, the index is append-only and never prunes: an
+entry the app evicts, or a bot deleted from the roster, stays queryable. Set
+`DEVSQL_GROK_DIR` to override the data directory (point it at the app-support
+root, not `sand-client-persistence`).
+
+**Running inside a Grok Bot sandbox**, devsql finds `/home/box/sand-data`
+automatically and reads every bot's `store.db` directly -- no configuration and
+no network. That path also carries entry kinds the desktop replica never shows,
+such as `tool-call`. Bot names come from each store's `kv` table when no roster
+blob exists.
+
+```bash
+devsql grok status                      # coverage, sync state, ingest errors
+devsql grok search "standup card"       # global search across all bots
+devsql grok search release --bot Terri  # one bot
+devsql grok sync --offline true         # refresh local replicas, no network
+devsql grok sync --bot Terri --full     # backfill full history via grokctl
+```
+
+`grok sync` optionally backfills complete history from the gateway by shelling
+out to [`grokctl`](https://github.com/douglance/grokctl) (`--grokctl <path>` or
+`DEVSQL_GROKCTL_BIN`). Only read-classified `grokctl` commands are used. If
+`grokctl` is missing or the gateway is unreachable, the command still succeeds:
+local sources are committed and the result reports `gateway.reachable = false`.
 
 ### Shell History
 

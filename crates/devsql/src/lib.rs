@@ -6,6 +6,7 @@
 mod codex_index;
 pub mod engine;
 pub mod error;
+pub mod grok_index;
 pub mod providers;
 mod redaction;
 pub mod tools;

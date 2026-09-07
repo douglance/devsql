@@ -29,6 +29,9 @@ incurs-codemode-mcp = "0.1.0"
 async-trait = "0.1"
 schemars = "1"
 
+# Grok Bot blob filenames are base32-encoded logical keys
+data-encoding = "2"
+
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
@@ -66,6 +69,8 @@ streaming-iterator = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Build store.db fixtures with the same engine production reads them with
+rusqlite.workspace = true
 assert_cmd = "2"
 predicates = "3"
 zstd.workspace = true

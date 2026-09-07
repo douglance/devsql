@@ -7,6 +7,7 @@ use crate::Result;
 
 #[cfg(feature = "tree-sitter-ast")]
 pub mod ast_nodes;
+pub mod grok_gateway;
 #[cfg(feature = "tree-sitter-ast")]
 pub mod imports;
 pub mod macos_logs;

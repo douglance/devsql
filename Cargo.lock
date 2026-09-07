@@ -1153,6 +1153,7 @@ dependencies = [
  "async-trait",
  "ccql",
  "chrono",
+ "data-encoding",
  "dirs 5.0.1",
  "git2",
  "ignore",

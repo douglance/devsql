@@ -24,6 +24,8 @@ pub struct UnifiedEngine {
     claude_sessions_loaded: bool,
     claude_tool_calls_loaded: bool,
     codex_loaded: bool,
+    grok_data_dir: PathBuf,
+    grok_loaded: bool,
     macos_log_stats: Option<crate::providers::macos_logs::MacosLogStats>,
 }
 
@@ -62,6 +64,8 @@ impl UnifiedEngine {
             claude_sessions_loaded: false,
             claude_tool_calls_loaded: false,
             codex_loaded: false,
+            grok_data_dir: default_grok_data_dir(),
+            grok_loaded: false,
             macos_log_stats: None,
         })
     }
@@ -505,6 +509,66 @@ impl UnifiedEngine {
             ",
         )?;
         self.codex_loaded = true;
+        Ok(())
+    }
+
+    /// Load Grok Bot tables needed for the query.
+    ///
+    /// Grok is deliberately not part of `load_claude_tables`: it is a separate
+    /// source with its own index, and it stays out of the cross-source
+    /// `command_events` view and of `recall`/`gather` default output.
+    pub fn load_grok_tables(&mut self, tables: &[&str]) -> Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        if self.grok_loaded {
+            return Ok(());
+        }
+        let mut index = crate::grok_index::GrokIndex::open(&self.grok_data_dir)?;
+        index.sync()?;
+        let cache_path = index.cache_path().to_string_lossy().into_owned();
+        drop(index);
+
+        self.attach_grok_tables(cache_path)
+    }
+
+    fn attach_grok_tables(&mut self, cache_path: String) -> Result<()> {
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS grok_index", [cache_path])?;
+        self.conn.execute_batch(
+            "
+            CREATE TEMP VIEW grok_bots AS
+              SELECT * FROM grok_index.grok_bots;
+            CREATE TEMP VIEW grok_entries AS
+              SELECT * FROM grok_index.grok_entries;
+            CREATE TEMP VIEW grok_ingest_errors AS
+              SELECT * FROM grok_index.grok_ingest_errors;
+            CREATE TEMP VIEW grok_messages AS
+              SELECT
+                entry.bot_id,
+                bot.name AS bot_name,
+                entry.entry_id,
+                entry.kind,
+                entry.role,
+                entry.direction,
+                entry.message_type,
+                entry.text,
+                entry.from_agent,
+                entry.to_agent,
+                entry.author,
+                entry.request_id,
+                entry.timestamp,
+                entry.timestamp_ms,
+                entry.provenance,
+                entry.source_order,
+                entry.source_path
+              FROM grok_index.grok_entries AS entry
+              LEFT JOIN grok_index.grok_bots AS bot
+                ON bot.bot_id = entry.bot_id
+              WHERE entry.text IS NOT NULL AND entry.text != '';
+            ",
+        )?;
+        self.grok_loaded = true;
         Ok(())
     }
 
@@ -1586,6 +1650,38 @@ fn default_codex_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
+/// Root of the Grok Bot desktop app's data directory.
+///
+/// The env override points at the app-support root rather than
+/// `sand-client-persistence` so one fixture can also supply
+/// `gateway-descriptor.json`. Note the default contains a space, so it must
+/// never be shell-interpolated.
+pub(crate) fn default_grok_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("DEVSQL_GROK_DIR") {
+        return PathBuf::from(dir);
+    }
+    // Inside a Grok Bot sandbox there is no desktop app; the gateway descriptor
+    // lives here instead, and this is also where the per-bot store.db files sit.
+    let sand_data = PathBuf::from("/home/box/sand-data");
+    if sand_data.is_dir() {
+        return sand_data;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return PathBuf::from("Grok Bot");
+    };
+    if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("Grok Bot")
+    } else {
+        // Electron's userData location on Linux and other unix hosts.
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("Grok Bot")
+    }
+}
+
 fn json_number_as_i64(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         value
@@ -1670,18 +1766,20 @@ fn query_mentions_table(query_upper: &str, table_name: &str) -> bool {
         .any(|token| token == table_upper)
 }
 
-/// Detect which tables are needed from a SQL query.
+/// Tables a SQL query needs, grouped by the loader responsible for them.
 ///
-/// Returns a 6-tuple:
-/// (claude_tables, git_tables, code_tables, shell_tables, work_tables, system_tables).
-pub type TableRequirements = (
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-);
+/// Named fields rather than a tuple: every new source would otherwise widen the
+/// tuple and touch every call site.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TableRequirements {
+    pub claude: Vec<String>,
+    pub git: Vec<String>,
+    pub code: Vec<String>,
+    pub shell: Vec<String>,
+    pub work: Vec<String>,
+    pub system: Vec<String>,
+    pub grok: Vec<String>,
+}
 
 pub fn detect_tables(query: &str) -> TableRequirements {
     let query_upper = query.to_uppercase();
@@ -1732,6 +1830,12 @@ pub fn detect_tables(query: &str) -> TableRequirements {
     let shell_tables = ["shell_history", "command_events"];
     let work_tables = ["work_tasks", "work_events"];
     let system_tables = ["macos_logs"];
+    let grok_tables = [
+        "grok_bots",
+        "grok_entries",
+        "grok_messages",
+        "grok_ingest_errors",
+    ];
 
     let needed_claude: Vec<String> = claude_tables
         .iter()
@@ -1769,14 +1873,21 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         .map(|s| s.to_string())
         .collect();
 
-    (
-        needed_claude,
-        needed_git,
-        needed_code,
-        needed_shell,
-        needed_work,
-        needed_system,
-    )
+    let needed_grok: Vec<String> = grok_tables
+        .iter()
+        .filter(|t| query_mentions_table(&query_upper, t))
+        .map(|s| s.to_string())
+        .collect();
+
+    TableRequirements {
+        claude: needed_claude,
+        git: needed_git,
+        code: needed_code,
+        shell: needed_shell,
+        work: needed_work,
+        system: needed_system,
+        grok: needed_grok,
+    }
 }
 
 #[cfg(test)]
@@ -1786,8 +1897,8 @@ mod tests {
 
     #[test]
     fn detect_tables_handles_jhistory_without_history_false_positive() {
-        let (claude, _, _, _, _, _) =
-            detect_tables("SELECT session_id, text FROM jhistory LIMIT 5");
+        let needed = detect_tables("SELECT session_id, text FROM jhistory LIMIT 5");
+        let claude = needed.claude;
 
         assert!(claude.contains(&"jhistory".to_string()));
         assert!(!claude.contains(&"history".to_string()));
@@ -1795,8 +1906,8 @@ mod tests {
 
     #[test]
     fn detect_tables_handles_codex_history_without_history_false_positive() {
-        let (claude, _, _, _, _, _) =
-            detect_tables("SELECT session_id, text FROM codex_history LIMIT 5");
+        let needed = detect_tables("SELECT session_id, text FROM codex_history LIMIT 5");
+        let claude = needed.claude;
 
         assert!(claude.contains(&"codex_history".to_string()));
         assert!(!claude.contains(&"history".to_string()));
@@ -1804,9 +1915,10 @@ mod tests {
 
     #[test]
     fn detect_tables_finds_code_tables() {
-        let (_, _, code, _, _, _) = detect_tables(
+        let code = detect_tables(
             "SELECT * FROM source_files JOIN symbols ON source_files.path = symbols.file_path",
-        );
+        )
+        .code;
 
         assert!(code.contains(&"source_files".to_string()));
         assert!(code.contains(&"symbols".to_string()));
@@ -1815,33 +1927,51 @@ mod tests {
 
     #[test]
     fn detect_tables_finds_work_tables() {
-        let (_, _, _, _, work, _) = detect_tables(
+        let work = detect_tables(
             "SELECT * FROM work_events JOIN work_tasks ON work_events.task_id = work_tasks.id",
-        );
+        )
+        .work;
         assert!(work.contains(&"work_events".to_string()));
         assert!(work.contains(&"work_tasks".to_string()));
     }
 
     #[test]
     fn detect_tables_finds_shell_history_without_history_false_positive() {
-        let (claude, _, _, shell, _, _) =
-            detect_tables("SELECT command FROM shell_history LIMIT 5");
+        let needed = detect_tables("SELECT command FROM shell_history LIMIT 5");
+        let (claude, shell) = (needed.claude, needed.shell);
         assert_eq!(shell, vec!["shell_history".to_string()]);
         assert!(!claude.contains(&"history".to_string()));
     }
 
     #[test]
     fn detect_tables_finds_command_events() {
-        let (_, _, _, shell, _, _) = detect_tables("SELECT actor, command FROM command_events");
+        let shell = detect_tables("SELECT actor, command FROM command_events").shell;
         assert_eq!(shell, vec!["command_events".to_string()]);
     }
 
     #[test]
     fn detect_tables_finds_macos_logs() {
-        let (_, _, _, shell, _, system) =
-            detect_tables("SELECT subsystem, message FROM macos_logs");
+        let needed = detect_tables("SELECT subsystem, message FROM macos_logs");
+        let (shell, system) = (needed.shell, needed.system);
         assert!(shell.is_empty());
         assert_eq!(system, vec!["macos_logs".to_string()]);
+    }
+
+    #[test]
+    fn detect_tables_finds_grok_tables_without_history_false_positive() {
+        let needed = detect_tables("SELECT name, text FROM grok_messages LIMIT 5");
+        assert_eq!(needed.grok, vec!["grok_messages".to_string()]);
+        assert!(!needed.claude.contains(&"history".to_string()));
+        assert!(needed.shell.is_empty());
+    }
+
+    #[test]
+    fn detect_tables_finds_grok_bots_and_entries() {
+        let needed = detect_tables(
+            "SELECT * FROM grok_bots JOIN grok_entries ON grok_bots.bot_id = grok_entries.bot_id",
+        );
+        assert!(needed.grok.contains(&"grok_bots".to_string()));
+        assert!(needed.grok.contains(&"grok_entries".to_string()));
     }
 
     #[test]
