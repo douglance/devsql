@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Bumping this re-projects every entry from its stored `raw_json`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Slice of the desktop app's persistence layer a blob belongs to.
 const SLICE_ROSTER: &str = "roster";
@@ -35,9 +35,15 @@ const SLICE_TRANSCRIPT: &str = "transcript";
 const SLICE_OTHER: &str = "other";
 
 const PERSISTENCE_SUBDIR: &str = "sand-client-persistence";
+const SLICE_STORE_DB: &str = "store_db";
+
+/// Inside a Grok Bot sandbox the per-bot SQLite stores are the server of
+/// record. The host exposes the same tree under two names.
+const IN_BOX_ROOTS: [&str; 2] = ["/home/box/agent-data", "/home/box/sand-data"];
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GrokSyncStats {
+    pub parsed_store_dbs: usize,
     pub parsed_blobs: usize,
     pub parsed_entries: usize,
     pub unchanged_blobs: usize,
@@ -117,12 +123,13 @@ impl GrokIndex {
     /// an error — the same invariant `shell_history` applies to absent sources.
     pub(crate) fn sync(&mut self) -> Result<GrokSyncStats> {
         let dir = self.persistence_dir();
-        if !dir.exists() {
-            return Ok(GrokSyncStats::default());
-        }
-
-        let blobs = discover_blobs(&dir)?;
-        if blobs.is_empty() {
+        let blobs = if dir.exists() {
+            discover_blobs(&dir)?
+        } else {
+            // In-box there is no desktop app, only per-bot store.db files.
+            Vec::new()
+        };
+        if blobs.is_empty() && discover_store_dbs(&self.grok_dir).is_empty() {
             return Ok(GrokSyncStats::default());
         }
 
@@ -153,6 +160,27 @@ impl GrokIndex {
                 BlobOutcome::Ingested { entries } => {
                     stats.parsed_blobs += 1;
                     stats.parsed_entries += entries;
+                }
+            }
+        }
+
+        for store in discover_store_dbs(&self.grok_dir) {
+            match sync_store_db(&mut tx, &store) {
+                Ok(StoreOutcome::Unchanged) => stats.unchanged_blobs += 1,
+                Ok(StoreOutcome::Ingested { entries }) => {
+                    stats.parsed_store_dbs += 1;
+                    stats.parsed_entries += entries;
+                }
+                Err(error) => {
+                    stats.skipped_blobs += 1;
+                    record_ingest_error(
+                        &tx,
+                        &store.path.to_string_lossy(),
+                        Some(&store.bot_id),
+                        None,
+                        "store_db_read",
+                        &error.to_string(),
+                    )?;
                 }
             }
         }
@@ -361,6 +389,250 @@ fn modified_ns(metadata: &fs::Metadata) -> i64 {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Per-bot SQLite stores (the in-box server of record)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoreDb {
+    pub path: PathBuf,
+    pub bot_id: String,
+    pub size: u64,
+    pub modified_ns: i64,
+}
+
+/// Find `<root>/agents/<bot-uuid>/store.db`.
+///
+/// Checks the configured directory first, then the two well-known in-box roots,
+/// so a bot inspecting itself needs no configuration.
+pub(crate) fn discover_store_dbs(grok_dir: &Path) -> Vec<StoreDb> {
+    let mut roots = vec![grok_dir.join("agents")];
+    roots.extend(
+        IN_BOX_ROOTS
+            .iter()
+            .map(|root| Path::new(root).join("agents")),
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    let mut stores = Vec::new();
+    for root in roots {
+        // The two in-box roots are aliases for one tree; key on bot id so a bot
+        // is never ingested twice.
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(bot_id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let path = entry.path().join("store.db");
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !seen.insert(bot_id.clone()) {
+                continue;
+            }
+            stores.push(StoreDb {
+                path,
+                bot_id,
+                size: metadata.len(),
+                modified_ns: modified_ns(&metadata),
+            });
+        }
+    }
+    stores
+}
+
+enum StoreOutcome {
+    Unchanged,
+    Ingested { entries: usize },
+}
+
+fn sync_store_db(tx: &mut Transaction<'_>, store: &StoreDb) -> Result<StoreOutcome> {
+    let key = store.path.to_string_lossy().into_owned();
+    let cached: Option<(i64, i64, Option<i64>)> = tx
+        .query_row(
+            "SELECT size, modified_ns, last_seq FROM source_blobs WHERE blob_path = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+
+    if let Some((size, modified_ns, _)) = cached {
+        if size == store.size as i64 && modified_ns == store.modified_ns {
+            return Ok(StoreOutcome::Unchanged);
+        }
+    }
+    let last_seq = cached.and_then(|(_, _, seq)| seq).unwrap_or(-1);
+
+    // `seq` is a monotonic rowid, so resuming from the watermark is exact --
+    // no offset arithmetic and no torn-record handling needed.
+    let rows = read_transcript_entries(&store.path, last_seq)?;
+
+    ensure_bot_row(tx, &store.bot_id)?;
+    let mut written = 0usize;
+    let mut highest = last_seq;
+    for (seq, entry_id, raw) in rows {
+        highest = highest.max(seq);
+        let Ok(entry) = serde_json::from_str::<Value>(&raw) else {
+            record_ingest_error(
+                tx,
+                &key,
+                Some(&store.bot_id),
+                Some(&entry_id),
+                "store_db_entry_json",
+                &format!("entry {entry_id} at seq {seq} is not valid JSON"),
+            )?;
+            continue;
+        };
+        // The stored JSON is the same entry shape the desktop replicas and the
+        // gateway return, so one projection serves all three sources.
+        if upsert_entry(
+            tx,
+            &store.bot_id,
+            &entry,
+            seq,
+            "store_db",
+            Some(seq),
+            Some(&key),
+        )? {
+            written += 1;
+        }
+    }
+
+    // In-box there is no roster blob, so identity comes from the store's own
+    // key/value table. Roster data, when present, stays authoritative.
+    if let Ok(profile) = read_store_kv(&store.path) {
+        apply_store_profile(tx, &store.bot_id, &profile)?;
+    }
+
+    tx.execute(
+        "INSERT INTO source_blobs (
+             blob_path, logical_key, slice, bot_id, account_id, schema_version,
+             size, modified_ns, persisted_at_ms, last_seq, entry_count, ingested_at)
+         VALUES (?1,?2,?3,?4,NULL,NULL,?5,?6,NULL,?7,?8,?9)
+         ON CONFLICT(blob_path) DO UPDATE SET
+             size = excluded.size,
+             modified_ns = excluded.modified_ns,
+             last_seq = excluded.last_seq,
+             entry_count = source_blobs.entry_count + excluded.entry_count,
+             ingested_at = excluded.ingested_at",
+        params![
+            key,
+            format!("store.db:{}", store.bot_id),
+            SLICE_STORE_DB,
+            store.bot_id,
+            store.size as i64,
+            store.modified_ns,
+            highest,
+            written as i64,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+
+    Ok(StoreOutcome::Ingested { entries: written })
+}
+
+#[derive(Debug, Default)]
+struct StoreProfile {
+    name: Option<String>,
+    origin: Option<String>,
+    last_activity_at: Option<String>,
+    unread_count: Option<i64>,
+}
+
+/// Pull bot identity out of the store's `kv` table.
+fn read_store_kv(path: &Path) -> Result<StoreProfile> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+
+    let mut stmt = conn.prepare("SELECT key, value FROM kv")?;
+    let mut profile = StoreProfile::default();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    for row in rows {
+        let (key, value) = row?;
+        match key.as_str() {
+            "origin" => profile.origin = Some(value),
+            "agentProfilePromptSnapshot" => {
+                profile.name = serde_json::from_str::<Value>(&value).ok().and_then(|v| {
+                    v.get("profileSection")
+                        .and_then(Value::as_str)
+                        .and_then(profile_title)
+                });
+            }
+            "unreadState" => {
+                if let Ok(state) = serde_json::from_str::<Value>(&value) {
+                    profile.last_activity_at =
+                        epoch_ms_to_rfc3339(state.get("lastActivityAt").and_then(Value::as_i64));
+                    profile.unread_count = state.get("unreadCount").and_then(Value::as_i64);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(profile)
+}
+
+/// The display name is not its own key; it appears as a `Title:` line inside
+/// the rendered profile prompt.
+fn profile_title(section: &str) -> Option<String> {
+    section.lines().find_map(|line| {
+        line.strip_prefix("Title:")
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+    })
+}
+
+fn apply_store_profile(conn: &Connection, bot_id: &str, profile: &StoreProfile) -> Result<()> {
+    conn.execute(
+        "UPDATE grok_bots SET
+             name = COALESCE(name, ?2),
+             origin = COALESCE(origin, ?3),
+             last_activity_at = COALESCE(last_activity_at, ?4),
+             unread_count = COALESCE(unread_count, ?5)
+         WHERE bot_id = ?1",
+        params![
+            bot_id,
+            profile.name,
+            profile.origin,
+            profile.last_activity_at,
+            profile.unread_count
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read new transcript rows from a bot's store, read-only.
+///
+/// The owning bot may be writing concurrently, so this opens read-only with a
+/// busy timeout and never takes a write lock.
+fn read_transcript_entries(path: &Path, after_seq: i64) -> Result<Vec<(i64, String, String)>> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+
+    let mut stmt =
+        conn.prepare("SELECT seq, id, entry FROM transcript_entries WHERE seq > ?1 ORDER BY seq")?;
+    let rows = stmt
+        .query_map(params![after_seq], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,6 +1299,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             size INTEGER NOT NULL,
             modified_ns INTEGER NOT NULL,
             persisted_at_ms INTEGER,
+            last_seq INTEGER,
             entry_count INTEGER NOT NULL DEFAULT 0,
             ingested_at TEXT NOT NULL
         );

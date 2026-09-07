@@ -106,7 +106,10 @@ Two caveats worth knowing when interpreting results:
 
 - Local replicas are truncated windows. `entry_count` below `newest_entry_id`
   means history exists on the gateway that is not indexed yet; run
-  `devsql grok sync --bot <name> --full` to backfill.
+  `devsql grok sync --bot <name> --full` to backfill. Inside a Grok Bot sandbox
+  this does not apply: devsql reads each bot's `store.db` directly and offline.
+- `provenance` says where a row came from: `local_replica`, `store_db`,
+  `gateway`, or `both` (seen from more than one).
 - `roster_present = 0` marks a bot deleted in the Grok UI whose history devsql
   still holds.
 

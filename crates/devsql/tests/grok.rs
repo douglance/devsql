@@ -841,3 +841,196 @@ fn a_missing_grokctl_binary_degrades_to_local_only() {
     assert_eq!(result["local"]["entries"], json!(3));
     assert_eq!(fx.scalar("SELECT COUNT(*) FROM grok_entries"), "3");
 }
+
+// ---------------------------------------------------------------------------
+// In-box per-bot store.db (the server of record inside a Grok Bot sandbox)
+// ---------------------------------------------------------------------------
+
+impl GrokFixtures {
+    /// Build `<grok_dir>/agents/<bot_id>/store.db` with the real schema.
+    fn write_store_db(&self, bot_id: &str, entries: &[(i64, &str, Value)], title: Option<&str>) {
+        let dir = self.grok_dir.join("agents").join(bot_id);
+        std::fs::create_dir_all(&dir).expect("agent dir");
+        let db = dir.join("store.db");
+        let conn = rusqlite::Connection::open(&db).expect("open store.db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transcript_entries (
+                 seq INTEGER PRIMARY KEY,
+                 id TEXT NOT NULL UNIQUE,
+                 entry TEXT NOT NULL
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS kv (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             ) STRICT;",
+        )
+        .expect("store schema");
+
+        for (seq, id, entry) in entries {
+            conn.execute(
+                "INSERT OR REPLACE INTO transcript_entries (seq, id, entry) VALUES (?1, ?2, ?3)",
+                rusqlite::params![seq, id, entry.to_string()],
+            )
+            .expect("insert entry");
+        }
+
+        if let Some(title) = title {
+            let snapshot = json!({
+                "version": 1,
+                "profileSection": format!(
+                    "Agent profile:\nTitle: {title}\nYour agent name is \"{title}\"."
+                ),
+            });
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES ('agentProfilePromptSnapshot', ?1)",
+                rusqlite::params![snapshot.to_string()],
+            )
+            .expect("insert kv");
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES ('origin', 'user')",
+                [],
+            )
+            .expect("insert origin");
+        }
+    }
+}
+
+#[test]
+fn reads_per_bot_store_db_without_any_replicas() {
+    // In-box there is no desktop app and no persistence directory at all.
+    let fx = GrokFixtures::new();
+    std::fs::remove_dir_all(fx.persistence()).expect("drop persistence dir");
+
+    fx.write_store_db(
+        BOT_A,
+        &[
+            (1, "t0u", user_entry(0, "in-box question", 100)),
+            (2, "t0s0", send_entry(0, 0, "in-box answer", 101)),
+        ],
+        Some("Grokctl"),
+    );
+
+    assert_eq!(fx.scalar("SELECT COUNT(*) FROM grok_entries"), "2");
+    // Identity comes from the store's kv table when no roster exists.
+    assert_eq!(fx.scalar("SELECT name FROM grok_bots"), "Grokctl");
+    assert_eq!(fx.scalar("SELECT origin FROM grok_bots"), "user");
+    assert_eq!(
+        fx.scalar("SELECT provenance FROM grok_entries WHERE entry_id = 't0u'"),
+        "store_db"
+    );
+    // `seq` is a real monotonic ordinal, so it drives ordering directly.
+    assert_eq!(
+        fx.scalar("SELECT source_order FROM grok_entries WHERE entry_id = 't0s0'"),
+        "2"
+    );
+    assert_eq!(
+        fx.scalar("SELECT text FROM grok_messages WHERE entry_id = 't0s0'"),
+        "in-box answer"
+    );
+}
+
+#[test]
+fn store_db_ingest_resumes_from_the_seq_watermark() {
+    let fx = GrokFixtures::new();
+    std::fs::remove_dir_all(fx.persistence()).expect("drop persistence dir");
+    fx.write_store_db(
+        BOT_A,
+        &[(1, "t0u", user_entry(0, "first", 100))],
+        Some("Grokctl"),
+    );
+    assert_eq!(fx.scalar("SELECT COUNT(*) FROM grok_entries"), "1");
+
+    // The bot keeps talking; only rows past the watermark are re-read.
+    fx.write_store_db(
+        BOT_A,
+        &[
+            (1, "t0u", user_entry(0, "first", 100)),
+            (2, "t1u", user_entry(1, "second", 200)),
+            (3, "t2u", user_entry(2, "third", 300)),
+        ],
+        Some("Grokctl"),
+    );
+
+    assert_eq!(fx.scalar("SELECT COUNT(*) FROM grok_entries"), "3");
+    let status = fx.status();
+    assert_eq!(status["entries"], json!(3));
+}
+
+#[test]
+fn store_db_and_local_replica_merge_for_the_same_bot() {
+    let fx = seeded();
+    // Same entry_id the replica already holds, now also in the store.
+    fx.write_store_db(
+        BOT_A,
+        &[(
+            1,
+            "t0u",
+            user_entry(0, "can you use grokctl?", 1_787_875_800_675),
+        )],
+        Some("Grokctl"),
+    );
+
+    assert_eq!(
+        fx.scalar(&format!(
+            "SELECT COUNT(*) FROM grok_entries WHERE bot_id = '{BOT_A}'"
+        )),
+        "2",
+        "a duplicate entry_id must merge across sources"
+    );
+    assert_eq!(
+        fx.scalar("SELECT provenance FROM grok_entries WHERE entry_id = 't0u'"),
+        "both"
+    );
+    // The roster name wins over the store's kv snapshot.
+    assert_eq!(
+        fx.scalar(&format!(
+            "SELECT name FROM grok_bots WHERE bot_id = '{BOT_A}'"
+        )),
+        "Grokctl"
+    );
+}
+
+/// store.db carries kinds the desktop replica never shows, `tool-call` among
+/// them. An unknown kind must be stored, not dropped.
+#[test]
+fn store_db_tool_call_entries_are_preserved() {
+    let fx = GrokFixtures::new();
+    std::fs::remove_dir_all(fx.persistence()).expect("drop persistence dir");
+    fx.write_store_db(
+        BOT_A,
+        &[(
+            1,
+            "t0c0",
+            json!({
+                "kind": "tool-call",
+                "id": "t0c0",
+                "tool": {"name": "run_terminal_command"},
+                "timestampMs": 100,
+            }),
+        )],
+        Some("Grokctl"),
+    );
+
+    assert_eq!(fx.scalar("SELECT kind FROM grok_entries"), "tool-call");
+    assert_eq!(fx.scalar("SELECT COUNT(*) FROM grok_messages"), "0");
+    let raw = fx.scalar("SELECT raw_json FROM grok_entries");
+    assert!(
+        raw.contains("run_terminal_command"),
+        "raw_json preserved: {raw}"
+    );
+}
+
+#[test]
+fn a_corrupt_store_db_is_recorded_and_skipped() {
+    let fx = seeded();
+    let dir = fx.grok_dir.join("agents").join(BOT_B);
+    std::fs::create_dir_all(&dir).expect("agent dir");
+    std::fs::write(dir.join("store.db"), b"this is not a sqlite database").expect("corrupt store");
+
+    // Local replicas still ingest; the bad store is reported.
+    assert_eq!(fx.scalar("SELECT COUNT(*) FROM grok_entries"), "3");
+    assert_eq!(
+        fx.scalar("SELECT COUNT(*) FROM grok_ingest_errors WHERE error_kind = 'store_db_read'"),
+        "1"
+    );
+}
