@@ -318,6 +318,7 @@ impl CommandHandler for DiffHandler {
         let head_short = &head_commit.id().to_string()[..7];
 
         CommandResult::Ok {
+            exit_code: None,
             data: json!({
                 "base": base_short,
                 "head": head_short,

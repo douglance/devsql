@@ -69,7 +69,7 @@ impl CommandHandler for ContextHandler {
 
         let (mut engine, _repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return e.into(),
         };
 
         // Load source_files and symbols tables
@@ -133,6 +133,7 @@ impl CommandHandler for ContextHandler {
         }
 
         CommandResult::Ok {
+            exit_code: None,
             data: json!({
                 "file_pattern": file,
                 "total": results.len(),

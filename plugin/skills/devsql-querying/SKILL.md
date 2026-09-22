@@ -53,15 +53,33 @@ All commands accept `--repo` / `-r` and `--data-dir` / `-d` options.
 
 ## Available Tables
 
+The lists below are a guide. For the exact columns, run `devsql schema` (every
+table) or `devsql schema <table>`; a query naming a column that does not exist
+fails with the table's real columns and the closest match.
+
 ### Claude/Codex Tables
 | Table | Columns |
 |-------|---------|
-| `history` | timestamp, display (prompt text), project, pastedContents |
+| `history` | rowid, display (prompt text), timestamp (epoch ms), project (working directory) |
 | `jhistory` | session_id, ts, text, display, timestamp |
 | `codex_history` | Alias of `jhistory` |
 | `transcripts` | type, content, tool_name, session_id, _source_file, _session_id, _project, _agent_id, timestamp, model, usage_input_tokens, usage_output_tokens, usage_cache_read_input_tokens, usage_cache_creation_input_tokens, usage_ephemeral_5m_input_tokens, usage_ephemeral_1h_input_tokens, usage_service_tier |
 | `sessions` | session_id, project, cwd, git_branch, version, title, first_timestamp, last_timestamp, user_message_count, assistant_message_count, subagent_count, total_input_tokens, total_output_tokens, total_cache_read_input_tokens, total_cache_creation_input_tokens, pr_url, pr_number |
 | `todos` | content, status |
+| `codex_threads` | one row per Codex conversation: thread_id, cwd, started_at, last_event_at, first_user_text, … |
+| `codex_messages`, `codex_events`, `codex_tool_executions` | Codex messages, raw events, and commands with output |
+
+### Shell and Worklog Tables
+| Table | Columns |
+|-------|---------|
+| `shell_history` | Atuin, zsh, and bash history: source, timestamp, command, cwd, exit_code, … |
+| `command_events` | shell and agent commands in one stream (large; filter early) |
+| `work_tasks` | id, title, project, cwd, agent, status, created_at, updated_at, session_id, source |
+| `work_events` | task events: task_id, ts, local_date, kind, title, body, project, cwd, agent |
+
+Write the worklog with `devsql work start|update|done|note`. `update` and
+`done` take a task id, an exact title, or (when one task is open in the current
+directory) a sentence of progress.
 
 `transcripts` covers `~/.claude/projects/<slug>/**/*.jsonl` (top-level sessions
 plus subagent transcripts) and the legacy `~/.claude/transcripts/*.jsonl`.
@@ -76,6 +94,11 @@ files. `_agent_id` is set only on subagent rows.
 | `branches` | name, is_head, commit_id |
 | `diffs` | commit_id, files_changed, insertions, deletions |
 | `diff_files` | commit_id, path, status (A/D/M/R/C), insertions, deletions |
+
+Also loaded when a query reads them: `commit_parents`, `tags`, `refs`,
+`stashes`, `reflog`, `blame`, `config`, `remotes`, `submodules`, `status`,
+`worktrees`, `hooks`, `notes`. A commit's hash is `commits.id` (`short_id` for
+7 characters); line counts live in `diffs` and `diff_files`, not `commits`.
 
 ### macOS Unified Log
 
@@ -120,9 +143,8 @@ Two caveats worth knowing when interpreting results:
 | `source_lines` | file_path, line_number, content, is_blank |
 | `symbols` | file_path, name, kind, line_start, line_end, signature, visibility, parameters, return_type, language |
 | `imports`\* | file_path, line_number, module, name, alias, kind, is_default, is_wildcard |
-| `ast_nodes`\* | (requires tree-sitter-ast feature) |
 
-\* Full extraction requires the `tree-sitter-ast` build feature. Without it, `symbols` uses regex-based extraction and `imports`/`ast_nodes` are empty.
+\* `imports` requires the `tree-sitter-ast` build feature; without it a query on `imports` fails with that message. Without the feature, `symbols` uses regex-based extraction.
 
 **Supported languages for symbol extraction:** Rust, TypeScript, JavaScript, Python, Go.
 

@@ -21,7 +21,6 @@ use rusqlite::{
     params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -58,15 +57,7 @@ pub(crate) struct GrokIndex {
 
 impl GrokIndex {
     pub(crate) fn open(grok_dir: &Path) -> Result<Self> {
-        let cache_root = dirs::cache_dir()
-            .unwrap_or_else(|| std::env::temp_dir().join("devsql-cache"))
-            .join("devsql")
-            .join("grok-index");
-        let canonical = grok_dir
-            .canonicalize()
-            .unwrap_or_else(|_| grok_dir.to_path_buf());
-        let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-        let cache_path = cache_root.join(format!("{digest:x}.sqlite"));
+        let cache_path = crate::cache::cache_path("grok-index", grok_dir);
         Self::open_at(grok_dir, &cache_path)
     }
 

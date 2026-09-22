@@ -60,8 +60,9 @@ pub fn create_table() -> Table {
 }
 
 pub fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s.chars().take(max_len - 3).collect::<String>())
+    if s.chars().count() > max_len {
+        let kept: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{kept}...")
     } else {
         s.to_string()
     }

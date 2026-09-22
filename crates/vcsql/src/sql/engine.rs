@@ -90,38 +90,46 @@ impl SqlEngine {
             return Ok(());
         }
 
-        let table_info = get_table_info(table_name)
-            .ok_or_else(|| VcsqlError::TableNotFound(table_name.to_string()))?;
-
-        self.conn.execute(table_info.create_sql, [])?;
-
-        let provider: Box<dyn Provider> = match table_name {
-            "commits" => Box::new(CommitsProvider),
-            "commit_parents" => Box::new(CommitParentsProvider),
-            "branches" => Box::new(BranchesProvider),
-            "tags" => Box::new(TagsProvider),
-            "refs" => Box::new(RefsProvider),
-            "stashes" => Box::new(StashesProvider),
-            "reflog" => Box::new(ReflogProvider),
-            "diffs" => Box::new(DiffsProvider),
-            "diff_files" => Box::new(DiffFilesProvider),
-            "blame" => Box::new(BlameProvider::new(None)),
-            "config" => Box::new(ConfigProvider),
-            "remotes" => Box::new(RemotesProvider),
-            "submodules" => Box::new(SubmodulesProvider),
-            "status" => Box::new(StatusProvider),
-            "worktrees" => Box::new(WorktreesProvider),
-            "hooks" => Box::new(HooksProvider),
-            "notes" => Box::new(NotesProvider),
-            _ => return Err(VcsqlError::TableNotFound(table_name.to_string())),
-        };
-
-        provider.populate(&self.conn, repo)?;
+        populate_table(&self.conn, table_name, repo)?;
         self.loaded_tables.insert(table_name.to_string());
 
         Ok(())
     }
+}
 
+/// Create `table_name` in `conn` and fill it from `repo`. This is the loader
+/// behind [`SqlEngine::load_table`], usable on any SQLite connection.
+pub fn populate_table(conn: &Connection, table_name: &str, repo: &mut GitRepo) -> Result<()> {
+    let table_info = get_table_info(table_name)
+        .ok_or_else(|| VcsqlError::TableNotFound(table_name.to_string()))?;
+
+    conn.execute(table_info.create_sql, [])?;
+
+    let provider: Box<dyn Provider> = match table_name {
+        "commits" => Box::new(CommitsProvider),
+        "commit_parents" => Box::new(CommitParentsProvider),
+        "branches" => Box::new(BranchesProvider),
+        "tags" => Box::new(TagsProvider),
+        "refs" => Box::new(RefsProvider),
+        "stashes" => Box::new(StashesProvider),
+        "reflog" => Box::new(ReflogProvider),
+        "diffs" => Box::new(DiffsProvider),
+        "diff_files" => Box::new(DiffFilesProvider),
+        "blame" => Box::new(BlameProvider::new(None)),
+        "config" => Box::new(ConfigProvider),
+        "remotes" => Box::new(RemotesProvider),
+        "submodules" => Box::new(SubmodulesProvider),
+        "status" => Box::new(StatusProvider),
+        "worktrees" => Box::new(WorktreesProvider),
+        "hooks" => Box::new(HooksProvider),
+        "notes" => Box::new(NotesProvider),
+        _ => return Err(VcsqlError::TableNotFound(table_name.to_string())),
+    };
+
+    provider.populate(conn, repo)
+}
+
+impl SqlEngine {
     /// Loads all tables referenced in a query from the repository.
     ///
     /// Analyzes the query to determine which tables are needed, then loads each one.

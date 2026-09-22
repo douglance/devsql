@@ -3,11 +3,13 @@
 //! This crate combines AI coding history, Git, source code, and shell history
 //! in a unified query interface.
 
+mod cache;
 mod codex_index;
 pub mod engine;
 pub mod error;
 pub mod grok_index;
 pub mod providers;
+pub mod query_help;
 mod redaction;
 pub mod tools;
 pub mod worklog;

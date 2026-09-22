@@ -157,6 +157,92 @@ fn work_list_and_sql_tables() {
         .stdout(predicate::str::contains("SQL check"));
 }
 
+fn work(home: &TempDir, dir: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Assert {
+    devsql()
+        .env("DEVSQL_HOME", home.path())
+        .current_dir(dir)
+        .args(args)
+        .args(["--format", "json"])
+        .assert()
+}
+
+fn json(assert: assert_cmd::assert::Assert) -> Value {
+    serde_json::from_slice(&assert.get_output().stdout).expect("json")
+}
+
+#[test]
+fn start_takes_title_flag_and_note_means_body() {
+    let home = with_home();
+    let dir = TempDir::new().expect("dir");
+    let started = json(
+        work(&home, dir.path(), &["work", "start", "--title", "Wire the gate", "--note", "first pass"])
+            .success(),
+    );
+    assert_eq!(started["task"]["title"], "Wire the gate");
+    assert_eq!(started["event"]["body"], "first pass");
+}
+
+#[test]
+fn update_and_done_find_a_task_by_title_or_id_prefix() {
+    let home = with_home();
+    let dir = TempDir::new().expect("dir");
+    let started = json(work(&home, dir.path(), &["work", "start", "Wire the gate"]).success());
+    let id = started["task"]["id"].as_str().unwrap().to_string();
+
+    let updated = json(
+        work(&home, dir.path(), &["work", "update", "wire the GATE", "--note", "halfway"]).success(),
+    );
+    assert_eq!(updated["task"]["id"], id.as_str());
+    assert_eq!(updated["event"]["body"], "halfway");
+
+    let done = json(work(&home, dir.path(), &["work", "done", &id[..12]]).success());
+    assert_eq!(done["task"]["id"], id.as_str());
+    assert_eq!(done["task"]["status"], "done");
+}
+
+#[test]
+fn a_progress_sentence_lands_on_the_only_open_task_here() {
+    let home = with_home();
+    let here = TempDir::new().expect("here");
+    let elsewhere = TempDir::new().expect("elsewhere");
+    let started = json(work(&home, here.path(), &["work", "start", "Port the parser"]).success());
+    work(&home, elsewhere.path(), &["work", "start", "Unrelated work"]).success();
+
+    let done = json(
+        work(&home, here.path(), &["work", "done", "Parser ported; tests green", "--body", "PR open"])
+            .success(),
+    );
+    assert_eq!(done["task"]["id"], started["task"]["id"]);
+    assert_eq!(done["event"]["body"], "Parser ported; tests green\n\nPR open");
+}
+
+#[test]
+fn an_ambiguous_reference_lists_the_open_tasks() {
+    let home = with_home();
+    let dir = TempDir::new().expect("dir");
+    let first = json(work(&home, dir.path(), &["work", "start", "First"]).success());
+    let second = json(work(&home, dir.path(), &["work", "start", "Second"]).success());
+
+    let output = work(&home, dir.path(), &["work", "update", "some progress"])
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(first["task"]["id"].as_str().unwrap()), "{text}");
+    assert!(text.contains(second["task"]["id"].as_str().unwrap()), "{text}");
+}
+
+#[test]
+fn a_wrong_id_is_never_read_as_progress() {
+    let home = with_home();
+    let dir = TempDir::new().expect("dir");
+    work(&home, dir.path(), &["work", "start", "Only task"]).success();
+    work(&home, dir.path(), &["work", "done", "00065c16489a29090000"])
+        .failure()
+        .stdout(predicate::str::contains("Unknown task: 00065c16489a29090000"));
+}
+
 #[test]
 fn days_index() {
     let home = with_home();

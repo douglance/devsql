@@ -46,13 +46,15 @@ devsql impact src/lib.rs         # Exports and dependents
 - `branches` — Branch information (name, is_head, commit_id)
 - `diffs` — Commit-level diff stats (commit_id, files_changed, insertions, deletions)
 - `diff_files` — Per-file diff stats (commit_id, path, status, insertions, deletions)
+- Also: `commit_parents`, `tags`, `refs`, `stashes`, `reflog`, `blame`, `config`, `remotes`, `submodules`, `status`, `worktrees`, `hooks`, `notes`
 
 ### Code Tables (source analysis of current repo)
 - `source_files` — File inventory (path, name, extension, directory, size_bytes, line_count, modified_at, language)
 - `source_lines` — Line-level content (file_path, line_number, content, is_blank)
 - `symbols` — Functions, classes, structs, traits, etc. (file_path, name, kind, line_start, line_end, signature, visibility, parameters, return_type, language)
-- `imports` — Import/use statements (file_path, line_number, module, name, alias, kind, is_default, is_wildcard). Requires `tree-sitter-ast` feature for full extraction.
-- `ast_nodes` — Raw AST nodes. Requires `tree-sitter-ast` feature.
+- `imports` — Import/use statements (file_path, line_number, module, name, alias, kind, is_default, is_wildcard). Requires the `tree-sitter-ast` feature.
+
+Run `devsql schema <table>` for any table's exact columns.
 
 ### macOS Unified Log
 

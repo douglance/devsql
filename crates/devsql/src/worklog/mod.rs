@@ -290,9 +290,8 @@ impl Worklog {
     }
 
     pub fn update(&self, input: UpdateInput) -> Result<(WorkTask, WorkEvent)> {
-        let mut task = self
-            .get_task(&input.task_id)?
-            .ok_or_else(|| Error::Query(format!("Unknown task: {}", input.task_id)))?;
+        let (mut task, progress) = self.resolve_task(&input.task_id, current_cwd().as_deref())?;
+        let body = with_progress(progress, input.body);
 
         let ts = now_iso();
         if let Some(title) = &input.title {
@@ -320,7 +319,7 @@ impl Worklog {
             Some(&task.id),
             kind,
             &title,
-            input.body.as_deref(),
+            body.as_deref(),
             task.project.as_deref(),
             task.cwd.as_deref(),
             task.agent.as_deref(),
@@ -332,9 +331,8 @@ impl Worklog {
     }
 
     pub fn done(&self, input: DoneInput) -> Result<(WorkTask, WorkEvent)> {
-        let mut task = self
-            .get_task(&input.task_id)?
-            .ok_or_else(|| Error::Query(format!("Unknown task: {}", input.task_id)))?;
+        let (mut task, progress) = self.resolve_task(&input.task_id, current_cwd().as_deref())?;
+        let body = with_progress(progress, input.body);
 
         let ts = now_iso();
         if let Some(title) = &input.title {
@@ -354,7 +352,7 @@ impl Worklog {
             Some(&task.id),
             "done",
             &title,
-            input.body.as_deref(),
+            body.as_deref(),
             task.project.as_deref(),
             task.cwd.as_deref(),
             task.agent.as_deref(),
@@ -366,10 +364,12 @@ impl Worklog {
     }
 
     pub fn note(&self, input: NoteInput) -> Result<WorkEvent> {
-        let (project, cwd, agent, session_id) = if let Some(tid) = &input.task_id {
-            let task = self
-                .get_task(tid)?
-                .ok_or_else(|| Error::Query(format!("Unknown task: {tid}")))?;
+        let mut task_id = input.task_id.clone();
+        let mut body = input.body.clone();
+        let (project, cwd, agent, session_id) = if let Some(reference) = &input.task_id {
+            let (task, progress) = self.resolve_task(reference, current_cwd().as_deref())?;
+            task_id = Some(task.id.clone());
+            body = with_progress(progress, body);
             (
                 input.project.or(task.project),
                 input.cwd.or(task.cwd),
@@ -386,10 +386,10 @@ impl Worklog {
         };
 
         self.insert_event(
-            input.task_id.as_deref(),
+            task_id.as_deref(),
             "note",
             &input.title,
-            input.body.as_deref(),
+            body.as_deref(),
             project.as_deref(),
             cwd.as_deref(),
             agent.as_deref(),
@@ -464,6 +464,67 @@ impl Worklog {
             )
             .optional()
             .map_err(Error::from)
+    }
+
+    fn tasks_where(&self, clause: &str, params: impl rusqlite::Params) -> Result<Vec<WorkTask>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, title, project, cwd, agent, status, created_at, updated_at,
+                    session_id, source
+             FROM work_tasks WHERE {clause}"
+        ))?;
+        let tasks = stmt.query_map(params, row_to_task)?;
+        tasks.collect::<rusqlite::Result<_>>().map_err(Error::from)
+    }
+
+    /// Find the task a reference means. Agents pass ids, id prefixes, titles,
+    /// and, when they have lost the id, a sentence of progress. That last case
+    /// resolves only when exactly one task is open in `cwd`; the sentence comes
+    /// back as the second value so the caller can record it.
+    pub fn resolve_task(
+        &self,
+        reference: &str,
+        cwd: Option<&str>,
+    ) -> Result<(WorkTask, Option<String>)> {
+        let reference = reference.trim();
+        if let Some(task) = self.get_task(reference)? {
+            return Ok((task, None));
+        }
+        let looks_like_id = reference.len() >= 6 && reference.chars().all(|c| c.is_ascii_hexdigit());
+        if looks_like_id {
+            let by_prefix = self.tasks_where("id LIKE ?1 || '%' LIMIT 2", params![reference])?;
+            if let [task] = by_prefix.as_slice() {
+                return Ok((task.clone(), None));
+            }
+        }
+        let by_title = self.tasks_where(
+            "lower(title) = lower(?1)
+             ORDER BY status IN ('doing', 'blocked') DESC, updated_at DESC LIMIT 1",
+            params![reference],
+        )?;
+        if let Some(task) = by_title.into_iter().next() {
+            return Ok((task, None));
+        }
+        let open_here = match cwd {
+            Some(cwd) => self.tasks_where(
+                "status IN ('doing', 'blocked')
+                   AND (cwd = ?1 OR substr(?1, 1, length(cwd) + 1) = cwd || '/')
+                 ORDER BY updated_at DESC LIMIT 5",
+                params![cwd],
+            )?,
+            None => Vec::new(),
+        };
+        if let ([task], false) = (open_here.as_slice(), looks_like_id) {
+            return Ok((task.clone(), Some(reference.to_string())));
+        }
+        let candidates = if open_here.is_empty() {
+            self.tasks_where(
+                "status IN ('doing', 'blocked') ORDER BY updated_at DESC LIMIT 5",
+                [],
+            )?
+        } else {
+            open_here
+        };
+        Err(Error::Query(unknown_task_message(reference, &candidates)))
     }
 
     pub fn list_tasks(
@@ -833,6 +894,30 @@ fn current_cwd() -> Option<String> {
     std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string())
+}
+
+/// Put progress text recovered from a task reference ahead of any body.
+fn with_progress(progress: Option<String>, body: Option<String>) -> Option<String> {
+    match (progress, body) {
+        (Some(progress), Some(body)) => Some(format!("{progress}\n\n{body}")),
+        (progress, body) => progress.or(body),
+    }
+}
+
+fn unknown_task_message(reference: &str, open: &[WorkTask]) -> String {
+    if open.is_empty() {
+        return format!(
+            "Unknown task: {reference}. No task is open; start one with `devsql work start <title>`."
+        );
+    }
+    let listed: Vec<String> = open
+        .iter()
+        .map(|t| format!("{} \"{}\"", t.id, t.title))
+        .collect();
+    format!(
+        "Unknown task: {reference}. Pass a task id or exact title. Open tasks: {}.",
+        listed.join("; ")
+    )
 }
 
 /// Prefer explicit project; else basename of cwd.

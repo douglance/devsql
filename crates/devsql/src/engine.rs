@@ -50,8 +50,18 @@ impl UnifiedEngine {
             1,
             rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
             |ctx| {
-                let value: String = ctx.get(0)?;
-                Ok(normalize_date(&value))
+                use rusqlite::types::ValueRef;
+                // NULL stays NULL, as in SQLite's own date functions; numbers
+                // are epoch timestamps, so read them as their digits.
+                let value = match ctx.get_raw(0) {
+                    ValueRef::Null => return Ok(None),
+                    ValueRef::Integer(n) => n.to_string(),
+                    ValueRef::Real(n) => (n as i64).to_string(),
+                    ValueRef::Text(text) | ValueRef::Blob(text) => {
+                        String::from_utf8_lossy(text).into_owned()
+                    }
+                };
+                Ok(Some(normalize_date(&value)))
             },
         )?;
 
@@ -101,10 +111,38 @@ impl UnifiedEngine {
                 "diffs" => self.load_diffs()?,
                 "diff_files" => self.load_diff_files()?,
                 "branches" => self.load_branches()?,
-                _ => {}
+                other => self.load_vcsql_table(other)?,
             }
         }
         Ok(())
+    }
+
+    /// Load a Git table devsql does not define itself, using vcsql's schema
+    /// and loader. Outside a Git repository the table exists but is empty.
+    fn load_vcsql_table(&mut self, table: &str) -> Result<()> {
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            return Ok(());
+        }
+        let Some(info) = vcsql::sql::get_table_info(table) else {
+            return Ok(());
+        };
+        match vcsql::GitRepo::open(&self.git_repo_path) {
+            Ok(mut repo) => vcsql::sql::populate_table(&self.conn, table, &mut repo)
+                .map_err(|e| Error::Vcsql(e.to_string())),
+            Err(_) => {
+                self.conn.execute(info.create_sql, [])?;
+                Ok(())
+            }
+        }
     }
 
     /// Load code analysis tables needed for the query
@@ -141,39 +179,22 @@ impl UnifiedEngine {
             self.load_codex_tables()?;
         }
 
-        self.conn.execute_batch(
-            "CREATE TEMP VIEW IF NOT EXISTS command_events (
-                source, channel, actor, provenance_quality, provenance_reason,
-                source_id, source_order, session_id, parent_session_id, agent_id,
-                agent_role, originator, tool_name, timestamp, duration_ms,
-                exit_code, command, cwd, hostname, source_path
-             ) AS
-             SELECT source, 'shell', 'unknown', 'unattributed',
-                    'unattributed_shell_history', source_id, source_order,
-                    session_id, NULL, NULL, NULL, NULL, NULL, timestamp,
-                    duration_ms, exit_code, command, cwd, hostname, history_path
-             FROM shell_history
-             UNION ALL
-             SELECT 'claude', 'agent_tool', 'agent', 'exact', NULL,
-                    source_id, rowid, session_id, parent_session_id, agent_id,
-                    agent_role, originator, tool_name, timestamp, NULL, NULL,
-                    command, cwd, NULL, source_path
-             FROM tool_calls
-             WHERE tool_name = 'Bash' AND command IS NOT NULL
-             UNION ALL
-             SELECT 'codex', 'agent_tool', 'agent', 'exact', NULL,
-                    execution.call_id, execution.call_record_index,
-                    execution.thread_id, thread.parent_thread_id, thread.agent_path,
-                    thread.agent_role, thread.originator, execution.tool_name,
-                    execution.called_at, NULL, execution.exit_code, execution.cmd,
-                    COALESCE(execution.cwd, thread.cwd), NULL, execution.source_path
-             FROM codex_tool_executions AS execution
-             LEFT JOIN codex_threads AS thread
-               ON thread.thread_id = execution.thread_id
-             WHERE execution.tool_name IN ('exec_command', 'shell')
-               AND execution.cmd IS NOT NULL;",
-        )?;
+        self.conn
+            .execute_batch(&command_events_view_sql("command_events", None))?;
+        Ok(())
+    }
 
+    /// Like [`Self::load_command_events`], but the `recent_command_events`
+    /// view holds only the newest `per_source` commands from each source.
+    /// Codex keeps each command's full output in the same row as its cwd and
+    /// exit code, so a scan of every Codex command reads all of that output;
+    /// a bounded window keeps term search to seconds.
+    pub fn load_recent_command_events(&mut self, per_source: i64) -> Result<()> {
+        self.load_command_events()?;
+        self.conn.execute_batch(&command_events_view_sql(
+            "recent_command_events",
+            Some(per_source),
+        ))?;
         Ok(())
     }
 
@@ -191,6 +212,12 @@ impl UnifiedEngine {
     /// connection used for rendering.
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Explain a failed query in terms of the loaded schema; see
+    /// [`crate::query_help::explain_error`].
+    pub fn explain_error(&self, sql: &str, message: &str) -> Option<String> {
+        crate::query_help::explain_error(&self.conn, sql, message)
     }
 
     /// Execute a SQL query and return results as JSON values
@@ -1008,15 +1035,7 @@ fn create_empty_sessions_table(conn: &Connection) -> Result<()> {
 }
 
 fn claude_tool_cache_path(claude_data_dir: &Path) -> PathBuf {
-    let cache_root = dirs::cache_dir()
-        .unwrap_or_else(|| std::env::temp_dir().join("devsql-cache"))
-        .join("devsql")
-        .join("claude-tool-index");
-    let canonical_dir = claude_data_dir
-        .canonicalize()
-        .unwrap_or_else(|_| claude_data_dir.to_path_buf());
-    let digest = Sha256::digest(canonical_dir.to_string_lossy().as_bytes());
-    cache_root.join(format!("{digest:x}.sqlite"))
+    crate::cache::cache_path("claude-tool-index", claude_data_dir)
 }
 
 fn open_claude_tool_cache(path: &Path) -> Result<Connection> {
@@ -1608,6 +1627,58 @@ fn set_private_cache_sidecar_permissions(path: &Path) -> Result<()> {
 }
 
 /// Normalize dates from various formats to YYYY-MM-DD
+/// The command-events view over shell history, Claude Bash calls, and Codex
+/// commands. With `per_source`, each source contributes only its newest rows.
+fn command_events_view_sql(name: &str, per_source: Option<i64>) -> String {
+    let newest = |order: &str| match per_source {
+        Some(limit) => format!("ORDER BY {order} DESC LIMIT {limit}"),
+        None => String::new(),
+    };
+    format!(
+        "CREATE TEMP VIEW IF NOT EXISTS {name} (
+            source, channel, actor, provenance_quality, provenance_reason,
+            source_id, source_order, session_id, parent_session_id, agent_id,
+            agent_role, originator, tool_name, timestamp, duration_ms,
+            exit_code, command, cwd, hostname, source_path
+         ) AS
+         SELECT * FROM (
+           SELECT source, 'shell', 'unknown', 'unattributed',
+                  'unattributed_shell_history', source_id, source_order,
+                  session_id, NULL, NULL, NULL, NULL, NULL, timestamp,
+                  duration_ms, exit_code, command, cwd, hostname, history_path
+           FROM shell_history
+           {shell_newest}
+         )
+         UNION ALL
+         SELECT * FROM (
+           SELECT 'claude', 'agent_tool', 'agent', 'exact', NULL,
+                  source_id, rowid, session_id, parent_session_id, agent_id,
+                  agent_role, originator, tool_name, timestamp, NULL, NULL,
+                  command, cwd, NULL, source_path
+           FROM tool_calls
+           WHERE tool_name = 'Bash' AND command IS NOT NULL
+           {claude_newest}
+         )
+         UNION ALL
+         SELECT 'codex', 'agent_tool', 'agent', 'exact', NULL,
+                execution.call_id, execution.call_record_index,
+                execution.thread_id, thread.parent_thread_id, thread.agent_path,
+                thread.agent_role, thread.originator, execution.tool_name,
+                execution.called_at, NULL, execution.exit_code, execution.cmd,
+                COALESCE(execution.cwd, thread.cwd), NULL, execution.source_path
+         FROM (
+           SELECT * FROM codex_tool_executions
+           WHERE tool_name IN ('exec_command', 'shell') AND cmd IS NOT NULL
+           {codex_newest}
+         ) AS execution
+         LEFT JOIN codex_threads AS thread
+           ON thread.thread_id = execution.thread_id;",
+        shell_newest = newest("timestamp"),
+        claude_newest = newest("timestamp"),
+        codex_newest = newest("called_at"),
+    )
+}
+
 fn normalize_date(value: &str) -> String {
     // Epoch milliseconds (13 digits)
     if value.chars().all(|c| c.is_ascii_digit()) && value.len() >= 13 {
@@ -1766,6 +1837,19 @@ fn query_mentions_table(query_upper: &str, table_name: &str) -> bool {
         .any(|token| token == table_upper)
 }
 
+/// True when `table_name` follows FROM or JOIN, so a column of the same name
+/// does not count.
+fn query_reads_table(query_upper: &str, table_name: &str) -> bool {
+    let table_upper = table_name.to_uppercase();
+    let tokens: Vec<&str> = query_upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens
+        .windows(2)
+        .any(|pair| matches!(pair[0], "FROM" | "JOIN") && pair[1] == table_upper)
+}
+
 /// Tables a SQL query needs, grouped by the loader responsible for them.
 ///
 /// Named fields rather than a tuple: every new source would otherwise widen the
@@ -1801,16 +1885,15 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         "codex_compactions",
         "codex_ingest_errors",
     ];
-    let git_tables = [
-        "commits",
+    let git_tables = ["commits", "branches", "diffs", "diff_files"];
+    // Loaded through vcsql. Several share a name with common columns
+    // (`status`, `config`, `notes`), so they load only when read as a table.
+    let git_extra_tables = [
         "commit_parents",
-        "branches",
         "tags",
         "refs",
         "stashes",
         "reflog",
-        "diffs",
-        "diff_files",
         "blame",
         "config",
         "remotes",
@@ -1825,7 +1908,6 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         "source_lines",
         "symbols",
         "imports",
-        "ast_nodes",
     ];
     let shell_tables = ["shell_history", "command_events"];
     let work_tables = ["work_tasks", "work_events"];
@@ -1846,6 +1928,11 @@ pub fn detect_tables(query: &str) -> TableRequirements {
     let needed_git: Vec<String> = git_tables
         .iter()
         .filter(|t| query_mentions_table(&query_upper, t))
+        .chain(
+            git_extra_tables
+                .iter()
+                .filter(|t| query_reads_table(&query_upper, t)),
+        )
         .map(|s| s.to_string())
         .collect();
 
@@ -1894,6 +1981,18 @@ pub fn detect_tables(query: &str) -> TableRequirements {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn date_accepts_null_and_numeric_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = UnifiedEngine::new(dir.path().into(), dir.path().into()).unwrap();
+        let rows = engine
+            .query("SELECT DATE(NULL) AS n, DATE(1758499200000) AS ms, DATE('2025-09-22T10:00:00Z') AS iso")
+            .unwrap();
+        assert_eq!(rows[0]["n"], Value::Null);
+        assert_eq!(rows[0]["ms"], "2025-09-22");
+        assert_eq!(rows[0]["iso"], "2025-09-22");
+    }
 
     #[test]
     fn detect_tables_handles_jhistory_without_history_false_positive() {

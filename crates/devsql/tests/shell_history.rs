@@ -395,12 +395,18 @@ fn command_events_compound_provenance_join_uses_codex_execution_primary_key() {
         .collect();
     assert!(
         details.iter().any(|detail| {
-            detail.contains("codex_tool_executions")
-                && detail.contains("sqlite_autoindex_codex_tool_executions_1")
+            detail.contains("sqlite_autoindex_codex_tool_execution_meta_1")
                 && detail.contains("thread_id=?")
                 && detail.contains("call_id=?")
         }),
-        "compound provenance join should use the codex_tool_executions primary key: {details:?}"
+        "compound provenance join should use the Codex command primary key: {details:?}"
+    );
+    // The join reads no output, so the output table must not be touched.
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("codex_tool_execution_outputs")),
+        "a join that reads no output must skip the output table: {details:?}"
     );
 }
 

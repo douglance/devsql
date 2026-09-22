@@ -5,8 +5,6 @@
 
 use crate::Result;
 
-#[cfg(feature = "tree-sitter-ast")]
-pub mod ast_nodes;
 pub mod grok_gateway;
 #[cfg(feature = "tree-sitter-ast")]
 pub mod imports;
@@ -285,8 +283,12 @@ pub fn load_all_code_tables(conn: &Connection, repo_path: &Path, tables: &[&str]
             "symbols" => symbols::load(conn, repo_path)?,
             #[cfg(feature = "tree-sitter-ast")]
             "imports" => imports::load(conn, repo_path)?,
-            #[cfg(feature = "tree-sitter-ast")]
-            "ast_nodes" => ast_nodes::load(conn, repo_path)?,
+            #[cfg(not(feature = "tree-sitter-ast"))]
+            "imports" => {
+                return Err(crate::Error::Query(
+                    "imports needs devsql built with --features tree-sitter-ast".into(),
+                ))
+            }
             _ => {}
         }
     }

@@ -11,6 +11,7 @@ pub mod grok;
 pub mod history;
 pub mod impact;
 pub mod recall;
+pub mod schema;
 pub mod search;
 pub mod semantic_diff;
 pub mod work;
@@ -33,6 +34,18 @@ pub struct ToolError {
 impl ToolError {
     pub fn into_typed<T>(self) -> TypedResult<T> {
         TypedResult::error(self.code, self.message)
+    }
+}
+
+impl From<ToolError> for CommandResult {
+    fn from(error: ToolError) -> Self {
+        CommandResult::Error {
+            code: error.code.to_string(),
+            message: error.message,
+            retryable: false,
+            exit_code: Some(1),
+            cta: None,
+        }
     }
 }
 
@@ -64,6 +77,66 @@ pub fn network_read_mcp() -> McpCommandOptions {
         }),
         ..Default::default()
     }
+}
+
+/// Load every table `sql` names into `engine`. macOS logs load only when
+/// `macos_logs` is given, because scanning them is bounded by caller options.
+pub fn load_query_tables(
+    engine: &mut UnifiedEngine,
+    sql: &str,
+    macos_logs: Option<crate::providers::macos_logs::MacosLogConfig>,
+) -> Result<(), ToolError> {
+    fn names(tables: &[String]) -> Vec<&str> {
+        tables.iter().map(String::as_str).collect()
+    }
+    fn load_error(what: &str) -> impl FnOnce(crate::Error) -> ToolError + '_ {
+        move |e| ToolError {
+            code: "LOAD_ERROR",
+            message: format!("Failed to load {what} tables: {e}"),
+        }
+    }
+
+    let needed = crate::engine::detect_tables(sql);
+    engine
+        .load_claude_tables(&names(&needed.claude))
+        .map_err(load_error("Claude"))?;
+    engine
+        .load_git_tables(&names(&needed.git))
+        .map_err(load_error("Git"))?;
+    engine
+        .load_code_tables(&names(&needed.code))
+        .map_err(load_error("code"))?;
+    if !needed.shell.is_empty() {
+        let loaded = if needed.shell.iter().any(|table| table == "command_events") {
+            engine.load_command_events()
+        } else {
+            engine.load_shell_history()
+        };
+        loaded.map_err(load_error("command-history"))?;
+    }
+    engine
+        .load_work_tables(&names(&needed.work))
+        .map_err(load_error("work"))?;
+    engine
+        .load_grok_tables(&names(&needed.grok))
+        .map_err(load_error("Grok"))?;
+    if let Some(config) = macos_logs.filter(|_| needed.system.iter().any(|t| t == "macos_logs")) {
+        engine
+            .load_macos_logs(config)
+            .map_err(load_error("macOS Unified Log"))?;
+    }
+    Ok(())
+}
+
+/// Join a search command's first term with any further unquoted words, so
+/// `recall mvc audit` means the same as `recall "mvc audit"`.
+pub(crate) fn search_terms(args: &serde_json::Value, first: &str) -> Option<String> {
+    let head = args.get(first).and_then(|v| v.as_str())?;
+    let mut words = vec![head.to_string()];
+    if let Some(more) = args.get("more").and_then(|v| v.as_array()) {
+        words.extend(more.iter().filter_map(|v| v.as_str()).map(String::from));
+    }
+    Some(words.join(" "))
 }
 
 pub fn legacy_context<Args: Serialize, Options: Serialize>(
@@ -98,8 +171,16 @@ where
     Output: DeserializeOwned + JsonSchema + Serialize,
 {
     match result {
-        CommandResult::Ok { data, cta } => match serde_json::from_value(data) {
-            Ok(data) => TypedResult::Ok { data, cta },
+        CommandResult::Ok {
+            data,
+            cta,
+            exit_code,
+        } => match serde_json::from_value(data) {
+            Ok(data) => TypedResult::Ok {
+                data,
+                cta,
+                exit_code,
+            },
             Err(error) => TypedResult::error("SERIALIZATION_ERROR", error.to_string()),
         },
         CommandResult::Error {
@@ -124,19 +205,13 @@ where
 
 pub fn engine_from_options(
     options: &serde_json::Value,
-) -> Result<(UnifiedEngine, PathBuf), CommandResult> {
+) -> Result<(UnifiedEngine, PathBuf), ToolError> {
     let repo = options
         .get("repo")
         .and_then(|value| value.as_str())
         .unwrap_or(".");
     let data_dir = options.get("data_dir").and_then(|value| value.as_str());
-    engine_from_paths(repo, data_dir).map_err(|error| CommandResult::Error {
-        code: error.code.to_string(),
-        message: error.message,
-        retryable: false,
-        exit_code: Some(1),
-        cta: None,
-    })
+    engine_from_paths(repo, data_dir)
 }
 
 /// Create an engine from common options (repo, data_dir).

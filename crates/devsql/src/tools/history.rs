@@ -68,7 +68,7 @@ impl CommandHandler for HistoryHandler {
 
         let (mut engine, _repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return e.into(),
         };
 
         // Load commits and diff_files tables
@@ -94,6 +94,7 @@ impl CommandHandler for HistoryHandler {
 
         match engine.query(&sql) {
             Ok(commits) => CommandResult::Ok {
+                exit_code: None,
                 data: json!({
                     "file_pattern": file,
                     "total": commits.len(),

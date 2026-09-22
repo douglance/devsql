@@ -281,6 +281,7 @@ redaction.
 | `branches` | name, is_head, commit_id |
 | `diffs` | Commit-level stats: commit_id, files_changed, insertions, deletions |
 | `diff_files` | Per-file stats: commit_id, path, status (A/D/M/R/C), insertions, deletions |
+| `commit_parents`, `tags`, `refs`, `stashes`, `reflog`, `blame`, `config`, `remotes`, `submodules`, `status`, `worktrees`, `hooks`, `notes` | Loaded when a query reads from them (`blame` covers every tracked file, so it is slow on large repos) |
 
 ### Source Code
 
@@ -290,9 +291,10 @@ redaction.
 | `source_lines` | Line content: file_path, line_number, content, is_blank |
 | `symbols` | Definitions: file_path, name, kind, line_start, line_end, signature, visibility, parameters, return_type, language |
 | `imports`\* | Import statements: file_path, line_number, module, name, alias, kind, is_default, is_wildcard |
-| `ast_nodes`\* | Raw AST nodes |
 
-\* Requires the `tree-sitter-ast` feature for full extraction. Without it, `symbols` falls back to regex-based extraction (Rust, TypeScript, JavaScript, Python, Go) and `imports`/`ast_nodes` are empty.
+\* Requires the `tree-sitter-ast` feature; without it a query on `imports` fails and says so, and `symbols` falls back to regex-based extraction (Rust, TypeScript, JavaScript, Python, Go).
+
+Run `devsql schema` to list every table, or `devsql schema <table>` for its exact columns.
 
 ## Examples
 
@@ -398,7 +400,8 @@ devsql history src/engine.rs
 ### Codex journal indexing and privacy
 
 - DevSQL reads canonical Codex journals from `$CODEX_HOME`, falling back to `~/.codex`. It reads active and archived `.jsonl` and `.jsonl.zst` journals; it does not query Codex's catalog, history, goals, memories, logs, credentials, attachments, generated images, or shell snapshots.
-- The versioned Codex index lives under the platform cache directory at `devsql/codex-index/<CODEX_HOME-hash>.sqlite`. Its first build parses the complete journal corpus and the derived cache can be as large as, or larger than, the source files. Later loads use file metadata to skip unchanged journals and read only appended records from growing plain journals.
+- The versioned Codex index lives under the platform cache directory at `devsql/codex-index/<CODEX_HOME-hash>.sqlite` (set `DEVSQL_CACHE_DIR` to move all DevSQL caches; sources inside the system temporary directory cache there). Its first build parses the complete journal corpus. Later loads use file metadata to skip unchanged journals and read only appended records from growing plain journals.
+- Base64 images embedded in tool output, such as screenshots returned to the model, are stored as `data:image/...;base64,<N bytes omitted>`. They are unsearchable and were most of the cache's size.
 - A journal's own `payload.id` is its thread ID. For subagent journals, `payload.session_id` and `source.subagent.thread_spawn.parent_thread_id` identify the parent and are stored as lineage instead of collapsing the child into the parent.
 - The index is rebuildable and removes derived rows after source journals disappear. Schema changes automatically replace the disposable cache.
 - DevSQL creates the cache directory with mode `0700` and cache files with mode `0600` on Unix. The cache still contains conversation text, tool arguments, commands, and tool output, so protect it like the source journals.

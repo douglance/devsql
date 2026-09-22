@@ -180,6 +180,81 @@ fn recall_returns_ranked_redacted_codex_threads() {
 }
 
 #[test]
+fn recall_joins_unquoted_words_into_one_query() {
+    let data = create_claude_data_dir();
+    let codex_home = TempDir::new().expect("codex");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex_home.path())
+        .args([
+            "recall",
+            "vision",
+            "simulator",
+            "--data-dir",
+            data.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(parsed["terms"], serde_json::json!(["vision", "simulator"]));
+    assert_eq!(parsed["prompts"][0]["score"], serde_json::json!(2));
+}
+
+#[test]
+fn recall_without_terms_reports_the_missing_argument() {
+    Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .args(["recall", "--format", "json"])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("Missing required argument: query"));
+}
+
+#[test]
+fn schema_questions_from_other_sql_shells_list_tables() {
+    for query in ["SHOW TABLES", ".tables", "tables", "schema"] {
+        Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .args([query, "--format", "json"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"table\": \"work_tasks\""));
+    }
+}
+
+#[test]
+fn short_format_flag_is_accepted() {
+    Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .args(["-f", "json", "SELECT 1 AS value"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"value\": 1"));
+}
+
+#[test]
+fn guessed_column_names_the_real_one() {
+    Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .args(["SELECT hash FROM commits LIMIT 1", "--format", "json"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Did you mean commits.id or commits.short_id?"));
+}
+
+#[test]
+fn date_of_null_is_null() {
+    Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .args(["SELECT DATE(NULL) AS d", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"d\": null"));
+}
+
+#[test]
 fn root_and_named_query_are_compatible() {
     for args in [
         vec!["SELECT 1 AS value", "--format", "json"],

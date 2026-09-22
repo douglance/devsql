@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use devsql::engine::detect_tables;
+use devsql::query_help::schema_request;
 use incurs::cli::Cli;
 use incurs::command::{CommandDef, Example, TypedContext, TypedResult};
 use incurs::output::{CtaBlock, CtaEntry};
@@ -90,10 +90,6 @@ struct QueryOptions {
     /// Claude data directory (defaults to ~/.claude)
     #[incurs(alias = "d")]
     data_dir: Option<String>,
-    /// Omit header row in table/csv output
-    #[incurs(alias = "H")]
-    #[serde(default)]
-    no_header: bool,
     /// Relative macOS Unified Log window (defaults to 15m)
     log_last: Option<String>,
     /// Absolute macOS Unified Log start time (requires --log-end)
@@ -132,6 +128,13 @@ async fn run_query(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResul
 
 fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedResult<QueryOutput> {
     let query = ctx.args.query;
+    if let Some(request) = schema_request(&query) {
+        return devsql::tools::schema::answer(
+            request,
+            &ctx.options.repo,
+            ctx.options.data_dir.as_deref(),
+        );
+    }
     let (mut engine, _) = match devsql::tools::engine_from_paths(
         &ctx.options.repo,
         ctx.options.data_dir.as_deref(),
@@ -140,59 +143,18 @@ fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedRe
         Err(error) => return error.into_typed(),
     };
 
-    let needed = detect_tables(&query);
-    let (shell_tables, system_tables) = (needed.shell, needed.system);
-    let claude_refs: Vec<&str> = needed.claude.iter().map(|s| s.as_str()).collect();
-    let git_refs: Vec<&str> = needed.git.iter().map(|s| s.as_str()).collect();
-    let code_refs: Vec<&str> = needed.code.iter().map(|s| s.as_str()).collect();
-    let work_refs: Vec<&str> = needed.work.iter().map(|s| s.as_str()).collect();
-    let grok_refs: Vec<&str> = needed.grok.iter().map(|s| s.as_str()).collect();
-
-    if let Err(e) = engine.load_claude_tables(&claude_refs) {
-        return TypedResult::error("LOAD_ERROR", format!("Failed to load Claude tables: {e}"));
-    }
-    if let Err(e) = engine.load_git_tables(&git_refs) {
-        return TypedResult::error("LOAD_ERROR", format!("Failed to load Git tables: {e}"));
-    }
-    if let Err(e) = engine.load_code_tables(&code_refs) {
-        return TypedResult::error("LOAD_ERROR", format!("Failed to load code tables: {e}"));
-    }
-    if !shell_tables.is_empty() {
-        let load_result = if shell_tables.iter().any(|table| table == "command_events") {
-            engine.load_command_events()
-        } else {
-            engine.load_shell_history()
-        };
-        if let Err(e) = load_result {
-            return TypedResult::error(
-                "LOAD_ERROR",
-                format!("Failed to load command-history tables: {e}"),
-            );
-        }
-    }
-    if let Err(e) = engine.load_work_tables(&work_refs) {
-        return TypedResult::error("LOAD_ERROR", format!("Failed to load work tables: {e}"));
-    }
-    if let Err(e) = engine.load_grok_tables(&grok_refs) {
-        return TypedResult::error("LOAD_ERROR", format!("Failed to load Grok tables: {e}"));
-    }
-    if system_tables.iter().any(|table| table == "macos_logs") {
-        let config = devsql::providers::macos_logs::MacosLogConfig {
-            last: ctx.options.log_last,
-            start: ctx.options.log_start,
-            end: ctx.options.log_end,
-            predicate: ctx.options.log_predicate,
-            archive: ctx.options.log_archive,
-            level: ctx.options.log_level,
-            max_rows: ctx.options.log_max_rows,
-            timeout: std::time::Duration::from_secs(ctx.options.log_timeout),
-        };
-        if let Err(error) = engine.load_macos_logs(config) {
-            return TypedResult::error(
-                "LOAD_ERROR",
-                format!("Failed to load macOS Unified Logs: {error}"),
-            );
-        }
+    let macos_logs = devsql::providers::macos_logs::MacosLogConfig {
+        last: ctx.options.log_last,
+        start: ctx.options.log_start,
+        end: ctx.options.log_end,
+        predicate: ctx.options.log_predicate,
+        archive: ctx.options.log_archive,
+        level: ctx.options.log_level,
+        max_rows: ctx.options.log_max_rows,
+        timeout: std::time::Duration::from_secs(ctx.options.log_timeout),
+    };
+    if let Err(error) = devsql::tools::load_query_tables(&mut engine, &query, Some(macos_logs)) {
+        return error.into_typed();
     }
 
     match engine.query(&query) {
@@ -200,6 +162,7 @@ fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedRe
             if let Some((rows, reason)) = engine.macos_log_truncation() {
                 TypedResult::Ok {
                     data: results,
+                    exit_code: None,
                     cta: Some(CtaBlock {
                         commands: vec![CtaEntry::Detailed {
                             command: "query <SQL> --log-last 5m".to_string(),
@@ -216,7 +179,25 @@ fn run_query_blocking(ctx: TypedContext<QueryArgs, QueryOptions, ()>) -> TypedRe
                 TypedResult::ok(results)
             }
         }
-        Err(e) => TypedResult::error("QUERY_ERROR", format!("Query failed: {e}")),
+        Err(e) => {
+            let message = e.to_string();
+            match engine.explain_error(&query, &message) {
+                Some(help) => TypedResult::Error {
+                    code: "QUERY_ERROR".into(),
+                    message: format!("Query failed: {help}"),
+                    retryable: false,
+                    exit_code: Some(1),
+                    cta: Some(CtaBlock {
+                        commands: vec![CtaEntry::Detailed {
+                            command: "schema <table>".to_string(),
+                            description: Some("Show a table's columns".to_string()),
+                        }],
+                        description: None,
+                    }),
+                },
+                None => TypedResult::error("QUERY_ERROR", format!("Query failed: {message}")),
+            }
+        }
     }
 }
 
@@ -263,7 +244,7 @@ fn query_examples() -> Vec<Example> {
 }
 
 fn query_hint() -> &'static str {
-    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Grok Bots:    grok_bots, grok_entries, grok_messages, grok_ingest_errors (global; see `devsql grok`)\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  macOS:        macos_logs (bounded live or .logarchive stream with provenance)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nGROK BOTS (explicit search target, never in recall/gather):\n  devsql grok status | search <terms> | sync\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
+    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Grok Bots:    grok_bots, grok_entries, grok_messages, grok_ingest_errors (global; see `devsql grok`)\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  macOS:        macos_logs (bounded live or .logarchive stream with provenance)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\n  devsql schema [table]        # every table, or one table's real columns\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nGROK BOTS (explicit search target, never in recall/gather):\n  devsql grok status | search <terms> | sync\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +269,7 @@ fn build_cli() -> Cli {
             "query",
             query_command("query", "Execute a SQL query against developer-local data"),
         )
+        .command("schema", devsql::tools::schema::build())
         .command("diff", devsql::tools::diff::build())
         .command("search", devsql::tools::search::build())
         .command("context", devsql::tools::context::build())
@@ -328,6 +310,27 @@ async fn serve_code_mode(cli: &Cli) -> Result<(), String> {
     incurs_codemode_mcp::serve_stdio(Arc::new(DurableCodeModeService(service))).await
 }
 
+/// Accept `-f <format>` for `--format <format>`. Agents carry the short form
+/// over from other SQL CLIs; incurs defines only the long one. Tokens after
+/// `--` pass through untouched.
+fn normalized_argv(args: impl Iterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut passthrough = false;
+    for arg in args {
+        if passthrough {
+            out.push(arg);
+            continue;
+        }
+        passthrough = arg == "--";
+        match arg.strip_prefix("-f") {
+            Some("") => out.push("--format".to_string()),
+            Some(rest) if rest.starts_with('=') => out.push(format!("--format{rest}")),
+            _ => out.push(arg),
+        }
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() {
     let cli = build_cli();
@@ -336,7 +339,8 @@ async fn main() {
             .await
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
     } else {
-        cli.serve().await
+        cli.serve_with(normalized_argv(std::env::args().skip(1)))
+            .await
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");

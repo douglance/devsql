@@ -16,6 +16,8 @@ use super::{engine_from_options, legacy_context, read_only_mcp, typed_from_resul
 struct RecallArgs {
     /// Space-separated terms to recall prior work for
     query: String,
+    /// Further terms; unquoted words are joined onto the query
+    more: Option<Vec<String>>,
 }
 
 #[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
@@ -49,6 +51,12 @@ struct RecallOutput {
 
 struct RecallHandler;
 
+/// Commands and Codex messages are searched in their newest window only;
+/// scanning every Codex command reads its full stored output and took minutes.
+/// Sessions, prompts, and commits are still searched in full.
+const RECENT_COMMANDS_PER_SOURCE: i64 = 5_000;
+const RECENT_CODEX_MESSAGES: i64 = 50_000;
+
 /// Build `((E LIKE '%t1%') + (E LIKE '%t2%') + ...)` -- SQLite booleans sum to
 /// a match count, so this scores a row by how many terms it hits.
 pub(crate) fn score_expr(expr: &str, terms: &[String]) -> String {
@@ -71,8 +79,8 @@ pub(crate) fn match_expr(expr: &str, terms: &[String]) -> String {
 #[async_trait::async_trait]
 impl CommandHandler for RecallHandler {
     async fn run(&self, ctx: CommandContext) -> CommandResult {
-        let query = match ctx.args.get("query").and_then(|v| v.as_str()) {
-            Some(q) => q.to_string(),
+        let query = match super::search_terms(&ctx.args, "query") {
+            Some(q) => q,
             None => {
                 return CommandResult::Error {
                     code: "MISSING_ARG".into(),
@@ -100,6 +108,7 @@ impl CommandHandler for RecallHandler {
         // No usable terms -> empty result, not an error.
         if terms.is_empty() {
             return CommandResult::Ok {
+                exit_code: None,
                 data: json!({
                     "terms": terms,
                     "sessions": Value::Array(vec![]),
@@ -115,7 +124,7 @@ impl CommandHandler for RecallHandler {
 
         let (mut engine, _repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return e.into(),
         };
 
         if let Err(e) =
@@ -138,7 +147,7 @@ impl CommandHandler for RecallHandler {
                 cta: None,
             };
         }
-        if let Err(e) = engine.load_command_events() {
+        if let Err(e) = engine.load_recent_command_events(RECENT_COMMANDS_PER_SOURCE) {
             return CommandResult::Error {
                 code: "LOAD_ERROR".into(),
                 message: format!("Failed to load command events: {e}"),
@@ -166,7 +175,14 @@ impl CommandHandler for RecallHandler {
 
         let codex_score = score_expr("message.text", &terms);
         let codex_sql = format!(
-            "WITH ranked AS (
+            "WITH recent_messages AS MATERIALIZED (
+               SELECT thread_id, timestamp, role, text
+               FROM codex_messages
+               WHERE is_canonical = 1
+               ORDER BY timestamp DESC
+               LIMIT {recent_limit}
+             ),
+             ranked AS (
                SELECT message.thread_id,
                       substr(COALESCE(message.timestamp, thread.last_event_at), 1, 10) AS date,
                       thread.cwd,
@@ -178,10 +194,10 @@ impl CommandHandler for RecallHandler {
                         PARTITION BY message.thread_id
                         ORDER BY {score} DESC, message.timestamp DESC
                       ) AS rank
-               FROM codex_messages AS message
+               FROM recent_messages AS message
                JOIN codex_threads AS thread
                  ON thread.thread_id = message.thread_id
-               WHERE message.is_canonical = 1 AND {matches}
+               WHERE {matches}
              )
              SELECT thread_id, date, cwd, role, excerpt, state, score
              FROM ranked
@@ -190,6 +206,7 @@ impl CommandHandler for RecallHandler {
              LIMIT {limit}",
             score = codex_score,
             matches = match_expr("message.text", &terms),
+            recent_limit = RECENT_CODEX_MESSAGES,
         );
         let mut codex_threads = match engine.query(&codex_sql) {
             Ok(rows) => rows,
@@ -243,7 +260,7 @@ impl CommandHandler for RecallHandler {
                     source_id, session_id, parent_session_id, agent_id, agent_role, \
                     originator, tool_name, command, substr(timestamp, 1, 10) AS date, \
                     cwd, exit_code, {score} AS score \
-             FROM command_events \
+             FROM recent_command_events \
              WHERE {matches} \
              ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
              LIMIT {limit}",
@@ -259,6 +276,7 @@ impl CommandHandler for RecallHandler {
             sessions.len() + codex_threads.len() + commits.len() + prompts.len() + commands.len();
 
         CommandResult::Ok {
+            exit_code: None,
             data: json!({
                 "terms": terms,
                 "sessions": Value::Array(sessions),

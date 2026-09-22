@@ -77,7 +77,7 @@ impl CommandHandler for SearchHandler {
 
         let (mut engine, _repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return e.into(),
         };
 
         // Load the symbols table
@@ -110,6 +110,7 @@ impl CommandHandler for SearchHandler {
 
         match engine.query(&sql) {
             Ok(matches) => CommandResult::Ok {
+                exit_code: None,
                 data: json!({
                     "query": query,
                     "kind_filter": kind,

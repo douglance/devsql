@@ -25,6 +25,8 @@ use crate::UnifiedEngine;
 struct GatherArgs {
     /// Space-separated terms to gather context for
     terms: String,
+    /// Further terms; unquoted words are joined onto the terms
+    more: Option<Vec<String>>,
 }
 
 #[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
@@ -36,8 +38,8 @@ struct GatherOptions {
     /// Claude data directory (defaults to ~/.claude)
     #[incurs(alias = "d")]
     data_dir: Option<String>,
-    /// Token budget for the bundle; lowest-ranked rows are dropped round-robin
-    /// per section (never mid-row) until the bundle fits
+    /// Token budget for the bundle; the lowest-ranked row of the largest
+    /// section is dropped (never mid-row) until the bundle fits
     #[incurs(default = 8000)]
     budget: i64,
 }
@@ -50,7 +52,7 @@ const RECENT_COMMAND_SEARCH_LIMIT: i64 = 2_000;
 const RECENT_AGENT_COMMANDS_PER_SOURCE: i64 = RECENT_COMMAND_SEARCH_LIMIT / 2;
 const RECENT_CODEX_COMMAND_SCAN_LIMIT: i64 = 5_000;
 
-/// Section names, in materialization/round-robin-trim order.
+/// Section names, in materialization order; ties in trimming go to the earlier.
 const SECTION_ORDER: [&str; 6] = [
     "prior_work",
     "repo_state",
@@ -111,8 +113,8 @@ struct GatherHandler;
 #[async_trait::async_trait]
 impl CommandHandler for GatherHandler {
     async fn run(&self, ctx: CommandContext) -> CommandResult {
-        let terms_arg = match ctx.args.get("terms").and_then(|v| v.as_str()) {
-            Some(t) => t.to_string(),
+        let terms_arg = match super::search_terms(&ctx.args, "terms") {
+            Some(t) => t,
             None => {
                 return CommandResult::Error {
                     code: "MISSING_ARG".into(),
@@ -139,7 +141,7 @@ impl CommandHandler for GatherHandler {
 
         let (render_engine, repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return e.into(),
         };
         let claude_dir = resolve_claude_dir(&ctx.options);
 
@@ -201,7 +203,11 @@ impl CommandHandler for GatherHandler {
 
         let data = build_data_json(&terms, budget, &sections);
 
-        CommandResult::Ok { data, cta: None }
+        CommandResult::Ok {
+            data,
+            cta: None,
+            exit_code: None,
+        }
     }
 }
 
@@ -251,38 +257,42 @@ fn count_rendered_tokens(value: &Value) -> usize {
     count_tokens(&rendered)
 }
 
-/// Drop lowest-ranked rows (the tail of each section's ranked list) one at a
-/// time, round-robin across sections, until the bundle fits the budget or
-/// there is nothing left to drop. Never truncates a row's content.
+/// Drop lowest-ranked rows (the tail of a section's ranked list) one at a
+/// time from whichever section has the most rows, until the bundle fits the
+/// budget or there is nothing left to drop. Never truncates a row's content.
+///
+/// Trimming the largest section first keeps every section represented; a
+/// round-robin emptied short sections such as `prior_work` while long ones
+/// such as `repo_state` still held dozens of rows.
 fn enforce_budget(
     sections: &mut HashMap<&'static str, SectionResult>,
     terms: &[String],
     budget: usize,
 ) {
-    let mut cursor = 0usize;
     loop {
         let data = build_data_json(terms, budget, sections);
         if count_rendered_tokens(&data).saturating_add(CLI_CTA_TOKEN_RESERVE) <= budget {
             return;
         }
-
-        let mut trimmed_any = false;
-        for _ in 0..SECTION_ORDER.len() {
-            let name = SECTION_ORDER[cursor % SECTION_ORDER.len()];
-            cursor += 1;
-            if let Some(section) = sections.get_mut(name) {
-                if section.rows.pop().is_some() {
-                    trimmed_any = true;
-                    break;
-                }
-            }
-        }
-
-        if !trimmed_any {
+        let Some(largest) = largest_section(sections) else {
             // Nothing left to drop; the skeleton itself exceeds the budget.
             return;
+        };
+        if let Some(section) = sections.get_mut(largest) {
+            section.rows.pop();
         }
     }
+}
+
+/// The non-empty section with the most rows; ties go to the earlier section.
+fn largest_section(sections: &HashMap<&'static str, SectionResult>) -> Option<&'static str> {
+    SECTION_ORDER
+        .iter()
+        .filter_map(|name| Some((*name, sections.get(name)?.rows.len())))
+        .filter(|(_, rows)| *rows > 0)
+        .rev()
+        .max_by_key(|(_, rows)| *rows)
+        .map(|(name, _)| name)
 }
 
 /// Materialize a section's rows as `gather_<name>` in the given connection.
@@ -992,6 +1002,10 @@ pub fn build() -> CommandDef {
     )
     .args::<GatherArgs>()
     .options::<GatherOptions>()
+    // The budget counts tokens of the data. A table pads every border to the
+    // widest cell, which multiplied the bundle several times over; Markdown
+    // renders it near the budget.
+    .format(incurs::output::Format::Markdown)
     .examples(vec![
         Example {
             command: "recall ranking --json".to_string(),
@@ -1007,8 +1021,8 @@ pub fn build() -> CommandDef {
              activity) is computed on its own connection concurrently, then materialized as a \
              `gather_<section>` table in the connection used to render this response -- a \
              section that errors yields an empty section with a `note` instead of failing the \
-             whole bundle. Once the bundle exceeds --budget tokens, the lowest-ranked row is \
-             dropped round-robin across sections (never mid-row) until it fits.",
+             whole bundle. Once the bundle exceeds --budget tokens, the lowest-ranked row of \
+             the largest section is dropped (never mid-row) until it fits.",
     )
     .mcp(read_only_mcp())
     .done()
@@ -1016,8 +1030,29 @@ pub fn build() -> CommandDef {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_prior_work_rows;
+    use super::{largest_section, merge_prior_work_rows, SectionResult};
     use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn trimming_takes_from_the_largest_section_first() {
+        let rows = |n: usize| SectionResult::ok((0..n).map(|i| json!({ "i": i })).collect());
+        let mut sections = HashMap::new();
+        sections.insert("prior_work", rows(3));
+        sections.insert("repo_state", rows(40));
+        sections.insert("activity", rows(40));
+        sections.insert("symbols", rows(0));
+        // A tie goes to the section listed first.
+        assert_eq!(largest_section(&sections), Some("repo_state"));
+        sections.get_mut("repo_state").unwrap().rows.truncate(2);
+        assert_eq!(largest_section(&sections), Some("activity"));
+        sections.get_mut("activity").unwrap().rows.clear();
+        assert_eq!(largest_section(&sections), Some("prior_work"));
+        for section in sections.values_mut() {
+            section.rows.clear();
+        }
+        assert_eq!(largest_section(&sections), None);
+    }
 
     #[test]
     fn prior_work_parallel_merge_preserves_original_tie_order() {

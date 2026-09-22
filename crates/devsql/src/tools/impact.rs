@@ -62,7 +62,7 @@ impl CommandHandler for ImpactHandler {
 
         let (mut engine, _repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return e.into(),
         };
 
         // Load symbols and imports tables
@@ -140,6 +140,7 @@ impl CommandHandler for ImpactHandler {
         }
 
         CommandResult::Ok {
+            exit_code: None,
             data: json!({
                 "file_pattern": file,
                 "exported_symbols": Value::Array(exported_symbols),

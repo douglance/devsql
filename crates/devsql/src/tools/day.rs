@@ -7,15 +7,12 @@ use serde_json::Value;
 use crate::worklog::{
     format_day_markdown, parse_day, DayStats, DayView, Worklog,
 };
-use super::{read_only_mcp, typed_from_result};
+use super::{read_only_mcp, typed_from_result, ToolError};
 
-fn open_worklog() -> Result<Worklog, CommandResult> {
-    Worklog::open().map_err(|e| CommandResult::Error {
-        code: "WORKLOG_ERROR".into(),
+fn open_worklog() -> Result<Worklog, ToolError> {
+    Worklog::open().map_err(|e| ToolError {
+        code: "WORKLOG_ERROR",
         message: format!("Failed to open worklog: {e}"),
-        retryable: false,
-        exit_code: Some(1),
-        cta: None,
     })
 }
 fn tool_err(message: String) -> CommandResult {
@@ -79,7 +76,7 @@ async fn run_today(
 ) -> incurs::command::TypedResult<DayOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
     };
     let date = match parse_day(Some("today")) {
         Ok(d) => d,
@@ -142,7 +139,7 @@ async fn run_day(
 ) -> incurs::command::TypedResult<DayOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
     };
     let date = match parse_day(ctx.args.date.as_deref()) {
         Ok(d) => d,
@@ -207,7 +204,7 @@ async fn run_days(
 ) -> incurs::command::TypedResult<DaysOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
     };
     match wl.list_days(ctx.options.limit, ctx.options.project.as_deref()) {
         Ok(days) => {

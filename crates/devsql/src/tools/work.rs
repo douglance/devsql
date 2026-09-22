@@ -7,21 +7,26 @@ use incurs::output::CommandResult;
 use crate::worklog::{
     DoneInput, NoteInput, StartInput, UpdateInput, WorkEvent, WorkTask, Worklog,
 };
-use super::typed_from_result;
+use super::{typed_from_result, ToolError};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn open_worklog() -> Result<Worklog, CommandResult> {
-    Worklog::open().map_err(|e| CommandResult::Error {
-        code: "WORKLOG_ERROR".into(),
+fn open_worklog() -> Result<Worklog, ToolError> {
+    Worklog::open().map_err(|e| ToolError {
+        code: "WORKLOG_ERROR",
         message: format!("Failed to open worklog: {e}"),
-        retryable: false,
-        exit_code: Some(1),
-        cta: None,
     })
 }
+/// `--note` is what agents reach for; it means the same as `--body`.
+fn body_or_note(body: Option<String>, note: Option<String>) -> Option<String> {
+    match (body, note) {
+        (Some(body), Some(note)) => Some(format!("{body}\n\n{note}")),
+        (body, note) => body.or(note),
+    }
+}
+
 fn tool_err(code: &str, message: String) -> CommandResult {
     CommandResult::Error {
         code: code.into(),
@@ -65,15 +70,19 @@ fn read_mcp() -> McpCommandOptions {
 #[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct StartArgs {
-    /// Short human title for the work
-    title: String,
+    /// Short human title for the work (or pass --title)
+    title: Option<String>,
 }
 
 #[derive(incurs::Options, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct StartOptions {
+    /// Title, when not given as the argument
+    title: Option<String>,
     /// Longer narrative body
     body: Option<String>,
+    /// Same as --body
+    note: Option<String>,
     /// Project name (defaults to basename of cwd)
     project: Option<String>,
     /// Working directory
@@ -93,11 +102,17 @@ struct StartOutput {
 async fn run_start(ctx: TypedContext<StartArgs, StartOptions, ()>) -> incurs::command::TypedResult<StartOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
+    };
+    let Some(title) = ctx.args.title.or(ctx.options.title) else {
+        return typed_from_result(tool_err(
+            "MISSING_ARG",
+            "Missing title: pass it as the argument or with --title".into(),
+        ));
     };
     match wl.start(StartInput {
-        title: ctx.args.title,
-        body: ctx.options.body,
+        title,
+        body: body_or_note(ctx.options.body, ctx.options.note),
         project: ctx.options.project,
         cwd: ctx.options.cwd,
         agent: ctx.options.agent,
@@ -127,7 +142,7 @@ fn start_cmd() -> CommandDef {
 #[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct UpdateArgs {
-    /// Task id from work start
+    /// Task id or exact title; with one open task here, a progress sentence
     task: String,
 }
 
@@ -138,6 +153,8 @@ struct UpdateOptions {
     title: Option<String>,
     /// Progress narrative
     body: Option<String>,
+    /// Same as --body
+    note: Option<String>,
     /// Status: doing | blocked | dropped
     status: Option<String>,
 }
@@ -153,12 +170,12 @@ async fn run_update(
 ) -> incurs::command::TypedResult<UpdateOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
     };
     match wl.update(UpdateInput {
         task_id: ctx.args.task,
         title: ctx.options.title,
-        body: ctx.options.body,
+        body: body_or_note(ctx.options.body, ctx.options.note),
         status: ctx.options.status,
     }) {
         Ok((task, event)) => incurs::command::TypedResult::ok(UpdateOutput { task, event }),
@@ -172,6 +189,9 @@ fn update_cmd() -> CommandDef {
         .examples(vec![Example {
             command: r#"abc123 --body "Found the bad middleware" --status doing"#.into(),
             description: Some("Update a task with a progress note".into()),
+        }, Example {
+            command: r#""Found the bad middleware""#.into(),
+            description: Some("Record progress on the only task open in this directory".into()),
         }])
         .mcp(write_mcp())
         .done()
@@ -184,7 +204,7 @@ fn update_cmd() -> CommandDef {
 #[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct DoneArgs {
-    /// Task id from work start
+    /// Task id or exact title; with one open task here, an outcome sentence
     task: String,
 }
 
@@ -195,6 +215,8 @@ struct DoneOptions {
     title: Option<String>,
     /// Outcome narrative
     body: Option<String>,
+    /// Same as --body
+    note: Option<String>,
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
@@ -206,12 +228,12 @@ struct DoneOutput {
 async fn run_done(ctx: TypedContext<DoneArgs, DoneOptions, ()>) -> incurs::command::TypedResult<DoneOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
     };
     match wl.done(DoneInput {
         task_id: ctx.args.task,
         title: ctx.options.title,
-        body: ctx.options.body,
+        body: body_or_note(ctx.options.body, ctx.options.note),
     }) {
         Ok((task, event)) => incurs::command::TypedResult::ok(DoneOutput { task, event }),
         Err(e) => typed_from_result(tool_err("WORKLOG_ERROR", e.to_string())),
@@ -245,7 +267,9 @@ struct NoteArgs {
 struct NoteOptions {
     /// Note body
     body: Option<String>,
-    /// Optional task to attach the note to
+    /// Same as --body
+    note: Option<String>,
+    /// Optional task (id or exact title) to attach the note to
     task: Option<String>,
     /// Project name
     project: Option<String>,
@@ -265,11 +289,11 @@ struct NoteOutput {
 async fn run_note(ctx: TypedContext<NoteArgs, NoteOptions, ()>) -> incurs::command::TypedResult<NoteOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
     };
     match wl.note(NoteInput {
         title: ctx.args.title,
-        body: ctx.options.body,
+        body: body_or_note(ctx.options.body, ctx.options.note),
         task_id: ctx.options.task,
         project: ctx.options.project,
         cwd: ctx.options.cwd,
@@ -321,7 +345,7 @@ struct ListOutput {
 async fn run_list(ctx: TypedContext<ListArgs, ListOptions, ()>) -> incurs::command::TypedResult<ListOutput> {
     let wl = match open_worklog() {
         Ok(w) => w,
-        Err(e) => return typed_from_result(e),
+        Err(e) => return e.into_typed(),
     };
     match wl.list_tasks(
         ctx.options.status.as_deref(),

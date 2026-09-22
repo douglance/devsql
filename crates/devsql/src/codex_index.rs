@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const LARGE_INDEX_REFRESH_THRESHOLD: i64 = 1_000;
 const LARGE_INDEX_REFRESH_INTERVAL_MS: i64 = 30_000;
 const FULL_RECONCILIATION_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -36,15 +36,7 @@ pub(crate) struct CodexIndex {
 
 impl CodexIndex {
     pub(crate) fn open(codex_home: &Path) -> Result<Self> {
-        let cache_root = dirs::cache_dir()
-            .unwrap_or_else(|| std::env::temp_dir().join("devsql-cache"))
-            .join("devsql")
-            .join("codex-index");
-        let canonical_home = codex_home
-            .canonicalize()
-            .unwrap_or_else(|_| codex_home.to_path_buf());
-        let digest = Sha256::digest(canonical_home.to_string_lossy().as_bytes());
-        let cache_path = cache_root.join(format!("{digest:x}.sqlite"));
+        let cache_path = crate::cache::cache_path("codex-index", codex_home);
         Self::open_at(codex_home, &cache_path)
     }
 
@@ -989,7 +981,7 @@ fn normalize_tool_call(
         .unwrap_or_else(|| format!("record:{record_index}"));
     let was_counted = tx
         .query_row(
-            "SELECT 1 FROM codex_tool_executions
+            "SELECT 1 FROM codex_tool_execution_meta
              WHERE thread_id = ?1 AND call_id = ?2
                AND call_record_index IS NOT NULL",
             params![thread_id, call_id],
@@ -1019,7 +1011,7 @@ fn normalize_tool_call(
         .or_else(|| parsed_arguments.get("cwd"))
         .and_then(Value::as_str);
     tx.execute(
-        "INSERT INTO codex_tool_executions
+        "INSERT INTO codex_tool_execution_meta
          (thread_id, call_id, call_record_index, tool_name, arguments_json, cmd,
           called_at, cwd, source_path)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -1068,14 +1060,13 @@ fn normalize_tool_output(
         .map(str::to_owned)
         .unwrap_or_else(|| serde_json::to_string(output).unwrap_or_default());
     let exit_code = extract_codex_host_exit_code(&output_text);
+    let output_text = omit_inline_images(&output_text);
     tx.execute(
-        "INSERT INTO codex_tool_executions
-         (thread_id, call_id, output_record_index, output_text, completed_at, exit_code,
-          source_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO codex_tool_execution_meta
+         (thread_id, call_id, output_record_index, completed_at, exit_code, source_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(thread_id, call_id) DO UPDATE SET
            output_record_index = excluded.output_record_index,
-           output_text = excluded.output_text,
            completed_at = excluded.completed_at,
            exit_code = excluded.exit_code,
            source_path = excluded.source_path",
@@ -1083,18 +1074,49 @@ fn normalize_tool_output(
             thread_id,
             call_id,
             record_index,
-            output_text,
             timestamp,
             exit_code,
             source_path
         ],
     )?;
+    tx.execute(
+        "INSERT INTO codex_tool_execution_outputs (thread_id, call_id, output_text)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(thread_id, call_id) DO UPDATE SET output_text = excluded.output_text",
+        params![thread_id, call_id, output_text.as_ref()],
+    )?;
     Ok(())
 }
 
+/// Replace base64 images embedded in tool output (screenshots returned to the
+/// model) with a note of their size. They held most of the cache's bytes and
+/// no query can search them.
+fn omit_inline_images(output_text: &str) -> std::borrow::Cow<'_, str> {
+    static INLINE_IMAGE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = INLINE_IMAGE.get_or_init(|| {
+        regex::Regex::new(r"(data:image/[A-Za-z0-9.+-]+;base64,)[A-Za-z0-9+/=]{256,}")
+            .expect("inline image pattern")
+    });
+    pattern.replace_all(output_text, |captures: &regex::Captures<'_>| {
+        let omitted = captures[0].len() - captures[1].len();
+        format!("{}<{omitted} bytes omitted>", &captures[1])
+    })
+}
+
+/// The exit code Codex reports in the header it puts before a command's
+/// output. The header ends at a `Final output:` line or, in the format
+/// current Codex writes, a line that is exactly `Output:`; a matching line
+/// after that belongs to the command's own output and is ignored.
 fn extract_codex_host_exit_code(output_text: &str) -> Option<i64> {
-    let (header, _) = output_text.split_once("Final output:")?;
-    header.lines().find_map(parse_codex_host_exit_line)
+    let mut exit_code = None;
+    for line in output_text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line == "Output:" || line.starts_with("Final output:") {
+            return exit_code;
+        }
+        exit_code = exit_code.or_else(|| parse_codex_host_exit_line(line));
+    }
+    None
 }
 
 fn parse_codex_host_exit_line(line: &str) -> Option<i64> {
@@ -1274,7 +1296,7 @@ fn recompute_thread(tx: &Transaction<'_>, thread_id: &str) -> Result<()> {
            user_message_count = ?2,
            assistant_message_count = ?3,
            tool_call_count = (
-             SELECT COUNT(*) FROM codex_tool_executions
+             SELECT COUNT(*) FROM codex_tool_execution_meta
              WHERE thread_id = ?1 AND call_record_index IS NOT NULL
            ),
            compaction_count = (
@@ -1380,7 +1402,7 @@ fn update_thread_location(
     for table in [
         "codex_events",
         "codex_messages",
-        "codex_tool_executions",
+        "codex_tool_execution_meta",
         "codex_compactions",
     ] {
         tx.execute(
@@ -1582,7 +1604,10 @@ fn create_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (thread_id, record_index)
         );
 
-        CREATE TABLE IF NOT EXISTS codex_tool_executions (
+        -- Command details and their output live in separate tables so a scan
+        -- of commands never walks through output text; the view below
+        -- presents them as one table.
+        CREATE TABLE IF NOT EXISTS codex_tool_execution_meta (
             thread_id TEXT NOT NULL REFERENCES codex_threads(thread_id) ON DELETE CASCADE,
             call_id TEXT NOT NULL,
             call_record_index INTEGER,
@@ -1590,7 +1615,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
             tool_name TEXT,
             arguments_json TEXT,
             cmd TEXT,
-            output_text TEXT,
             called_at TEXT,
             completed_at TEXT,
             exit_code INTEGER,
@@ -1598,6 +1622,22 @@ fn create_schema(conn: &Connection) -> Result<()> {
             source_path TEXT NOT NULL,
             PRIMARY KEY (thread_id, call_id)
         );
+
+        CREATE TABLE IF NOT EXISTS codex_tool_execution_outputs (
+            thread_id TEXT NOT NULL REFERENCES codex_threads(thread_id) ON DELETE CASCADE,
+            call_id TEXT NOT NULL,
+            output_text TEXT,
+            PRIMARY KEY (thread_id, call_id)
+        );
+
+        CREATE VIEW IF NOT EXISTS codex_tool_executions AS
+            SELECT meta.thread_id, meta.call_id, meta.call_record_index,
+                   meta.output_record_index, meta.tool_name, meta.arguments_json,
+                   meta.cmd, output.output_text, meta.called_at, meta.completed_at,
+                   meta.exit_code, meta.cwd, meta.source_path
+            FROM codex_tool_execution_meta AS meta
+            LEFT JOIN codex_tool_execution_outputs AS output
+              ON output.thread_id = meta.thread_id AND output.call_id = meta.call_id;
 
         CREATE TABLE IF NOT EXISTS codex_compactions (
             thread_id TEXT NOT NULL REFERENCES codex_threads(thread_id) ON DELETE CASCADE,
@@ -1630,9 +1670,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_codex_messages_role_timestamp
             ON codex_messages(role, timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_codex_tool_executions_tool_called_at
-            ON codex_tool_executions(tool_name, called_at DESC);
+            ON codex_tool_execution_meta(tool_name, called_at DESC);
         CREATE INDEX IF NOT EXISTS idx_codex_tool_executions_called_at
-            ON codex_tool_executions(called_at DESC);
+            ON codex_tool_execution_meta(called_at DESC);
         CREATE INDEX IF NOT EXISTS idx_codex_ingest_errors_journal_path
             ON codex_ingest_errors(journal_path);
         ",
@@ -1710,6 +1750,31 @@ mod tests {
                 "tests passed".into()
             )
         );
+    }
+
+    #[test]
+    fn exit_code_comes_from_the_header_in_either_codex_format() {
+        let current = "Chunk ID: 055a58\nWall time: 18.3 seconds\nProcess exited with code 2\n\
+                       Original token count: 10\nOutput:\nProcess exited with code 9\n";
+        assert_eq!(extract_codex_host_exit_code(current), Some(2));
+        let older = "Process exited with code 42\nFinal output:\nfailed";
+        assert_eq!(extract_codex_host_exit_code(older), Some(42));
+        let body_only = "Output:\nProcess exited with code 7";
+        assert_eq!(extract_codex_host_exit_code(body_only), None);
+        let no_header = "Process exited with code 3";
+        assert_eq!(extract_codex_host_exit_code(no_header), None);
+    }
+
+    #[test]
+    fn inline_images_are_replaced_by_their_size() {
+        let image = "A".repeat(1000);
+        let text = format!("before data:image/png;base64,{image} after");
+        assert_eq!(
+            omit_inline_images(&text),
+            "before data:image/png;base64,<1000 bytes omitted> after"
+        );
+        let short = "see data:image/png;base64,AAAA for the icon";
+        assert_eq!(omit_inline_images(short), short);
     }
 
     #[test]

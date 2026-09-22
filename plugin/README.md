@@ -63,6 +63,7 @@ Claude will automatically use devsql to answer.
 - `branches` — Branch info (name, is_head, commit_id)
 - `diffs` — Commit-level diff stats (commit_id, files_changed, insertions, deletions)
 - `diff_files` — Per-file diff stats (commit_id, path, status, insertions, deletions)
+- Also: `commit_parents`, `tags`, `refs`, `stashes`, `reflog`, `blame`, `config`, `remotes`, `submodules`, `status`, `worktrees`, `hooks`, `notes`
 
 ### macOS Unified Log
 
@@ -73,9 +74,10 @@ Claude will automatically use devsql to answer.
 - `source_lines` — Line-level content (file_path, line_number, content, is_blank)
 - `symbols` — Functions, classes, structs, etc. (name, kind, file_path, line_start, signature, visibility)
 - `imports`\* — Import statements (file_path, module, name, alias, kind)
-- `ast_nodes`\* — Raw AST nodes
 
-\* Full extraction requires the `tree-sitter-ast` build feature. Without it, `symbols` uses regex-based extraction and `imports`/`ast_nodes` are empty.
+\* `imports` requires the `tree-sitter-ast` build feature. Without it, `symbols` uses regex-based extraction.
+
+Run `devsql schema <table>` for any table's exact columns.
 
 ## Examples
 
