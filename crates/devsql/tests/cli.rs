@@ -207,6 +207,32 @@ fn recall_joins_unquoted_words_into_one_query() {
 }
 
 #[test]
+fn recall_accepts_terms_as_a_query_flag() {
+    let data = create_claude_data_dir();
+    let codex_home = TempDir::new().expect("codex");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex_home.path())
+        .args([
+            "recall",
+            "--query",
+            "vision simulator",
+            "--data-dir",
+            data.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(parsed["terms"], serde_json::json!(["vision", "simulator"]));
+}
+
+#[test]
 fn recall_without_terms_reports_the_missing_argument() {
     Command::new(env!("CARGO_BIN_EXE_devsql"))
         .args(["recall", "--format", "json"])

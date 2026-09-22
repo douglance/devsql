@@ -449,6 +449,21 @@ pub fn explain_error(conn: &Connection, sql: &str, message: &str) -> Option<Stri
         let mut text = format!("No column named `{name}`.");
         if !suggestions.is_empty() {
             text.push_str(&format!(" Did you mean {}?", suggestions.join(" or ")));
+        } else {
+            let mentioned = mentioned_tables(sql);
+            let elsewhere: Vec<&str> = TABLES
+                .iter()
+                .filter(|t| !mentioned.contains(&t.name) && guess.len() >= 4)
+                .filter(|t| {
+                    t.about
+                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .any(|w| w == guess)
+                })
+                .map(|t| t.name)
+                .collect();
+            if !elsewhere.is_empty() {
+                text.push_str(&format!(" `{guess}` is in {}.", elsewhere.join(", ")));
+            }
         }
         text.push_str(&format!(" Columns: {}.", listings.join("; ")));
         return Some(text);
@@ -549,6 +564,21 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("history.display"), "{text}");
+    }
+
+    #[test]
+    fn names_the_table_that_has_a_missing_column() {
+        let conn = conn_with("CREATE TABLE commits (id TEXT, summary TEXT);");
+        let text = explain_error(
+            &conn,
+            "SELECT SUM(insertions) FROM commits",
+            "no such column: insertions",
+        )
+        .unwrap();
+        assert!(
+            text.contains("`insertions` is in diffs, diff_files."),
+            "{text}"
+        );
     }
 
     #[test]

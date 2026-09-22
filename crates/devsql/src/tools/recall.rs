@@ -14,8 +14,8 @@ use super::{engine_from_options, legacy_context, read_only_mcp, typed_from_resul
 #[derive(incurs::Args, serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct RecallArgs {
-    /// Space-separated terms to recall prior work for
-    query: String,
+    /// Space-separated terms to recall prior work for (or pass --query)
+    query: Option<String>,
     /// Further terms; unquoted words are joined onto the query
     more: Option<Vec<String>>,
 }
@@ -32,6 +32,8 @@ struct RecallOptions {
     /// Maximum number of results per source
     #[incurs(alias = "n", default = 8)]
     limit: i64,
+    /// Terms, when not given as arguments
+    query: Option<String>,
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
@@ -79,7 +81,8 @@ pub(crate) fn match_expr(expr: &str, terms: &[String]) -> String {
 #[async_trait::async_trait]
 impl CommandHandler for RecallHandler {
     async fn run(&self, ctx: CommandContext) -> CommandResult {
-        let query = match super::search_terms(&ctx.args, "query") {
+        let flag = ctx.options.get("query").and_then(|v| v.as_str()).map(String::from);
+        let query = match super::search_terms(&ctx.args, "query").or(flag) {
             Some(q) => q,
             None => {
                 return CommandResult::Error {
