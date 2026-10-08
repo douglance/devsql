@@ -8,8 +8,8 @@
     {
       "name": "devsql",
       "source": "./plugin",
-      "description": "Use Code Mode to query AI coding history, shell history, Git, source code, and durable worklogs.",
-      "version": "0.5.0",
+      "description": "Use Code Mode to query AI coding history, shell history, Git, and source code.",
+      "version": "0.7.0",
       "author": {
         "name": "Doug Lance"
       }

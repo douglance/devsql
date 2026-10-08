@@ -1,7 +1,7 @@
 {
   "name": "devsql",
-  "version": "0.5.0",
-  "description": "Use Code Mode to query AI coding history, shell history, Git, source code, and durable worklogs.",
+  "version": "0.7.0",
+  "description": "Use Code Mode to query AI coding history, shell history, Git, and source code.",
   "author": {
     "name": "Doug Lance",
     "url": "https://github.com/douglance"

@@ -175,6 +175,34 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
         "{executed}"
     );
 
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 105,
+            "method": "tools/call",
+            "params": {"name": "codemode_search", "arguments": {"query": "work_start work_update work_done work_note work_list today day days"}}
+        }),
+    );
+    let removed = response(&receiver, 105);
+    assert!(removed.get("error").is_none(), "{removed}");
+    let catalog = removed.to_string();
+    for method in [
+        "devsql.work_start",
+        "devsql.work_update",
+        "devsql.work_done",
+        "devsql.work_note",
+        "devsql.work_list",
+        "devsql.today",
+        "devsql.day",
+        "devsql.days",
+    ] {
+        assert!(
+            !catalog.contains(method),
+            "removed method is still discoverable: {method}"
+        );
+    }
+
     drop(stdin);
     let status = child.wait().expect("wait for MCP server");
     reader.join().expect("join MCP reader");

@@ -195,16 +195,6 @@ pub const TABLES: &[TableInfo] = &[
         about: "shell and agent commands in one stream",
     },
     TableInfo {
-        name: "work_tasks",
-        source: "Worklog",
-        about: "tasks from `devsql work`",
-    },
-    TableInfo {
-        name: "work_events",
-        source: "Worklog",
-        about: "start, update, done, and note events",
-    },
-    TableInfo {
         name: "grok_bots",
         source: "Grok Bots",
         about: "Grok bots",
@@ -358,9 +348,6 @@ const SYNONYMS: &[&[&str]] = &[
 ];
 
 const TABLE_SYNONYMS: &[(&str, &str)] = &[
-    ("work", "work_tasks"),
-    ("tasks", "work_tasks"),
-    ("worklog", "work_events"),
     ("prompts", "history"),
     ("messages", "codex_messages"),
     ("conversations", "sessions"),
@@ -597,8 +584,6 @@ mod tests {
     #[test]
     fn suggests_the_real_table_for_a_guessed_one() {
         let conn = conn_with("");
-        let text = explain_error(&conn, "SELECT * FROM work", "no such table: work").unwrap();
-        assert!(text.contains("Did you mean work_tasks"), "{text}");
         let text = explain_error(&conn, "SELECT * FROM comits", "no such table: comits").unwrap();
         assert!(text.contains("Did you mean commits"), "{text}");
     }
@@ -621,7 +606,6 @@ mod tests {
                 needed.git,
                 needed.code,
                 needed.shell,
-                needed.work,
                 needed.system,
                 needed.grok,
             ]

@@ -5,11 +5,11 @@ description: Query and analyze developer-local history, macOS Unified Logs, Git,
 
 # DevSQL Querying Skill
 
-Use DevSQL Code Mode to query Claude Code and Codex CLI history, shell history, macOS Unified Logs, Git commits, source code, and durable worklogs.
+Use DevSQL Code Mode to query Claude Code and Codex CLI history, shell history, macOS Unified Logs, Git commits, and source code.
 
 ## Primary interface
 
-Prefer the connected DevSQL Code Mode server. Use `codemode_search` to discover typed `devsql.*` methods, then `codemode_execute` to compose them in JavaScript. Poll durable work with `codemode_execution`; approve writes with `codemode_decide` only when the user has authorized them.
+Prefer the connected DevSQL Code Mode server. Use `codemode_search` to discover typed `devsql.*` methods, then `codemode_execute` to compose them in JavaScript. Inspect query executions with `codemode_execution`. Devsql observes existing history; it does not create tasks or require progress reports.
 
 Use the direct commands below only when Code Mode is unavailable or when writing a shell script.
 
@@ -69,17 +69,12 @@ fails with the table's real columns and the closest match.
 | `codex_threads` | one row per Codex conversation: thread_id, cwd, started_at, last_event_at, first_user_text, … |
 | `codex_messages`, `codex_events`, `codex_tool_executions` | Codex messages, raw events, and commands with output |
 
-### Shell and Worklog Tables
+### Shell Tables
 | Table | Columns |
 |-------|---------|
 | `shell_history` | Atuin, zsh, and bash history: source, timestamp, command, cwd, exit_code, … |
 | `command_events` | shell and agent commands in one stream (large; filter early) |
-| `work_tasks` | id, title, project, cwd, agent, status, created_at, updated_at, session_id, source |
-| `work_events` | task events: task_id, ts, local_date, kind, title, body, project, cwd, agent |
 
-Write the worklog with `devsql work start|update|done|note`. `update` and
-`done` take a task id, an exact title, or (when one task is open in the current
-directory) a sentence of progress.
 
 `transcripts` covers `~/.claude/projects/<slug>/**/*.jsonl` (top-level sessions
 plus subagent transcripts) and the legacy `~/.claude/transcripts/*.jsonl`.

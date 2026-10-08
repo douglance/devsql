@@ -249,7 +249,9 @@ fn schema_questions_from_other_sql_shells_list_tables() {
             .args([query, "--format", "json"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("\"table\": \"work_tasks\""));
+            .stdout(predicate::str::contains("\"table\": \"commits\""))
+            .stdout(predicate::str::contains("work_tasks").not())
+            .stdout(predicate::str::contains("work_events").not());
     }
 }
 
@@ -268,7 +270,9 @@ fn guessed_column_names_the_real_one() {
         .args(["SELECT hash FROM commits LIMIT 1", "--format", "json"])
         .assert()
         .failure()
-        .stdout(predicate::str::contains("Did you mean commits.id or commits.short_id?"));
+        .stdout(predicate::str::contains(
+            "Did you mean commits.id or commits.short_id?",
+        ));
 }
 
 #[test]
@@ -320,4 +324,83 @@ fn table_and_csv_formats_remain_available() {
         .assert()
         .success()
         .stdout(predicate::str::contains("value\n1"));
+}
+
+#[test]
+fn task_tracking_is_not_advertised() {
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(output).expect("help");
+    for removed in [
+        "devsql work",
+        "WORKDAY MEMORY",
+        "work_tasks",
+        "work_events",
+        "worklog",
+    ] {
+        assert!(
+            !help.contains(removed),
+            "task tracking is still advertised: {removed}"
+        );
+    }
+}
+
+#[test]
+fn task_and_worklog_day_commands_are_removed() {
+    let home = TempDir::new().expect("home");
+    for args in [
+        vec!["work", "start", "must not create a task"],
+        vec!["today"],
+        vec!["day", "yesterday"],
+        vec!["days"],
+    ] {
+        Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("DEVSQL_HOME", home.path())
+            .args(args)
+            .assert()
+            .failure();
+        assert!(!home.path().join("worklog.sqlite").exists());
+    }
+}
+
+#[test]
+fn queries_do_not_load_or_modify_owned_worklog_tables() {
+    let home = TempDir::new().expect("home");
+    let path = home.path().join("worklog.sqlite");
+    let conn = rusqlite::Connection::open(&path).expect("sentinel database");
+    conn.execute("CREATE TABLE sentinel (value TEXT)", [])
+        .expect("sentinel table");
+    conn.execute("INSERT INTO sentinel VALUES ('preserve existing data')", [])
+        .expect("sentinel row");
+    drop(conn);
+    let before = std::fs::read(&path).expect("before");
+    for table in ["work_tasks", "work_events"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("DEVSQL_HOME", home.path())
+            .args([
+                "query",
+                &format!("SELECT * FROM {table}"),
+                "--format",
+                "json",
+            ])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic.contains(&format!("No table named `{table}`")),
+            "{diagnostic}"
+        );
+        assert_eq!(std::fs::read(&path).expect("after"), before);
+    }
 }

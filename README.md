@@ -1,8 +1,8 @@
 # DevSQL
 
-Code Mode for AI coding history, shell history, macOS Unified Logs, Git repositories, source code, and durable worklogs. Code Mode is the primary agent interface; the direct SQL CLI remains available for humans and scripts.
+Code Mode for observing AI coding history, shell history, macOS Unified Logs, Git repositories, and source code. Code Mode is the primary agent interface; the direct SQL CLI remains available for humans and scripts.
 
-DevSQL loads data from Claude Code, Codex CLI, shell history, macOS Unified Logs, Git, your source tree, and its durable worklog into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Unified Logs stream through a bounded virtual table rather than being materialized. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
+DevSQL loads data from Claude Code, Codex CLI, shell history, macOS Unified Logs, Git and your source tree into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Unified Logs stream through a bounded virtual table rather than being materialized. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
 
 ## Primary agent interface: Code Mode
 
@@ -25,7 +25,7 @@ const recent = await devsql.query({
 recent
 ```
 
-Read-only methods run without approval. Worklog writes pause for an explicit decision. Use direct `devsql` commands when working interactively in a terminal or writing a shell script.
+Read-only methods run without approval. Use direct `devsql` commands when working interactively in a terminal or writing a shell script.
 
 ## Overview
 
@@ -33,8 +33,7 @@ Read-only methods run without approval. Worklog writes pause for an explicit dec
 ~/.claude/       --+
 ~/.codex/        --+
 shell histories  --+
-macOS logs       --+
-worklog.sqlite   --+--> SQLite --> SQL queries / JSON / CSV
+macOS logs       --+--> SQLite --> SQL queries / JSON / CSV
 .git/            --+
 src/**/*         --+
 ```
@@ -102,23 +101,8 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql impact <file>` | Analyze exports and find potential dependents |
 | `devsql recall <terms>` | Load prior work (Claude sessions, Codex threads, commits, prompts, shell commands, and agent-issued commands) ranked by term-match count then recency |
 | `devsql gather <terms>` | Run prior_work, repo_state, code_search, symbols, excerpts, and activity concurrently and return one token-budgeted bundle |
-| `devsql work start\|update\|done\|note\|list` | Write structured work events to the durable day log (agents populate; humans read) |
-| `devsql today` / `day` / `days` | Cross-project day timeline (Today granular; past days summarized) |
 
 Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`). `gather` also takes `--budget` (default `8000` tokens; lowest-ranked rows are dropped round-robin per section, never mid-row, until the bundle fits).
-
-### Workday memory
-
-Agents write short work events so you can answer “what did I do today?” across every project:
-
-```bash
-devsql work start "Fix auth token refresh" --project velo --agent codex --body "Investigating 401s"
-devsql work done <task-id> --body "Shipped fix; tests green"
-devsql today
-devsql day yesterday
-```
-
-Events live in `~/.devsql/worklog.sqlite` (override with `DEVSQL_HOME`) and are also queryable as SQL tables `work_tasks` and `work_events`.
 
 ### Code Mode server
 
@@ -144,8 +128,6 @@ Run `devsql --mcp` to start the primary agent interface described above. Direct 
 | `codex_compactions` | Same rollout journals | Compaction summaries and window metadata |
 | `codex_ingest_errors` | DevSQL Codex index | Nonfatal journal read and JSON parsing errors |
 | `tool_calls` | `~/.claude/projects/<slug>/**/*.jsonl` (+ legacy `~/.claude/transcripts/*.jsonl`) | Claude assistant tool calls with source, session, subagent, cwd, and timestamp provenance |
-| `work_tasks` | `~/.devsql/worklog.sqlite` | Durable tasks (title, project, status, agent, …) written via `devsql work` |
-| `work_events` | `~/.devsql/worklog.sqlite` | Day-timeline events (start/update/done/note) with `local_date` |
 | `grok_bots` | `~/Library/Application Support/Grok Bot/sand-client-persistence/*.blob` | One row per Grok Bot: name, roster presence, remote store path, entry counts, first/last entry, local replica and gateway backfill state |
 | `grok_entries` | Replicas, in-box `store.db`, and optional gateway backfill | Every transcript entry: kind, role, direction, text, agents, request/batch IDs, `raw_json`, and `provenance` (`local_replica`, `store_db`, `gateway`, or `both`) |
 | `grok_messages` | View over `grok_entries` | Entries that carry real text, joined to the bot name |

@@ -4,7 +4,6 @@
 //! for use with the incurs CLI framework.
 
 pub mod context;
-pub mod day;
 pub mod diff;
 pub mod gather;
 pub mod grok;
@@ -14,7 +13,6 @@ pub mod recall;
 pub mod schema;
 pub mod search;
 pub mod semantic_diff;
-pub mod work;
 
 use std::path::PathBuf;
 
@@ -114,9 +112,6 @@ pub fn load_query_tables(
         };
         loaded.map_err(load_error("command-history"))?;
     }
-    engine
-        .load_work_tables(&names(&needed.work))
-        .map_err(load_error("work"))?;
     engine
         .load_grok_tables(&names(&needed.grok))
         .map_err(load_error("Grok"))?;

@@ -244,7 +244,7 @@ fn query_examples() -> Vec<Example> {
 }
 
 fn query_hint() -> &'static str {
-    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # approve writes or stop work\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Grok Bots:    grok_bots, grok_entries, grok_messages, grok_ingest_errors (global; see `devsql grok`)\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  macOS:        macos_logs (bounded live or .logarchive stream with provenance)\n  Worklog:      work_tasks, work_events (durable day memory; write via `devsql work`)\n\n  devsql schema [table]        # every table, or one table's real columns\n\nWORKDAY MEMORY:\n  devsql work start|update|done|note|list   # agents write structured work events\n  devsql today | day [date] | days          # human day timeline\n\nGROK BOTS (explicit search target, never in recall/gather):\n  devsql grok status | search <terms> | sync\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Start a worklog task when beginning non-trivial work\"\n  \"Show me what I did today with DevSQL Code Mode\"\n\nLearn more: https://github.com/douglance/devsql"
+    "PRIMARY AGENT INTERFACE:\n  devsql --mcp                 # five-tool Code Mode server\n  codemode_search              # discover devsql.* methods\n  codemode_execute             # run JavaScript across one or more methods\n  codemode_execution           # inspect a durable execution\n  codemode_decide / cancel     # execution decisions or cancellation\n\n  The direct CLI below is the human and scripting fallback.\n\nTABLES:\n  Claude Code:  history (prompts), transcripts (conversations), sessions (per-session stats), todos\n  Codex CLI:    jhistory / codex_history, codex_threads, codex_messages, codex_events,\n                codex_tool_executions / codex_tool_calls, codex_compactions, codex_ingest_errors\n  Grok Bots:    grok_bots, grok_entries, grok_messages, grok_ingest_errors (global; see devsql grok)\n  Git:          commits, diffs, diff_files, branches\n  Shell:        shell_history (Atuin, zsh, bash), command_events (shell + agent commands)\n  macOS:        macos_logs (bounded live or .logarchive stream with provenance)\n\n  devsql schema [table]        # every table, or one table's real columns\n\nGROK BOTS (explicit search target, never in recall/gather):\n  devsql grok status | search <terms> | sync\n\nTELL YOUR AI AGENT:\n  \"Use DevSQL Code Mode to find my most effective prompts from the past month\"\n  \"Use DevSQL Code Mode to inspect my recent commands and commits\"\n\nLearn more: https://github.com/douglance/devsql"
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +255,7 @@ fn build_cli() -> Cli {
     Cli::create("devsql")
         .description(
             "Code Mode is the primary agent interface for querying AI coding, Git, source code, \
-             shell history, macOS Unified Logs, and worklog data.\n\n\
+             shell history and macOS Unified Logs.\n\n\
              Run `devsql --mcp` for the Code Mode server. Use the direct CLI for human queries \
              and scripts.",
         )
@@ -277,11 +277,7 @@ fn build_cli() -> Cli {
         .command("impact", devsql::tools::impact::build())
         .command("recall", devsql::tools::recall::build())
         .command("gather", devsql::tools::gather::build())
-        .group(devsql::tools::work::build_group())
         .group(devsql::tools::grok::build_group())
-        .command("today", devsql::tools::day::build_today())
-        .command("day", devsql::tools::day::build_day())
-        .command("days", devsql::tools::day::build_days())
 }
 
 fn code_mode_requested() -> bool {
@@ -294,10 +290,7 @@ async fn serve_code_mode(cli: &Cli) -> Result<(), String> {
         IncurConnector::new(cli.tool_catalog())
             .with_name("devsql")
             .with_instructions(
-                "Use devsql.query for cross-source SQL; use devsql.gather when prior work and \
-                 repository context should be loaded together. Use devsql.work_start, \
-                 devsql.work_update, devsql.work_done, and devsql.work_note to maintain the \
-                 durable day timeline.",
+                "Use devsql.query to inspect existing records across sources; use devsql.gather when prior work and repository context should be loaded together. Devsql observes history and does not manage tasks.",
             ),
     );
     let service = LocalCodeModeService::spawn(move || {

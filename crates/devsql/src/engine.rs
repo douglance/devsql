@@ -198,15 +198,6 @@ impl UnifiedEngine {
         Ok(())
     }
 
-    /// Load durable worklog tables (work_tasks, work_events) into this connection.
-    pub fn load_work_tables(&mut self, tables: &[&str]) -> Result<()> {
-        if tables.is_empty() {
-            return Ok(());
-        }
-        let wl = crate::worklog::Worklog::open()?;
-        wl.materialize_into(&self.conn, tables)
-    }
-
     /// Access the underlying SQLite connection. Used by `gather` to
     /// materialize section results as `gather_<section>` tables in the
     /// connection used for rendering.
@@ -1860,7 +1851,6 @@ pub struct TableRequirements {
     pub git: Vec<String>,
     pub code: Vec<String>,
     pub shell: Vec<String>,
-    pub work: Vec<String>,
     pub system: Vec<String>,
     pub grok: Vec<String>,
 }
@@ -1903,14 +1893,8 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         "hooks",
         "notes",
     ];
-    let code_tables = [
-        "source_files",
-        "source_lines",
-        "symbols",
-        "imports",
-    ];
+    let code_tables = ["source_files", "source_lines", "symbols", "imports"];
     let shell_tables = ["shell_history", "command_events"];
-    let work_tables = ["work_tasks", "work_events"];
     let system_tables = ["macos_logs"];
     let grok_tables = [
         "grok_bots",
@@ -1948,12 +1932,6 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         .map(|s| s.to_string())
         .collect();
 
-    let needed_work: Vec<String> = work_tables
-        .iter()
-        .filter(|t| query_mentions_table(&query_upper, t))
-        .map(|s| s.to_string())
-        .collect();
-
     let needed_system: Vec<String> = system_tables
         .iter()
         .filter(|t| query_mentions_table(&query_upper, t))
@@ -1971,7 +1949,6 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         git: needed_git,
         code: needed_code,
         shell: needed_shell,
-        work: needed_work,
         system: needed_system,
         grok: needed_grok,
     }
@@ -2022,16 +1999,6 @@ mod tests {
         assert!(code.contains(&"source_files".to_string()));
         assert!(code.contains(&"symbols".to_string()));
         assert!(!code.contains(&"source_lines".to_string()));
-    }
-
-    #[test]
-    fn detect_tables_finds_work_tables() {
-        let work = detect_tables(
-            "SELECT * FROM work_events JOIN work_tasks ON work_events.task_id = work_tasks.id",
-        )
-        .work;
-        assert!(work.contains(&"work_events".to_string()));
-        assert!(work.contains(&"work_tasks".to_string()));
     }
 
     #[test]

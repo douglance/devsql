@@ -12,7 +12,6 @@ pub mod providers;
 pub mod query_help;
 mod redaction;
 pub mod tools;
-pub mod worklog;
 
 pub use engine::UnifiedEngine;
 pub use error::Error;
