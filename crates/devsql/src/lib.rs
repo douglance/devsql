@@ -11,6 +11,7 @@ pub mod grok_index;
 pub mod providers;
 pub mod query_help;
 mod redaction;
+pub mod shared;
 pub mod tools;
 
 pub use engine::UnifiedEngine;

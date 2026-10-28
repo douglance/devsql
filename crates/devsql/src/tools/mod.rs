@@ -13,6 +13,7 @@ pub mod recall;
 pub mod schema;
 pub mod search;
 pub mod semantic_diff;
+pub mod shared;
 
 use std::path::PathBuf;
 

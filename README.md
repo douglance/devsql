@@ -108,6 +108,45 @@ Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.
 
 Run `devsql --mcp` to start the primary agent interface described above. Direct commands remain the explicit CLI fallback.
 
+### Shared history over Tailscale
+
+Choose one machine as the shared host. Install this version of DevSQL, Tailscale,
+SSH, and rsync on every participating machine. Each client must be able to use
+noninteractive SSH to the host, with its host key already trusted. The host must
+have `devsql` in `~/.cargo/bin`, `~/.local/bin`, or its SSH command PATH.
+
+On each participating machine, including the host, publish its local history:
+
+```bash
+devsql shared sync HOST
+```
+
+Replace `HOST` with the host's Tailscale name or full DNS name. Sync again to
+refresh the snapshot; it does not run automatically. An unsuccessful transfer
+leaves the previous snapshot available. The host stores private SQLite snapshots
+in `~/.devsql/shared/machines`. Each snapshot contains Claude, Codex, Grok, and
+shell history available on the machine at sync time, including conversation and
+tool contents. Protect SSH access to the host accordingly. A snapshot replaces
+that machine's previous snapshot, so retain source history or separate backups.
+
+Query from any participating machine:
+
+```bash
+devsql shared query 'SELECT _machine, display FROM history LIMIT 10' --host HOST
+devsql shared query 'SELECT _machine, modified_at FROM shared_snapshots' --host HOST
+```
+
+`_machine` is the Tailscale node ID. `modified_at` is the snapshot file's Unix
+timestamp. Only successfully uploaded machines appear; compare this list with
+the machines you expect and check timestamps for freshness. Set
+`DEVSQL_SHARED_HOST=HOST` in the agent's environment to omit `--host`. Agents
+can call `devsql.shared_query({query: "SELECT * FROM shared_snapshots"})` through
+Code Mode; its network access may require approval. Queries are read-only;
+local Git, source-code, and macOS-log tables remain local. The host must be
+online for remote queries and uploads. Each sync rebuilds and transfers the
+whole snapshot, and shared queries temporarily copy referenced tables on the
+host, so large histories require sufficient disk space and time.
+
 ## Tables
 
 ### AI History
