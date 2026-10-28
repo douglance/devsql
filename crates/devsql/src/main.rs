@@ -278,6 +278,7 @@ fn build_cli() -> Cli {
         .command("recall", devsql::tools::recall::build())
         .command("gather", devsql::tools::gather::build())
         .group(devsql::tools::grok::build_group())
+        .group(devsql::tools::shared::build_group())
 }
 
 fn code_mode_requested() -> bool {

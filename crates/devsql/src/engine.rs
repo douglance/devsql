@@ -41,8 +41,38 @@ impl UnifiedEngine {
         git_repo_path: PathBuf,
         codex_data_dir: PathBuf,
     ) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        Self::new_with_connection(
+            claude_data_dir,
+            git_repo_path,
+            codex_data_dir,
+            Connection::open_in_memory()?,
+            true,
+        )
+    }
+
+    /// Construct an engine with a disk-backed temporary database for large exports.
+    pub fn new_for_export(
+        claude_data_dir: PathBuf,
+        git_repo_path: PathBuf,
+        codex_data_dir: PathBuf,
+    ) -> Result<Self> {
+        Self::new_with_connection(
+            claude_data_dir,
+            git_repo_path,
+            codex_data_dir,
+            Connection::open("")?,
+            false,
+        )
+    }
+
+    fn new_with_connection(
+        claude_data_dir: PathBuf,
+        git_repo_path: PathBuf,
+        codex_data_dir: PathBuf,
+        conn: Connection,
+        memory: bool,
+    ) -> Result<Self> {
+        conn.pragma_update(None, "temp_store", if memory { "MEMORY" } else { "FILE" })?;
 
         // Register custom DATE function that handles both epoch ms and ISO dates
         conn.create_scalar_function(

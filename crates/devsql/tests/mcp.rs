@@ -130,6 +130,13 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
 
     send(
         &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 106, "method": "tools/call", "params": {"name": "codemode_search", "arguments": {"query": "shared"}}}),
+    );
+    let shared = response(&receiver, 106);
+    assert!(shared.to_string().contains("devsql.shared_query"), "{shared}");
+
+    send(
+        &mut stdin,
         json!({
             "jsonrpc": "2.0",
             "id": 4,
