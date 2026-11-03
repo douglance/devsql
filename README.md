@@ -454,9 +454,12 @@ The table includes `token_usage_record` entries only; older journals or incomple
 ```bash
 devsql gather "auth token refresh"
 devsql gather "auth token refresh" -r /path/to/repo --budget 4000
+devsql gather "older command" --all-codex-commands true
 ```
 
 `gather` returns six independently computed sections: prior work, repository state, code search, symbols, excerpts, and recent activity. If one section fails, the remaining sections are still returned and the failed section includes a note. Codex prior-work excerpts in `gather` and `recall` show up to 200 characters around the first literal matching term after redaction.
+
+Activity normally searches the latest 5,000 Codex tool executions. `--all-codex-commands true` searches indexed Codex commands across the full history and may take substantially longer; other source, result, and budget limits still apply. Matching Codex command rows include `thread_id` and `call_record_index`, which identify the execution in `codex_tool_executions` for a targeted follow-up query. This option searches command text and working directory, not tool output.
 
 ### File context and impact
 ```bash

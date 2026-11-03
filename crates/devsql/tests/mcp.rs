@@ -146,6 +146,10 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
     );
     let gather = response(&receiver, 107);
     assert!(gather.to_string().contains("omitted"), "{gather}");
+    assert!(
+        gather.to_string().contains("all_codex_commands"),
+        "{gather}"
+    );
 
     send(
         &mut stdin,

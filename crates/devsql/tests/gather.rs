@@ -427,3 +427,59 @@ fn gather_redacts_codex_threads_and_preserves_command_provenance() {
         .unwrap()
         .contains("Bearer abc.def.ghi"));
 }
+
+#[test]
+fn gather_can_find_old_codex_commands_with_follow_up_provenance() {
+    let claude = TempDir::new().expect("claude");
+    let repo = create_empty_git_repo();
+    let codex = TempDir::new().expect("codex");
+    let mut journal = String::from(concat!(
+        "{\"timestamp\":\"2020-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"old-command-thread\",\"cwd\":\"/repo\"}}\n",
+        "{\"timestamp\":\"2020-01-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"old-call\",\"arguments\":\"{\\\"cmd\\\":\\\"bun test ancientcommandneedle\\\"}\"}}\n",
+        "{\"timestamp\":\"2020-01-01T00:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"old-call\",\"output\":\"4 pass, 0 fail\"}}\n"
+    ));
+    for i in 0..5000 {
+        journal.push_str(&format!(
+            "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"new-{i}\",\"arguments\":\"{{\\\"cmd\\\":\\\"echo unrelated\\\"}}\"}}}}\n"
+        ));
+    }
+    write(
+        &codex.path().join("sessions/rollout-window.jsonl"),
+        &journal,
+    );
+    for full in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("CODEX_HOME", codex.path())
+            .env("DEVSQL_CACHE_DIR", codex.path().join("cache"))
+            .args([
+                "gather",
+                "ancientcommandneedle",
+                "--data-dir",
+                claude.path().to_str().unwrap(),
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--all-codex-commands",
+                if full { "true" } else { "false" },
+                "--budget",
+                "100000",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).expect("valid json");
+        let found = result["activity"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["thread_id"] == "old-command-thread");
+        assert_eq!(found.is_some(), full);
+        if let Some(row) = found {
+            assert_eq!(row["call_record_index"], 1);
+            assert_eq!(row["command"], "bun test ancientcommandneedle");
+        }
+    }
+}

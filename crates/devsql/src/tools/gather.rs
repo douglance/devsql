@@ -45,6 +45,9 @@ struct GatherOptions {
     /// Search all indexed canonical Codex messages for prior work (can be slow)
     #[serde(default)]
     all_codex_messages: bool,
+    /// Search all indexed Codex shell commands (can be slow)
+    #[serde(default)]
+    all_codex_commands: bool,
 }
 
 /// Rows fetched per section before budget trimming.
@@ -155,6 +158,11 @@ impl CommandHandler for GatherHandler {
             .get("all_codex_messages")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let full_codex_commands = ctx
+            .options
+            .get("all_codex_commands")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (render_engine, repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
             Err(e) => return e.into(),
@@ -176,6 +184,7 @@ impl CommandHandler for GatherHandler {
                         &terms,
                         SECTION_LIMIT,
                         full_codex,
+                        full_codex_commands,
                     )
                 }),
                 scope.spawn(|| vec![("repo_state", section_repo_state(&repo_path))]),
@@ -428,6 +437,7 @@ fn sections_prior_work_and_activity(
     terms: &[String],
     limit: i64,
     full_codex: bool,
+    full_codex_commands: bool,
 ) -> Vec<(&'static str, SectionResult)> {
     if terms.is_empty() {
         return vec![
@@ -472,7 +482,7 @@ fn sections_prior_work_and_activity(
                     return SectionResult::err(format!("failed to load command events: {error}"));
                 }
             }
-            section_activity(&mut engine, terms, limit)
+            section_activity(&mut engine, terms, limit, full_codex_commands)
         });
 
         let non_codex = non_codex
@@ -889,7 +899,12 @@ fn section_excerpts(engine: &UnifiedEngine, terms: &[String]) -> SectionResult {
 }
 
 /// 6. activity -- open todos, tool calls, and shell commands matching terms.
-fn section_activity(engine: &mut UnifiedEngine, terms: &[String], limit: i64) -> SectionResult {
+fn section_activity(
+    engine: &mut UnifiedEngine,
+    terms: &[String],
+    limit: i64,
+    full_codex_commands: bool,
+) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
     }
@@ -959,10 +974,32 @@ fn section_activity(engine: &mut UnifiedEngine, terms: &[String], limit: i64) ->
     }
 
     let command_expr = "(command || ' ' || coalesce(cwd, ''))";
+    let codex_window = if full_codex_commands {
+        String::new()
+    } else {
+        format!("ORDER BY called_at DESC LIMIT {RECENT_CODEX_COMMAND_SCAN_LIMIT}")
+    };
+    let codex_limit = if full_codex_commands {
+        String::new()
+    } else {
+        format!("LIMIT {RECENT_AGENT_COMMANDS_PER_SOURCE}")
+    };
+    let codex_filter = if full_codex_commands {
+        format!(
+            "AND {}",
+            match_expr(
+                "(execution.cmd || ' ' || coalesce(execution.cwd, thread.cwd, ''))",
+                terms
+            )
+        )
+    } else {
+        String::new()
+    };
     let agent_sql = format!(
         "WITH claude_commands AS MATERIALIZED (
            SELECT 'claude' AS source, 'agent' AS actor, agent_role, tool_name,
-                  command, cwd, timestamp, rowid AS source_order
+                  command, cwd, timestamp, rowid AS source_order,
+                  NULL AS thread_id, NULL AS call_record_index
            FROM tool_calls
            WHERE tool_name = 'Bash' AND command IS NOT NULL
            ORDER BY timestamp DESC
@@ -973,18 +1010,20 @@ fn section_activity(engine: &mut UnifiedEngine, terms: &[String], limit: i64) ->
                   execution.tool_name, execution.cmd AS command,
                   COALESCE(execution.cwd, thread.cwd) AS cwd,
                   execution.called_at AS timestamp,
-                  execution.call_record_index AS source_order
+                  execution.call_record_index AS source_order,
+                  execution.thread_id, execution.call_record_index
            FROM (
-             SELECT * FROM codex_tool_executions
-             ORDER BY called_at DESC
-             LIMIT {codex_scan_limit}
+             SELECT thread_id, tool_name, cmd, cwd, called_at, call_record_index
+             FROM codex_tool_executions
+             {codex_window}
            ) AS execution
            LEFT JOIN codex_threads AS thread
              ON thread.thread_id = execution.thread_id
            WHERE execution.tool_name IN ('exec_command', 'shell')
              AND execution.cmd IS NOT NULL
+             {codex_filter}
            ORDER BY execution.called_at DESC
-           LIMIT {per_source_limit}
+           {codex_limit}
          ),
          recent_commands AS MATERIALIZED (
            SELECT * FROM claude_commands
@@ -992,7 +1031,7 @@ fn section_activity(engine: &mut UnifiedEngine, terms: &[String], limit: i64) ->
            SELECT * FROM codex_commands
          )
          SELECT 'agent_command' AS kind, source, source AS text, actor, agent_role, \
-                tool_name, command, cwd, timestamp, {score} AS score \
+                tool_name, command, cwd, timestamp, thread_id, call_record_index, {score} AS score \
          FROM recent_commands \
          WHERE {matches} \
          ORDER BY score DESC, coalesce(timestamp, '') DESC, source_order DESC \
@@ -1000,7 +1039,6 @@ fn section_activity(engine: &mut UnifiedEngine, terms: &[String], limit: i64) ->
         score = score_expr(command_expr, terms),
         matches = match_expr(command_expr, terms),
         per_source_limit = RECENT_AGENT_COMMANDS_PER_SOURCE,
-        codex_scan_limit = RECENT_CODEX_COMMAND_SCAN_LIMIT,
     );
     match engine.query(&agent_sql) {
         Ok(r) => rows.extend(r),
