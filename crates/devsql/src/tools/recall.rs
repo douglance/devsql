@@ -67,7 +67,7 @@ const RECENT_CODEX_MESSAGES: i64 = 50_000;
 pub(crate) fn score_expr(expr: &str, terms: &[String]) -> String {
     let parts: Vec<String> = terms
         .iter()
-        .map(|t| format!("({expr} LIKE '%{t}%')"))
+        .map(|t| format!("({expr} LIKE '%{}%' ESCAPE '\\')", escape_like(t)))
         .collect();
     format!("({})", parts.join(" + "))
 }
@@ -76,9 +76,47 @@ pub(crate) fn score_expr(expr: &str, terms: &[String]) -> String {
 pub(crate) fn match_expr(expr: &str, terms: &[String]) -> String {
     let parts: Vec<String> = terms
         .iter()
-        .map(|t| format!("({expr} LIKE '%{t}%')"))
+        .map(|t| format!("({expr} LIKE '%{}%' ESCAPE '\\')", escape_like(t)))
         .collect();
     format!("({})", parts.join(" OR "))
+}
+
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+#[cfg(test)]
+mod literal_search_tests {
+    use super::{match_expr, score_expr};
+    use rusqlite::Connection;
+
+    #[test]
+    fn search_predicate_and_score_treat_wildcards_as_literal_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (term, matches, nonmatch) in [
+            ("active_key", "active_key", "activeXkey"),
+            ("20%", "20%", "2000"),
+            (r"path\file", r"path\file", "pathfile"),
+            ("isn''t", "isn't", "isnt"),
+        ] {
+            let terms = vec![term.to_string()];
+            let sql = format!(
+                "SELECT {}, {} FROM (SELECT ?1 AS value)",
+                match_expr("value", &terms),
+                score_expr("value", &terms)
+            );
+            let check = |value: &str| {
+                conn.query_row(&sql, [value], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+            };
+            assert_eq!(check(matches), (1, 1), "{term}");
+            assert_eq!(check(nonmatch), (0, 0), "{term}");
+        }
+    }
 }
 
 /// Return a bounded excerpt around the first literal search term. Redact the

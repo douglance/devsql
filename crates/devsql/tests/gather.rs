@@ -620,7 +620,9 @@ fn gather_searches_tool_outputs_only_when_requested_and_redacts_them() {
     let records = [
         serde_json::json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"output-thread","cwd":"/repo"}}),
         serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"output-call","arguments":"{\"cmd\":\"run tests\"}"}}),
-        serde_json::json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"output-call","output":[{"type":"input_text","text":"failure outputneedle password=hunter2"},{"password":"secret words"}]}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"output-call","output":[{"type":"input_text","text":"failure output_needle password=hunter2"},{"password":"secret words"}]}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"wildcard-call","arguments":"{}"}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"wildcard-call","output":"failure outputXneedle"}}),
     ];
     write(
         &codex.path().join("sessions/rollout-output.jsonl"),
@@ -637,7 +639,7 @@ fn gather_searches_tool_outputs_only_when_requested_and_redacts_them() {
             .env("DEVSQL_CACHE_DIR", codex.path().join("cache"))
             .args([
                 "gather",
-                "outputneedle",
+                "output_needle",
                 "--data-dir",
                 claude.path().to_str().unwrap(),
                 "--repo",
@@ -655,11 +657,14 @@ fn gather_searches_tool_outputs_only_when_requested_and_redacts_them() {
             .stdout
             .clone();
         let result: Value = serde_json::from_slice(&output).unwrap();
-        let found = result["activity"]["rows"]
+        let output_rows: Vec<_> = result["activity"]["rows"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|row| row["kind"] == "tool_output");
+            .filter(|row| row["kind"] == "tool_output")
+            .collect();
+        assert_eq!(output_rows.len(), usize::from(enabled), "{result}");
+        let found = output_rows.first().copied();
         assert_eq!(found.is_some(), enabled, "{result}");
         if let Some(row) = found {
             assert_eq!(row["thread_id"], "output-thread");
@@ -667,7 +672,7 @@ fn gather_searches_tool_outputs_only_when_requested_and_redacts_them() {
             assert_eq!(row["call_record_index"], 1);
             assert_eq!(row["output_record_index"], 2);
             let excerpt = row["excerpt"].as_str().unwrap();
-            assert!(excerpt.contains("outputneedle"));
+            assert!(excerpt.contains("output_needle"));
             assert!(!excerpt.contains("hunter2"));
             assert!(!excerpt.contains("secret words"));
             assert!(excerpt.chars().count() <= 200);
