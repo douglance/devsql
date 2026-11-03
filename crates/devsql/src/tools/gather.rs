@@ -12,7 +12,7 @@ use rusqlite::{params_from_iter, Connection};
 use serde_json::{json, Value};
 
 use super::engine_from_options;
-use super::recall::{match_expr, score_expr};
+use super::recall::{match_expr, matched_excerpt, score_expr};
 use super::{legacy_context, read_only_mcp, typed_from_result};
 use crate::UnifiedEngine;
 
@@ -641,7 +641,7 @@ fn prior_work_codex(
          ),
          ranked AS (
            SELECT 'codex_thread' AS kind,
-                  substr(replace(message.text, char(10), ' '), 1, 200) AS text,
+                  message.text AS text,
                   substr(COALESCE(message.timestamp, thread.last_event_at), 1, 10) AS date,
                   {score} AS score,
                   ROW_NUMBER() OVER (
@@ -666,7 +666,11 @@ fn prior_work_codex(
         .query(&codex_sql)
         .map_err(|error| format!("codex threads query failed: {error}"))?;
     for row in &mut rows {
-        redact_row_field(row, "text");
+        if let Some(value) = row.get_mut("text") {
+            if let Some(text) = value.as_str() {
+                *value = Value::String(matched_excerpt(text, terms));
+            }
+        }
     }
     Ok(rows)
 }

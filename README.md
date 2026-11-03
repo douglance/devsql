@@ -441,7 +441,7 @@ devsql gather "auth token refresh"
 devsql gather "auth token refresh" -r /path/to/repo --budget 4000
 ```
 
-`gather` returns six independently computed sections: prior work, repository state, code search, symbols, excerpts, and recent activity. If one section fails, the remaining sections are still returned and the failed section includes a note.
+`gather` returns six independently computed sections: prior work, repository state, code search, symbols, excerpts, and recent activity. If one section fails, the remaining sections are still returned and the failed section includes a note. Codex prior-work excerpts in `gather` and `recall` show up to 200 characters around the first literal matching term after redaction.
 
 ### File context and impact
 ```bash

@@ -78,10 +78,31 @@ pub(crate) fn match_expr(expr: &str, terms: &[String]) -> String {
     format!("({})", parts.join(" OR "))
 }
 
+/// Return a bounded excerpt around the first literal search term. Redact the
+/// complete message first so a slice cannot expose part of a recognized secret.
+pub(crate) fn matched_excerpt(text: &str, terms: &[String]) -> String {
+    let text = crate::redaction::redact_sensitive_text(text).replace('\n', " ");
+    let folded = text.to_ascii_lowercase();
+    let position = terms
+        .iter()
+        .filter_map(|term| {
+            let term = term.replace("''", "'").to_ascii_lowercase();
+            folded.find(&term)
+        })
+        .min()
+        .unwrap_or(0);
+    let start = text[..position].chars().count().saturating_sub(70);
+    text.chars().skip(start).take(200).collect()
+}
+
 #[async_trait::async_trait]
 impl CommandHandler for RecallHandler {
     async fn run(&self, ctx: CommandContext) -> CommandResult {
-        let flag = ctx.options.get("query").and_then(|v| v.as_str()).map(String::from);
+        let flag = ctx
+            .options
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let query = match super::search_terms(&ctx.args, "query").or(flag) {
             Some(q) => q,
             None => {
@@ -190,7 +211,7 @@ impl CommandHandler for RecallHandler {
                       substr(COALESCE(message.timestamp, thread.last_event_at), 1, 10) AS date,
                       thread.cwd,
                       message.role,
-                      substr(replace(message.text, char(10), ' '), 1, 200) AS excerpt,
+                      message.text AS excerpt,
                       thread.state,
                       {score} AS score,
                       ROW_NUMBER() OVER (
@@ -218,7 +239,7 @@ impl CommandHandler for RecallHandler {
         for thread in &mut codex_threads {
             if let Some(excerpt) = thread.get_mut("excerpt") {
                 if let Some(text) = excerpt.as_str() {
-                    *excerpt = Value::String(crate::redaction::redact_sensitive_text(text));
+                    *excerpt = Value::String(matched_excerpt(text, &terms));
                 }
             }
         }

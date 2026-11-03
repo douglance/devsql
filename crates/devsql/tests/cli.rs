@@ -341,6 +341,61 @@ fn recall_returns_ranked_redacted_codex_threads() {
 }
 
 #[test]
+fn recall_and_gather_show_late_matches_without_leaking_secrets() {
+    let claude = TempDir::new().expect("claude");
+    let codex = TempDir::new().expect("codex");
+    let repo = TempDir::new().expect("repo");
+    git2::Repository::init(repo.path()).expect("init repo");
+    let message = format!(
+        "{} Authorization: Bearer supersecret123 {} NeedlePoint useful evidence",
+        "é".repeat(300),
+        "x".repeat(10)
+    );
+    let meta = serde_json::json!({"type":"session_meta", "payload":{"id":"late-match"}});
+    let item = serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":message}]}});
+    write(
+        &codex.path().join("sessions/rollout-late.jsonl"),
+        &format!("{meta}\n{item}\n"),
+    );
+    for command in ["recall", "gather"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("CODEX_HOME", codex.path())
+            .args([
+                command,
+                "needlepoint",
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--data-dir",
+                claude.path().to_str().unwrap(),
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let parsed: Value = serde_json::from_slice(&output).expect("valid json");
+        let text = if command == "recall" {
+            &parsed["codex_threads"][0]["excerpt"]
+        } else {
+            &parsed["prior_work"]["rows"][0]["text"]
+        };
+        let excerpt = text.as_str().expect("excerpt");
+        assert!(
+            excerpt.contains("NeedlePoint useful evidence"),
+            "{command}: {excerpt}"
+        );
+        assert!(!excerpt.contains("supersecret123"));
+        assert!(
+            excerpt.contains("Bearer <redacted>"),
+            "{command}: {excerpt}"
+        );
+        assert!(excerpt.chars().count() <= 200);
+    }
+}
+
+#[test]
 fn recall_joins_unquoted_words_into_one_query() {
     let data = create_claude_data_dir();
     let codex_home = TempDir::new().expect("codex");
