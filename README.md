@@ -425,6 +425,28 @@ SELECT COUNT(*) AS responses, COUNT(input_tokens) AS responses_with_input,
 FROM codex_token_usage WHERE thread_id = '<thread-id>';
 ```
 
+To inspect individual recorded turns in one thread and the budget implied by a
+100x reduction, group by the recorded turn ID:
+
+```sql
+SELECT turn_id, COUNT(*) AS responses,
+       COUNT(input_tokens) AS responses_with_input,
+       COUNT(total_tokens) AS responses_with_total,
+       SUM(total_tokens) AS total_tokens,
+       SUM(total_tokens) / 100.0 AS hundredfold_budget,
+       MIN(input_tokens) AS smallest_observed_response_input
+FROM codex_token_usage
+WHERE thread_id = '<thread-id>' AND turn_id IS NOT NULL
+GROUP BY turn_id
+ORDER BY MIN(record_index);
+```
+
+The smallest observed response is not a lower bound for a different run. If it
+already exceeds the hundredfold budget, repeating any of those observed
+responses cannot meet that budget; a comparison needs a different execution
+and an independent check that it accomplishes the same task. This query excludes
+records without turn IDs and does not attribute descendant threads to a turn.
+
 For a task with linked subagents, include the parent and all indexed descendants:
 
 ```sql
