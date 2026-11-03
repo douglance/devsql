@@ -151,6 +151,7 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
         "{gather}"
     );
     assert!(gather.to_string().contains("all_codex_tools"), "{gather}");
+    assert!(gather.to_string().contains("all_codex_outputs"), "{gather}");
 
     send(
         &mut stdin,

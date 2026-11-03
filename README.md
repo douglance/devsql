@@ -494,6 +494,13 @@ extend the shell-command search.
 A match in a script is evidence of submitted script text, not proof that a
 nested command ran; inspect the recorded output for its outcome.
 
+`--all-codex-outputs true` also searches indexed Codex tool outputs across
+history. Matching activity rows contain a redacted excerpt and the thread,
+call, and output record identifiers for a targeted follow-up. This scan can
+be slow, searches the indexed text representation (including JSON escapes),
+and remains subject to result and budget limits; an absent row does not prove
+an output did not exist.
+
 ### File context and impact
 ```bash
 devsql context src/engine.rs

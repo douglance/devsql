@@ -611,3 +611,66 @@ fn gather_can_search_old_codex_tool_scripts_without_claiming_execution() {
         }
     }
 }
+
+#[test]
+fn gather_searches_tool_outputs_only_when_requested_and_redacts_them() {
+    let claude = TempDir::new().unwrap();
+    let repo = create_empty_git_repo();
+    let codex = TempDir::new().unwrap();
+    let records = [
+        serde_json::json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"output-thread","cwd":"/repo"}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"output-call","arguments":"{\"cmd\":\"run tests\"}"}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"output-call","output":[{"type":"input_text","text":"failure outputneedle password=hunter2"},{"password":"secret words"}]}}),
+    ];
+    write(
+        &codex.path().join("sessions/rollout-output.jsonl"),
+        &(records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"),
+    );
+    for enabled in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("CODEX_HOME", codex.path())
+            .env("DEVSQL_CACHE_DIR", codex.path().join("cache"))
+            .args([
+                "gather",
+                "outputneedle",
+                "--data-dir",
+                claude.path().to_str().unwrap(),
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--all-codex-outputs",
+                if enabled { "true" } else { "false" },
+                "--budget",
+                "100000",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        let found = result["activity"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "tool_output");
+        assert_eq!(found.is_some(), enabled, "{result}");
+        if let Some(row) = found {
+            assert_eq!(row["thread_id"], "output-thread");
+            assert_eq!(row["call_id"], "output-call");
+            assert_eq!(row["call_record_index"], 1);
+            assert_eq!(row["output_record_index"], 2);
+            let excerpt = row["excerpt"].as_str().unwrap();
+            assert!(excerpt.contains("outputneedle"));
+            assert!(!excerpt.contains("hunter2"));
+            assert!(!excerpt.contains("secret words"));
+            assert!(excerpt.chars().count() <= 200);
+        }
+    }
+}

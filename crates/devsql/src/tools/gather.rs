@@ -51,6 +51,9 @@ struct GatherOptions {
     /// Search all indexed non-shell Codex tool calls (can be slow)
     #[serde(default)]
     all_codex_tools: bool,
+    /// Search indexed Codex tool output text (can be slow)
+    #[serde(default)]
+    all_codex_outputs: bool,
 }
 
 /// Rows fetched per section before budget trimming.
@@ -171,6 +174,11 @@ impl CommandHandler for GatherHandler {
             .get("all_codex_tools")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let full_codex_outputs = ctx
+            .options
+            .get("all_codex_outputs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (render_engine, repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
             Err(e) => return e.into(),
@@ -194,6 +202,7 @@ impl CommandHandler for GatherHandler {
                         full_codex,
                         full_codex_commands,
                         full_codex_tools,
+                        full_codex_outputs,
                     )
                 }),
                 scope.spawn(|| vec![("repo_state", section_repo_state(&repo_path))]),
@@ -448,6 +457,7 @@ fn sections_prior_work_and_activity(
     full_codex: bool,
     full_codex_commands: bool,
     full_codex_tools: bool,
+    full_codex_outputs: bool,
 ) -> Vec<(&'static str, SectionResult)> {
     if terms.is_empty() {
         return vec![
@@ -498,6 +508,7 @@ fn sections_prior_work_and_activity(
                 limit,
                 full_codex_commands,
                 full_codex_tools,
+                full_codex_outputs,
             )
         });
 
@@ -921,6 +932,7 @@ fn section_activity(
     limit: i64,
     full_codex_commands: bool,
     full_codex_tools: bool,
+    full_codex_outputs: bool,
 ) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
@@ -999,6 +1011,35 @@ fn section_activity(
             rows.extend(codex_rows);
         }
         Err(e) => return SectionResult::err(format!("codex_tool_calls query failed: {e}")),
+    }
+
+    if full_codex_outputs {
+        let sql = format!(
+            "SELECT 'tool_output' AS kind, tool_name AS text, output_text AS excerpt, \
+                    thread_id, call_id, call_record_index, output_record_index, completed_at AS timestamp \
+             FROM codex_tool_executions WHERE output_text IS NOT NULL AND {matches} \
+             ORDER BY {score} DESC, completed_at DESC, output_record_index DESC LIMIT {limit}",
+            matches = match_expr("output_text", terms),
+            score = score_expr("output_text", terms),
+        );
+        match engine.query(&sql) {
+            Ok(mut output_rows) => {
+                for row in &mut output_rows {
+                    if let Some(excerpt) = row.get_mut("excerpt") {
+                        if let Some(raw) = excerpt.as_str() {
+                            let decoded = serde_json::from_str::<Value>(raw)
+                                .ok()
+                                .map(|value| output_strings(&value))
+                                .filter(|text| !text.is_empty())
+                                .unwrap_or_else(|| raw.to_string());
+                            *excerpt = Value::String(matched_excerpt(&decoded, terms));
+                        }
+                    }
+                }
+                rows.extend(output_rows);
+            }
+            Err(e) => return SectionResult::err(format!("codex_tool_outputs query failed: {e}")),
+        }
     }
 
     let command_expr = "(command || ' ' || coalesce(cwd, ''))";
@@ -1096,6 +1137,41 @@ fn section_activity(
     }
 
     SectionResult::ok(rows)
+}
+
+fn output_strings(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(output_strings)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                let normalized = key.to_ascii_lowercase().replace(['_', '-'], "");
+                let text = if matches!(
+                    normalized.as_str(),
+                    "authorization"
+                        | "apikey"
+                        | "accesstoken"
+                        | "refreshtoken"
+                        | "secret"
+                        | "password"
+                        | "cookie"
+                ) {
+                    "<redacted>".to_string()
+                } else {
+                    output_strings(value)
+                };
+                format!("{key}: {text}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
