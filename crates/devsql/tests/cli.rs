@@ -83,6 +83,57 @@ fn query_reports_per_response_token_usage_without_double_counting_events() {
 }
 
 #[test]
+fn recursive_usage_query_includes_linked_descendants_and_reports_empty_threads() {
+    let codex = TempDir::new().expect("codex");
+    for (id, parent, total) in [
+        ("root", None, Some(100)),
+        ("child", Some("root"), Some(40)),
+        ("grandchild", Some("child"), Some(10)),
+        ("empty", Some("root"), None),
+        ("unrelated", None, Some(900)),
+    ] {
+        let meta = serde_json::json!({"type": "session_meta", "payload": {"id": id, "parent_thread_id": parent}});
+        let mut journal = format!("{meta}\n");
+        if let Some(total) = total {
+            journal.push_str(&format!("{}\n", serde_json::json!({"type": "token_usage_record", "payload": {"usage": {"total_tokens": total}}})));
+        }
+        write(
+            &codex.path().join(format!("sessions/rollout-{id}.jsonl")),
+            &journal,
+        );
+    }
+    let readme = include_str!("../../../README.md");
+    let query = readme
+        .split("For a task with linked subagents, include the parent and all indexed descendants:")
+        .nth(1)
+        .expect("query section")
+        .split("```sql\n")
+        .nth(1)
+        .expect("SQL block")
+        .split("```")
+        .next()
+        .expect("SQL end")
+        .replace("<thread-id>", "root");
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
+        .args([query.as_str(), "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(
+        rows,
+        serde_json::json!([{
+            "recorded_threads": 4, "recorded_responses": 3, "responses_with_total": 3,
+            "input_tokens": null, "cached_input_tokens": null, "output_tokens": null,
+            "total_tokens": 150, "threads_without_usage": 1
+        }])
+    );
+}
+
+#[test]
 fn query_reports_latest_valid_legacy_cumulative_usage() {
     let codex = TempDir::new().expect("codex");
     write(&codex.path().join("sessions/rollout-legacy-usage.jsonl"), concat!(

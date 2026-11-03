@@ -408,6 +408,31 @@ SELECT COUNT(*) AS responses, COUNT(input_tokens) AS responses_with_input,
 FROM codex_token_usage WHERE thread_id = '<thread-id>';
 ```
 
+For a task with linked subagents, include the parent and all indexed descendants:
+
+```sql
+WITH RECURSIVE thread_tree(thread_id) AS (
+  SELECT thread_id FROM codex_threads WHERE thread_id = '<thread-id>'
+  UNION
+  SELECT child.thread_id FROM codex_threads AS child
+  JOIN thread_tree AS parent ON child.parent_thread_id = parent.thread_id
+)
+SELECT COUNT(DISTINCT tree.thread_id) AS recorded_threads,
+       COUNT(usage.record_index) AS recorded_responses,
+       COUNT(usage.total_tokens) AS responses_with_total,
+       SUM(usage.input_tokens) AS input_tokens,
+       SUM(usage.cached_input_tokens) AS cached_input_tokens,
+       SUM(usage.output_tokens) AS output_tokens,
+       SUM(usage.total_tokens) AS total_tokens,
+       (SELECT COUNT(*) FROM thread_tree AS t WHERE NOT EXISTS
+         (SELECT 1 FROM codex_token_usage AS u WHERE u.thread_id = t.thread_id))
+         AS threads_without_usage
+FROM thread_tree AS tree
+LEFT JOIN codex_token_usage AS usage ON usage.thread_id = tree.thread_id;
+```
+
+This covers only indexed, linked journals. Missing journals, unlinked or external workers, and missing response records are not detectable from these counts; a complete comparison must account for them separately.
+
 The table includes `token_usage_record` entries only; older journals or incomplete runs can lack them. For those, `codex_token_totals` exposes the latest cumulative `token_count` event with a total, if present; it can itself be incomplete and may use different accounting. In some journals, cumulative snapshots omit recorded compaction-response usage, so they can undercount the complete task cost. Do not sum snapshots with per-response records. Missing counters are NULL, not zero, and SQL sums skip NULLs, so check the counts before treating a sum as complete. Reasoning output is part of output, and cached input is part of input: do not add them a second time. Both tables are local and are not included in shared snapshots.
 
 ### Gather a context bundle
