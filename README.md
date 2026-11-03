@@ -4,6 +4,8 @@ Code Mode for observing AI coding history, shell history, macOS Unified Logs, Gi
 
 DevSQL loads data from Claude Code, Codex CLI, shell history, macOS Unified Logs, Git and your source tree into SQLite so you can join, filter, and aggregate across all of them with standard SQL. Most providers load into memory on demand. Unified Logs stream through a bounded virtual table rather than being materialized. Codex rollout journals use a rebuildable incremental cache so compressed conversation history does not need to be reparsed for every query.
 
+The Codex cache path includes its schema version, leaving the unversioned cache used by older releases intact. A new schema rebuilds its index and uses additional disk space; older indexes are not automatically removed.
+
 ## Primary agent interface: Code Mode
 
 Run `devsql --mcp` and connect it as an stdio MCP server. Agents see five stable lifecycle tools instead of a wide direct-tool surface:

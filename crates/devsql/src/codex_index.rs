@@ -36,7 +36,8 @@ pub(crate) struct CodexIndex {
 
 impl CodexIndex {
     pub(crate) fn open(codex_home: &Path) -> Result<Self> {
-        let cache_path = crate::cache::cache_path("codex-index", codex_home);
+        let cache_path =
+            crate::cache::cache_path(&format!("codex-index/v{SCHEMA_VERSION}"), codex_home);
         Self::open_at(codex_home, &cache_path)
     }
 
@@ -2240,6 +2241,39 @@ mod tests {
         assert_eq!(unchanged.unchanged_journals, 1);
         assert_eq!(unchanged.parsed_records, 0);
         assert_eq!(index.connection().total_changes(), changes_before);
+    }
+
+    #[test]
+    fn opening_current_index_preserves_legacy_cache() {
+        let temp = tempfile::tempdir().expect("temp");
+        let codex_home = temp.path().join("codex");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        let legacy_path = crate::cache::cache_path("codex-index", &codex_home);
+        fs::create_dir_all(legacy_path.parent().expect("parent")).expect("cache dir");
+        let legacy = Connection::open(&legacy_path).expect("legacy cache");
+        legacy
+            .pragma_update(None, "user_version", 5)
+            .expect("version");
+        legacy
+            .execute("CREATE TABLE marker (value TEXT)", [])
+            .expect("marker");
+        drop(legacy);
+
+        let current = CodexIndex::open(&codex_home).expect("current cache");
+        assert_ne!(current.cache_path(), legacy_path);
+        let legacy = Connection::open(&legacy_path).expect("legacy cache remains readable");
+        let version: i64 = legacy
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 5);
+        let markers: i64 = legacy
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'marker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("marker");
+        assert_eq!(markers, 1);
     }
 
     #[test]
