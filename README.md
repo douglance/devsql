@@ -383,6 +383,15 @@ devsql recall "vision simulator mute"
 devsql recall "auth token refresh" -r /path/to/repo
 ```
 
+A Codex result includes `thread_id` and `record_index`, identifying the matching
+message for a targeted follow-up query. Explicit SQL returns stored text without
+`recall` or `gather` redaction:
+
+```sql
+SELECT role, text, timestamp FROM codex_messages
+WHERE thread_id = '<thread-id>' AND record_index = <record-index>;
+```
+
 ### Query Codex conversation history
 ```sql
 SELECT

@@ -381,6 +381,25 @@ fn recall_and_gather_show_late_matches_without_leaking_secrets() {
         } else {
             &parsed["prior_work"]["rows"][0]["text"]
         };
+        let row = if command == "recall" {
+            &parsed["codex_threads"][0]
+        } else {
+            &parsed["prior_work"]["rows"][0]
+        };
+        assert_eq!(row["thread_id"], "late-match");
+        let record = row["record_index"].as_i64().expect("message record index");
+        let query = format!("SELECT text FROM codex_messages WHERE thread_id = 'late-match' AND record_index = {record}");
+        let full = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("CODEX_HOME", codex.path())
+            .args([query.as_str(), "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let full: Value = serde_json::from_slice(&full).expect("valid json");
+        assert_eq!(full.as_array().unwrap().len(), 1);
+        assert_eq!(full[0]["text"], message);
         let excerpt = text.as_str().expect("excerpt");
         assert!(
             excerpt.contains("NeedlePoint useful evidence"),

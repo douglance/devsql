@@ -633,7 +633,7 @@ fn prior_work_codex(
     let codex_score = score_expr("message.text", terms);
     let codex_sql = format!(
         "WITH recent_messages AS MATERIALIZED (
-           SELECT thread_id, timestamp, text
+           SELECT thread_id, record_index, timestamp, text
            FROM codex_messages
            WHERE is_canonical = 1
            ORDER BY timestamp DESC
@@ -641,7 +641,7 @@ fn prior_work_codex(
          ),
          ranked AS (
            SELECT 'codex_thread' AS kind,
-                  message.text AS text,
+                  message.thread_id, message.record_index, message.text AS text,
                   substr(COALESCE(message.timestamp, thread.last_event_at), 1, 10) AS date,
                   {score} AS score,
                   ROW_NUMBER() OVER (
@@ -653,7 +653,7 @@ fn prior_work_codex(
              ON thread.thread_id = message.thread_id
            WHERE {matches}
          )
-         SELECT kind, text, date, score
+         SELECT kind, thread_id, record_index, text, date, score
          FROM ranked
          WHERE rank = 1
          ORDER BY score DESC, date DESC
