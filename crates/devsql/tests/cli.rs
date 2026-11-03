@@ -415,6 +415,61 @@ fn recall_and_gather_show_late_matches_without_leaking_secrets() {
 }
 
 #[test]
+fn recall_and_gather_can_search_codex_beyond_recent_window() {
+    let claude = TempDir::new().expect("claude");
+    let codex = TempDir::new().expect("codex");
+    let repo = TempDir::new().expect("repo");
+    git2::Repository::init(repo.path()).expect("init repo");
+    let mut journal = String::from(concat!(
+        "{\"timestamp\":\"2020-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"old-thread\"}}\n",
+        "{\"timestamp\":\"2020-01-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"ancientuniquemarker evidence\"}]}}\n"
+    ));
+    let filler = "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"unrelated\"}]}}\n";
+    for _ in 0..50_000 {
+        journal.push_str(filler);
+    }
+    write(
+        &codex.path().join("sessions/rollout-window.jsonl"),
+        &journal,
+    );
+    for command in ["recall", "gather"] {
+        for full in [false, true] {
+            let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+                .env("CODEX_HOME", codex.path())
+                .args([
+                    command,
+                    "ancientuniquemarker",
+                    "--repo",
+                    repo.path().to_str().unwrap(),
+                    "--data-dir",
+                    claude.path().to_str().unwrap(),
+                    "--all-codex-messages",
+                    if full { "true" } else { "false" },
+                    "--format",
+                    "json",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let parsed: Value = serde_json::from_slice(&output).expect("valid json");
+            let rows = if command == "recall" {
+                &parsed["codex_threads"]
+            } else {
+                &parsed["prior_work"]["rows"]
+            };
+            let found = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["thread_id"] == "old-thread");
+            assert_eq!(found, full, "{command}: full={full}");
+        }
+    }
+}
+
+#[test]
 fn recall_joins_unquoted_words_into_one_query() {
     let data = create_claude_data_dir();
     let codex_home = TempDir::new().expect("codex");

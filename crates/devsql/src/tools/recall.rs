@@ -32,6 +32,9 @@ struct RecallOptions {
     /// Maximum number of results per source
     #[incurs(alias = "n", default = 8)]
     limit: i64,
+    /// Search all indexed canonical Codex messages (can be slow)
+    #[serde(default)]
+    all_codex_messages: bool,
     /// Terms, when not given as arguments
     query: Option<String>,
 }
@@ -198,13 +201,23 @@ impl CommandHandler for RecallHandler {
         };
 
         let codex_score = score_expr("message.text", &terms);
+        let full_codex = ctx
+            .options
+            .get("all_codex_messages")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let materialization = if full_codex { "" } else { "MATERIALIZED" };
+        let window = if full_codex {
+            String::new()
+        } else {
+            format!("ORDER BY timestamp DESC LIMIT {RECENT_CODEX_MESSAGES}")
+        };
         let codex_sql = format!(
-            "WITH recent_messages AS MATERIALIZED (
+            "WITH recent_messages AS {materialization} (
                SELECT thread_id, record_index, timestamp, role, text
                FROM codex_messages
                WHERE is_canonical = 1
-               ORDER BY timestamp DESC
-               LIMIT {recent_limit}
+               {window}
              ),
              ranked AS (
                SELECT message.thread_id, message.record_index,
@@ -230,7 +243,6 @@ impl CommandHandler for RecallHandler {
              LIMIT {limit}",
             score = codex_score,
             matches = match_expr("message.text", &terms),
-            recent_limit = RECENT_CODEX_MESSAGES,
         );
         let mut codex_threads = match engine.query(&codex_sql) {
             Ok(rows) => rows,

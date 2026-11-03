@@ -381,7 +381,13 @@ devsql diff main~5 HEAD
 ```bash
 devsql recall "vision simulator mute"
 devsql recall "auth token refresh" -r /path/to/repo
+devsql recall "older evidence" --all-codex-messages true
 ```
+
+By default, `recall` and `gather` search the latest 50,000 canonical Codex
+messages. `--all-codex-messages true` searches all indexed canonical Codex
+messages for prior work and may take substantially longer; other source and
+result limits still apply.
 
 A Codex result includes `thread_id` and `record_index`, identifying the matching
 message for a targeted follow-up query. Explicit SQL returns stored text without

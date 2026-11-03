@@ -42,6 +42,9 @@ struct GatherOptions {
     /// section is dropped (never mid-row) until the bundle fits
     #[incurs(default = 8000)]
     budget: i64,
+    /// Search all indexed canonical Codex messages for prior work (can be slow)
+    #[serde(default)]
+    all_codex_messages: bool,
 }
 
 /// Rows fetched per section before budget trimming.
@@ -147,6 +150,11 @@ impl CommandHandler for GatherHandler {
             .map(|t| t.replace('\'', "''"))
             .collect();
 
+        let full_codex = ctx
+            .options
+            .get("all_codex_messages")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (render_engine, repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
             Err(e) => return e.into(),
@@ -162,7 +170,13 @@ impl CommandHandler for GatherHandler {
             });
             let handles = [
                 scope.spawn(|| {
-                    sections_prior_work_and_activity(&claude_dir, &repo_path, &terms, SECTION_LIMIT)
+                    sections_prior_work_and_activity(
+                        &claude_dir,
+                        &repo_path,
+                        &terms,
+                        SECTION_LIMIT,
+                        full_codex,
+                    )
                 }),
                 scope.spawn(|| vec![("repo_state", section_repo_state(&repo_path))]),
                 scope.spawn(|| sections_code(&claude_dir, &repo_path, &terms, SECTION_LIMIT)),
@@ -413,6 +427,7 @@ fn sections_prior_work_and_activity(
     repo_path: &Path,
     terms: &[String],
     limit: i64,
+    full_codex: bool,
 ) -> Vec<(&'static str, SectionResult)> {
     if terms.is_empty() {
         return vec![
@@ -427,8 +442,16 @@ fn sections_prior_work_and_activity(
         let non_codex = scope.spawn(move || {
             prior_work_non_codex(claude_dir, repo_path, terms, limit, claude_ready_tx)
         });
-        let codex = scope
-            .spawn(move || prior_work_codex(claude_dir, repo_path, terms, limit, codex_ready_tx));
+        let codex = scope.spawn(move || {
+            prior_work_codex(
+                claude_dir,
+                repo_path,
+                terms,
+                limit,
+                codex_ready_tx,
+                full_codex,
+            )
+        });
         let activity = scope.spawn(move || {
             let claude_cache_ready = claude_ready_rx.recv().is_ok();
             let codex_cache_ready = codex_ready_rx.recv().is_ok();
@@ -622,6 +645,7 @@ fn prior_work_codex(
     terms: &[String],
     limit: i64,
     ready: std::sync::mpsc::SyncSender<()>,
+    full_codex: bool,
 ) -> std::result::Result<Vec<Value>, String> {
     let mut engine = UnifiedEngine::new(claude_dir.to_path_buf(), repo_path.to_path_buf())
         .map_err(|error| format!("engine init failed: {error}"))?;
@@ -631,13 +655,18 @@ fn prior_work_codex(
     let _ = ready.send(());
 
     let codex_score = score_expr("message.text", terms);
+    let materialization = if full_codex { "" } else { "MATERIALIZED" };
+    let window = if full_codex {
+        String::new()
+    } else {
+        format!("ORDER BY timestamp DESC LIMIT {RECENT_CODEX_SEARCH_LIMIT}")
+    };
     let codex_sql = format!(
-        "WITH recent_messages AS MATERIALIZED (
+        "WITH recent_messages AS {materialization} (
            SELECT thread_id, record_index, timestamp, text
            FROM codex_messages
            WHERE is_canonical = 1
-           ORDER BY timestamp DESC
-           LIMIT {recent_limit}
+           {window}
          ),
          ranked AS (
            SELECT 'codex_thread' AS kind,
@@ -660,7 +689,6 @@ fn prior_work_codex(
          LIMIT {limit}",
         score = codex_score,
         matches = match_expr("message.text", terms),
-        recent_limit = RECENT_CODEX_SEARCH_LIMIT,
     );
     let mut rows = engine
         .query(&codex_sql)
