@@ -70,6 +70,8 @@ const SECTION_ORDER: [&str; 6] = [
 struct SectionResult {
     rows: Vec<Value>,
     note: Option<String>,
+    /// Rows removed from this section solely to meet the requested budget.
+    omitted: usize,
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
@@ -86,13 +88,18 @@ struct GatherOutput {
 
 impl SectionResult {
     fn ok(rows: Vec<Value>) -> Self {
-        Self { rows, note: None }
+        Self {
+            rows,
+            note: None,
+            omitted: 0,
+        }
     }
 
     fn err(note: impl Into<String>) -> Self {
         Self {
             rows: Vec::new(),
             note: Some(note.into()),
+            omitted: 0,
         }
     }
 
@@ -100,6 +107,7 @@ impl SectionResult {
         json!({
             "rows": self.rows,
             "note": self.note,
+            "omitted": self.omitted,
         })
     }
 }
@@ -279,7 +287,9 @@ fn enforce_budget(
             return;
         };
         if let Some(section) = sections.get_mut(largest) {
-            section.rows.pop();
+            if section.rows.pop().is_some() {
+                section.omitted += 1;
+            }
         }
     }
 }
@@ -1030,9 +1040,21 @@ pub fn build() -> CommandDef {
 
 #[cfg(test)]
 mod tests {
-    use super::{largest_section, merge_prior_work_rows, SectionResult};
+    use super::{enforce_budget, largest_section, merge_prior_work_rows, SectionResult};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn budget_omission_count_tracks_each_removed_row() {
+        let mut sections = HashMap::new();
+        sections.insert(
+            "prior_work",
+            SectionResult::ok(vec![json!("a"), json!("b"), json!("c")]),
+        );
+        enforce_budget(&mut sections, &[], 0);
+        assert!(sections["prior_work"].rows.is_empty());
+        assert_eq!(sections["prior_work"].omitted, 3);
+    }
 
     #[test]
     fn trimming_takes_from_the_largest_section_first() {

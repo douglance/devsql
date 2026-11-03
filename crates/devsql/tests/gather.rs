@@ -299,6 +299,60 @@ fn gather_enforces_token_budget() {
     );
 }
 
+#[test]
+fn gather_reports_rows_removed_by_budget() {
+    let claude = create_claude_data_dir();
+    let repo = create_git_repo();
+    let codex_home = isolated_codex_home();
+    let run = |budget: &str| -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("CODEX_HOME", codex_home.path())
+            .args([
+                "gather",
+                TERM,
+                "--data-dir",
+                claude.path().to_str().unwrap(),
+                "-r",
+                repo.path().to_str().unwrap(),
+                "--format",
+                "json",
+                "--budget",
+                budget,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).expect("valid json")
+    };
+    let full = run("1000000");
+    let limited = run("350");
+    let mut total_omitted = 0;
+    for section in [
+        "prior_work",
+        "repo_state",
+        "code_search",
+        "symbols",
+        "excerpts",
+        "activity",
+    ] {
+        let before = full[section]["rows"].as_array().unwrap().len();
+        let after = limited[section]["rows"].as_array().unwrap().len();
+        assert_eq!(full[section]["omitted"].as_u64(), Some(0));
+        let omitted = limited[section]["omitted"]
+            .as_u64()
+            .expect("omission count") as usize;
+        assert_eq!(
+            before,
+            after + omitted,
+            "incorrect omission count for {section}"
+        );
+        total_omitted += omitted;
+    }
+    assert!(total_omitted > 0, "fixture must exercise budget trimming");
+}
+
 /// `--format json` still round-trips terms even with no matches.
 #[test]
 fn gather_empty_terms_still_returns_sections() {

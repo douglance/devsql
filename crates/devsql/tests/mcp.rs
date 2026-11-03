@@ -54,8 +54,10 @@ fn response_within(receiver: &Receiver<Value>, id: i64, timeout: Duration) -> Op
 
 #[test]
 fn exposes_code_mode_and_executes_a_devsql_query() {
+    let codex = TempDir::new().expect("isolated Codex home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_devsql"))
         .arg("--mcp")
+        .env("CODEX_HOME", codex.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -133,7 +135,17 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
         json!({"jsonrpc": "2.0", "id": 106, "method": "tools/call", "params": {"name": "codemode_search", "arguments": {"query": "shared"}}}),
     );
     let shared = response(&receiver, 106);
-    assert!(shared.to_string().contains("devsql.shared_query"), "{shared}");
+    assert!(
+        shared.to_string().contains("devsql.shared_query"),
+        "{shared}"
+    );
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 107, "method": "tools/call", "params": {"name": "codemode_search", "arguments": {"query": "gather"}}}),
+    );
+    let gather = response(&receiver, 107);
+    assert!(gather.to_string().contains("omitted"), "{gather}");
 
     send(
         &mut stdin,
@@ -180,6 +192,50 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
     assert!(
         executed.to_string().contains("value") && executed.to_string().contains('1'),
         "{executed}"
+    );
+
+    let repo_dir = TempDir::new().expect("repo directory");
+    let repo = git2::Repository::init(repo_dir.path()).expect("init repo");
+    let mut index = repo.index().expect("index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
+    repo.commit(Some("HEAD"), &sig, &sig, "test", &tree, &[])
+        .expect("commit");
+    let args =
+        json!({"terms": "test", "repo": repo_dir.path(), "data_dir": codex.path(), "budget": 0});
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 108, "method": "tools/call", "params": {
+            "name": "codemode_execute", "arguments": {"code": format!("return await devsql.gather({args})")}
+        }}),
+    );
+    let mut gathered = response(&receiver, 108);
+    let gather_id = gathered["result"]["structuredContent"]["id"]
+        .as_str()
+        .expect("execution id")
+        .to_string();
+    for id in 109..209 {
+        if gathered["result"]["structuredContent"]["status"] == "completed" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        send(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+                "name": "codemode_execution", "arguments": {"id": gather_id}
+            }}),
+        );
+        gathered = response(&receiver, id);
+    }
+    let execution = &gathered["result"]["structuredContent"];
+    assert_eq!(execution["status"], "completed", "{gathered}");
+    assert!(
+        execution["result"]["repo_state"]["omitted"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "{gathered}"
     );
 
     send(
