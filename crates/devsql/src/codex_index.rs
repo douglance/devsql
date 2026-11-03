@@ -771,6 +771,14 @@ fn parse_journal(
     Ok(ParsedJournal { progress, delta })
 }
 
+fn cached_execute(
+    tx: &Transaction<'_>,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<usize> {
+    tx.prepare_cached(sql)?.execute(params)
+}
+
 fn normalize_record(
     tx: &Transaction<'_>,
     thread_id: &str,
@@ -790,7 +798,8 @@ fn normalize_record(
         .or_else(|| payload.get("message")?.get("role")?.as_str());
     let call_id = payload.get("call_id").and_then(Value::as_str);
 
-    tx.execute(
+    cached_execute(
+        tx,
         "INSERT OR REPLACE INTO codex_events
          (thread_id, record_index, timestamp, record_type, payload_type, role, call_id, source_path)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -817,7 +826,8 @@ fn normalize_record(
     }
     if record_type == Some("token_usage_record") {
         let usage = payload.get("usage").unwrap_or(&Value::Null);
-        tx.execute(
+        cached_execute(
+            tx,
             "INSERT OR REPLACE INTO codex_token_usage
              (thread_id, record_index, timestamp, turn_id, response_id, input_tokens,
               cached_input_tokens, cache_write_input_tokens, output_tokens,
@@ -847,7 +857,7 @@ fn normalize_record(
             .and_then(|info| info.get("total_token_usage"))
             .filter(|usage| usage.get("total_tokens").and_then(Value::as_i64).is_some())
         {
-            tx.execute(
+            cached_execute(tx,
                 "INSERT OR REPLACE INTO codex_token_totals
                  (thread_id, record_index, timestamp, input_tokens, cached_input_tokens,
                   cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, source_path)
@@ -869,7 +879,7 @@ fn normalize_record(
         } else if message.canonical && message.role == "assistant" {
             delta.assistant_message_count += 1;
         }
-        tx.execute(
+        cached_execute(tx,
             "INSERT OR REPLACE INTO codex_messages
              (thread_id, record_index, timestamp, role, text, content_json, is_canonical, source_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -908,7 +918,8 @@ fn normalize_record(
     }
     if record_type == Some("compacted") {
         delta.compaction_count += 1;
-        tx.execute(
+        cached_execute(
+            tx,
             "INSERT OR REPLACE INTO codex_compactions
              (thread_id, record_index, timestamp, window_id, previous_window_id,
               first_window_id, window_number, summary_text, source_path)
@@ -1057,7 +1068,8 @@ fn normalize_tool_call(
         .get("workdir")
         .or_else(|| parsed_arguments.get("cwd"))
         .and_then(Value::as_str);
-    tx.execute(
+    cached_execute(
+        tx,
         "INSERT INTO codex_tool_execution_meta
          (thread_id, call_id, call_record_index, tool_name, arguments_json, cmd,
           called_at, cwd, source_path)
@@ -1108,7 +1120,8 @@ fn normalize_tool_output(
         .unwrap_or_else(|| serde_json::to_string(output).unwrap_or_default());
     let exit_code = extract_codex_host_exit_code(&output_text);
     let output_text = omit_inline_images(&output_text);
-    tx.execute(
+    cached_execute(
+        tx,
         "INSERT INTO codex_tool_execution_meta
          (thread_id, call_id, output_record_index, completed_at, exit_code, source_path)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1126,7 +1139,8 @@ fn normalize_tool_output(
             source_path
         ],
     )?;
-    tx.execute(
+    cached_execute(
+        tx,
         "INSERT INTO codex_tool_execution_outputs (thread_id, call_id, output_text)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(thread_id, call_id) DO UPDATE SET output_text = excluded.output_text",
