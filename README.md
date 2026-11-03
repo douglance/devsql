@@ -161,6 +161,7 @@ host, so large histories require sufficient disk space and time.
 | `codex_history` | - | Alias for `jhistory` |
 | `codex_threads` | `$CODEX_HOME/{sessions,archived_sessions}/**/rollout-*.jsonl[.zst]` | One row per Codex thread: lineage, agent identity, originator, cwd, Git branch, state, compression, journal path, timestamps, first user text, and aggregate counts |
 | `codex_events` | Same rollout journals | One row per newline-terminated journal record: thread ID, record index, timestamp, record type, payload type, role, call ID, and source path |
+| `codex_token_usage` | Same rollout journals | One row per recorded per-response usage event, including input, cached input, output, reasoning output, and total tokens |
 | `codex_messages` | Same rollout journals | Normalized user and assistant content, including canonical-message status and source provenance |
 | `codex_tool_executions` | Same rollout journals | Tool calls paired with outputs by thread and call ID |
 | `codex_tool_calls` | Same rollout journals | Backward-compatible tool-call view with source, session, agent, cwd, and timestamp provenance |
@@ -395,6 +396,18 @@ WHERE message.is_canonical = 1
   AND message.text LIKE '%auth callback%'
 ORDER BY message.timestamp DESC;
 ```
+
+### Measure recorded Codex task usage
+```sql
+SELECT COUNT(*) AS responses, COUNT(input_tokens) AS responses_with_input,
+       COUNT(cached_input_tokens) AS responses_with_cache,
+       COUNT(total_tokens) AS responses_with_total, SUM(input_tokens) AS input_tokens,
+       SUM(cached_input_tokens) AS cached_input_tokens,
+       SUM(output_tokens) AS output_tokens, SUM(total_tokens) AS total_tokens
+FROM codex_token_usage WHERE thread_id = '<thread-id>';
+```
+
+The table includes `token_usage_record` entries only; older journals or incomplete runs can lack them. Missing counters are NULL, not zero, and SQL sums skip NULLs, so check the counts before treating a sum as complete. Reasoning output is part of output, and cached input is part of input: do not add them a second time. This table is local and is not included in shared snapshots.
 
 ### Gather a context bundle
 ```bash

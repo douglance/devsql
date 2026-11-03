@@ -123,6 +123,7 @@ impl UnifiedEngine {
                 "codex_tool_calls" => self.load_codex_tool_calls()?,
                 "codex_threads"
                 | "codex_events"
+                | "codex_token_usage"
                 | "codex_messages"
                 | "codex_tool_executions"
                 | "codex_compactions"
@@ -525,6 +526,8 @@ impl UnifiedEngine {
               SELECT * FROM codex_index.codex_threads;
             CREATE TEMP VIEW codex_events AS
               SELECT * FROM codex_index.codex_events;
+            CREATE TEMP VIEW codex_token_usage AS
+              SELECT * FROM codex_index.codex_token_usage;
             CREATE TEMP VIEW codex_messages AS
               SELECT * FROM codex_index.codex_messages;
             CREATE TEMP VIEW codex_tool_executions AS
@@ -1900,6 +1903,7 @@ pub fn detect_tables(query: &str) -> TableRequirements {
         "codex_tool_calls",
         "codex_threads",
         "codex_events",
+        "codex_token_usage",
         "codex_messages",
         "codex_tool_executions",
         "codex_compactions",

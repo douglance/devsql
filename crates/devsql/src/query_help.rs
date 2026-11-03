@@ -65,6 +65,11 @@ pub const TABLES: &[TableInfo] = &[
         about: "raw Codex events",
     },
     TableInfo {
+        name: "codex_token_usage",
+        source: "Codex CLI",
+        about: "per-response usage records; absent in older journals",
+    },
+    TableInfo {
         name: "codex_tool_executions",
         source: "Codex CLI",
         about: "Codex commands with their output",

@@ -63,6 +63,26 @@ fn create_codex_data_dir() -> TempDir {
 }
 
 #[test]
+fn query_reports_per_response_token_usage_without_double_counting_events() {
+    let codex = TempDir::new().expect("codex");
+    write(&codex.path().join("sessions/rollout-usage.jsonl"), concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"usage-thread\"}}\n",
+        "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"turn-1\",\"response_id\":\"response-1\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":60,\"output_tokens\":9,\"reasoning_output_tokens\":3,\"total_tokens\":109}}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":109}}}}\n",
+        "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"turn-1\",\"response_id\":\"response-2\",\"usage\":{\"input_tokens\":50,\"cached_input_tokens\":20,\"output_tokens\":4,\"reasoning_output_tokens\":1,\"total_tokens\":54}}}\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
+        .args(["SELECT COUNT(*) AS responses, SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached, SUM(output_tokens) AS output, SUM(total_tokens) AS total, SUM(cache_write_input_tokens) AS cache_write FROM codex_token_usage WHERE thread_id = 'usage-thread'", "--format", "json"])
+        .assert().success().get_output().stdout.clone();
+    let rows: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(
+        rows,
+        serde_json::json!([{"responses": 2, "input": 150, "cached": 80, "output": 13, "total": 163, "cache_write": null}])
+    );
+}
+
+#[test]
 fn recall_surfaces_matching_fixture() {
     let data = create_claude_data_dir();
     let codex_home = TempDir::new().expect("codex");

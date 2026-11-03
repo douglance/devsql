@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const LARGE_INDEX_REFRESH_THRESHOLD: i64 = 1_000;
 const LARGE_INDEX_REFRESH_INTERVAL_MS: i64 = 30_000;
 const FULL_RECONCILIATION_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -815,6 +815,32 @@ fn normalize_record(
     if record_type == Some("session_meta") {
         update_thread_metadata(tx, thread_id, payload, timestamp)?;
     }
+    if record_type == Some("token_usage_record") {
+        let usage = payload.get("usage").unwrap_or(&Value::Null);
+        tx.execute(
+            "INSERT OR REPLACE INTO codex_token_usage
+             (thread_id, record_index, timestamp, turn_id, response_id, input_tokens,
+              cached_input_tokens, cache_write_input_tokens, output_tokens,
+              reasoning_output_tokens, total_tokens, source_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                thread_id,
+                record.record_index,
+                timestamp,
+                string_field(payload, "turn_id"),
+                string_field(payload, "response_id"),
+                usage.get("input_tokens").and_then(Value::as_i64),
+                usage.get("cached_input_tokens").and_then(Value::as_i64),
+                usage
+                    .get("cache_write_input_tokens")
+                    .and_then(Value::as_i64),
+                usage.get("output_tokens").and_then(Value::as_i64),
+                usage.get("reasoning_output_tokens").and_then(Value::as_i64),
+                usage.get("total_tokens").and_then(Value::as_i64),
+                source_path
+            ],
+        )?;
+    }
     if let Some(message) = normalize_message(record_type, payload_type, payload) {
         if message.canonical && message.role == "user" {
             delta.user_message_count += 1;
@@ -1401,6 +1427,7 @@ fn update_thread_location(
     )?;
     for table in [
         "codex_events",
+        "codex_token_usage",
         "codex_messages",
         "codex_tool_execution_meta",
         "codex_compactions",
@@ -1588,6 +1615,22 @@ fn create_schema(conn: &Connection) -> Result<()> {
             payload_type TEXT,
             role TEXT,
             call_id TEXT,
+            source_path TEXT NOT NULL,
+            PRIMARY KEY (thread_id, record_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS codex_token_usage (
+            thread_id TEXT NOT NULL REFERENCES codex_threads(thread_id) ON DELETE CASCADE,
+            record_index INTEGER NOT NULL,
+            timestamp TEXT,
+            turn_id TEXT,
+            response_id TEXT,
+            input_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            cache_write_input_tokens INTEGER,
+            output_tokens INTEGER,
+            reasoning_output_tokens INTEGER,
+            total_tokens INTEGER,
             source_path TEXT NOT NULL,
             PRIMARY KEY (thread_id, record_index)
         );
