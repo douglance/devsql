@@ -408,7 +408,7 @@ SELECT COUNT(*) AS responses, COUNT(input_tokens) AS responses_with_input,
 FROM codex_token_usage WHERE thread_id = '<thread-id>';
 ```
 
-The table includes `token_usage_record` entries only; older journals or incomplete runs can lack them. For those, `codex_token_totals` exposes the latest cumulative `token_count` event with a total, if present; it can itself be incomplete and may use different accounting. Do not sum snapshots with per-response records. Missing counters are NULL, not zero, and SQL sums skip NULLs, so check the counts before treating a sum as complete. Reasoning output is part of output, and cached input is part of input: do not add them a second time. Both tables are local and are not included in shared snapshots.
+The table includes `token_usage_record` entries only; older journals or incomplete runs can lack them. For those, `codex_token_totals` exposes the latest cumulative `token_count` event with a total, if present; it can itself be incomplete and may use different accounting. In some journals, cumulative snapshots omit recorded compaction-response usage, so they can undercount the complete task cost. Do not sum snapshots with per-response records. Missing counters are NULL, not zero, and SQL sums skip NULLs, so check the counts before treating a sum as complete. Reasoning output is part of output, and cached input is part of input: do not add them a second time. Both tables are local and are not included in shared snapshots.
 
 ### Gather a context bundle
 ```bash

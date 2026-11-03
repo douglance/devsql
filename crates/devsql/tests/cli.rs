@@ -103,6 +103,27 @@ fn query_reports_latest_valid_legacy_cumulative_usage() {
 }
 
 #[test]
+fn usage_totals_include_compaction_responses_missing_from_cumulative_snapshot() {
+    let codex = TempDir::new().expect("codex");
+    write(&codex.path().join("sessions/rollout-compaction-usage.jsonl"), concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"compaction-thread\"}}\n",
+        "{\"type\":\"token_usage_record\",\"payload\":{\"usage\":{\"input_tokens\":90,\"output_tokens\":10,\"total_tokens\":100}}}\n",
+        "{\"type\":\"token_usage_record\",\"payload\":{\"usage\":{\"input_tokens\":35,\"output_tokens\":5,\"total_tokens\":40}}}\n",
+        "{\"type\":\"compacted\",\"payload\":{}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":100}}}}\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
+        .args(["SELECT (SELECT SUM(total_tokens) FROM codex_token_usage) AS response_sum, (SELECT total_tokens FROM codex_token_totals) AS snapshot, (SELECT COUNT(*) FROM codex_compactions) AS compactions", "--format", "json"])
+        .assert().success().get_output().stdout.clone();
+    let rows: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(
+        rows,
+        serde_json::json!([{"response_sum": 140, "snapshot": 100, "compactions": 1}])
+    );
+}
+
+#[test]
 fn gather_preserves_claude_results_when_codex_cache_fails() {
     let data = create_claude_data_dir();
     let codex = TempDir::new().expect("codex");
