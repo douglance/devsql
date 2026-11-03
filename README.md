@@ -102,7 +102,7 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | `devsql recall <terms>` | Load prior work (Claude sessions, Codex threads, commits, prompts, shell commands, and agent-issued commands) ranked by term-match count then recency |
 | `devsql gather <terms>` | Run prior_work, repo_state, code_search, symbols, excerpts, and activity concurrently and return one token-budgeted bundle |
 
-Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`). `gather` also takes `--budget` (default `8000` tokens); it drops the lowest-ranked row of the largest section, never part of a row, until the bundle fits or no rows remain. Each section's `omitted` counts rows removed by this step; it does not count results excluded by search or source limits. The response envelope itself can exceed very small budgets.
+Common options: `--repo` / `-r` (default `.`), `--data-dir` / `-d` (default `~/.claude`). `gather` also takes `--budget` (default `8000` tokens); it drops the lowest-ranked row of the largest section, never part of a row, until the bundle fits or no rows remain. Each section's `omitted` counts rows removed by this step; it does not count results excluded by search or source limits. The response envelope itself can exceed very small budgets. If one prior-work source fails, results from the other source remain available and the section note identifies the failure.
 
 ### Code Mode server
 

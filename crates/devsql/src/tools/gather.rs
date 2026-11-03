@@ -462,16 +462,32 @@ fn sections_prior_work_and_activity(
             .join()
             .unwrap_or_else(|_| SectionResult::err("activity source panicked"));
 
-        let prior_work = match (non_codex, codex) {
-            (Ok((sessions, commits, prompts)), Ok(codex)) => SectionResult::ok(
-                merge_prior_work_rows(sessions, codex, commits, prompts, limit),
-            ),
-            (Err(error), _) | (_, Err(error)) => SectionResult::err(error),
-        };
+        let prior_work = merge_prior_work_sources(non_codex, codex, limit);
         (prior_work, activity)
     });
 
     vec![("prior_work", prior_work), ("activity", activity)]
+}
+
+fn merge_prior_work_sources(
+    non_codex: std::result::Result<NonCodexPriorWork, String>,
+    codex: std::result::Result<Vec<Value>, String>,
+    limit: i64,
+) -> SectionResult {
+    let mut errors = Vec::new();
+    let (sessions, commits, prompts) = non_codex.unwrap_or_else(|error| {
+        errors.push(format!("non-Codex prior work: {error}"));
+        (Vec::new(), Vec::new(), Vec::new())
+    });
+    let codex = codex.unwrap_or_else(|error| {
+        errors.push(format!("Codex prior work: {error}"));
+        Vec::new()
+    });
+    SectionResult {
+        rows: merge_prior_work_rows(sessions, codex, commits, prompts, limit),
+        note: (!errors.is_empty()).then(|| errors.join("; ")),
+        omitted: 0,
+    }
 }
 
 fn merge_prior_work_rows(
@@ -1043,6 +1059,42 @@ mod tests {
     use super::{enforce_budget, largest_section, merge_prior_work_rows, SectionResult};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn prior_work_preserves_available_results_and_reports_source_failures() {
+        let codex_row = json!({"kind": "codex", "score": 2});
+        let session_row = json!({"kind": "session", "score": 1});
+        let codex_only = super::merge_prior_work_sources(
+            Err("non-Codex unavailable".into()),
+            Ok(vec![codex_row.clone()]),
+            10,
+        );
+        assert_eq!(codex_only.rows, vec![codex_row]);
+        assert!(codex_only
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("non-Codex unavailable"));
+        let other_only = super::merge_prior_work_sources(
+            Ok((vec![session_row.clone()], vec![], vec![])),
+            Err("Codex unavailable".into()),
+            10,
+        );
+        assert_eq!(other_only.rows, vec![session_row]);
+        assert!(other_only
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("Codex unavailable"));
+        let neither = super::merge_prior_work_sources(
+            Err("non-Codex unavailable".into()),
+            Err("Codex unavailable".into()),
+            10,
+        );
+        assert!(neither.rows.is_empty());
+        let note = neither.note.as_deref().unwrap();
+        assert!(note.contains("non-Codex unavailable") && note.contains("Codex unavailable"));
+    }
 
     #[test]
     fn budget_omission_count_tracks_each_removed_row() {

@@ -103,6 +103,55 @@ fn query_reports_latest_valid_legacy_cumulative_usage() {
 }
 
 #[test]
+fn gather_preserves_claude_results_when_codex_cache_fails() {
+    let data = create_claude_data_dir();
+    let codex = TempDir::new().expect("codex");
+    let repo = TempDir::new().expect("repo");
+    let blocked_cache = repo.path().join("cache");
+    std::fs::create_dir(&blocked_cache).expect("create cache");
+    std::fs::write(blocked_cache.join("codex-index"), "not a directory")
+        .expect("block Codex cache");
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
+        .env("DEVSQL_CACHE_DIR", &blocked_cache)
+        .args([
+            "gather",
+            "vision",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--data-dir",
+            data.path().to_str().unwrap(),
+            "--budget",
+            "8000",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: Value = serde_json::from_slice(&output).expect("valid json");
+    let prior = &result["prior_work"];
+    assert!(
+        prior["rows"].as_array().unwrap().iter().any(|row| {
+            row["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("vision simulator session")
+        }),
+        "available Claude result was discarded: {prior}"
+    );
+    assert!(
+        prior["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Codex prior work"),
+        "missing source failure: {prior}"
+    );
+}
+
+#[test]
 fn recall_surfaces_matching_fixture() {
     let data = create_claude_data_dir();
     let codex_home = TempDir::new().expect("codex");
