@@ -48,6 +48,9 @@ struct GatherOptions {
     /// Search all indexed Codex shell commands (can be slow)
     #[serde(default)]
     all_codex_commands: bool,
+    /// Search all indexed non-shell Codex tool calls (can be slow)
+    #[serde(default)]
+    all_codex_tools: bool,
 }
 
 /// Rows fetched per section before budget trimming.
@@ -163,6 +166,11 @@ impl CommandHandler for GatherHandler {
             .get("all_codex_commands")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let full_codex_tools = ctx
+            .options
+            .get("all_codex_tools")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (render_engine, repo_path) = match engine_from_options(&ctx.options) {
             Ok(v) => v,
             Err(e) => return e.into(),
@@ -185,6 +193,7 @@ impl CommandHandler for GatherHandler {
                         SECTION_LIMIT,
                         full_codex,
                         full_codex_commands,
+                        full_codex_tools,
                     )
                 }),
                 scope.spawn(|| vec![("repo_state", section_repo_state(&repo_path))]),
@@ -438,6 +447,7 @@ fn sections_prior_work_and_activity(
     limit: i64,
     full_codex: bool,
     full_codex_commands: bool,
+    full_codex_tools: bool,
 ) -> Vec<(&'static str, SectionResult)> {
     if terms.is_empty() {
         return vec![
@@ -482,7 +492,13 @@ fn sections_prior_work_and_activity(
                     return SectionResult::err(format!("failed to load command events: {error}"));
                 }
             }
-            section_activity(&mut engine, terms, limit, full_codex_commands)
+            section_activity(
+                &mut engine,
+                terms,
+                limit,
+                full_codex_commands,
+                full_codex_tools,
+            )
         });
 
         let non_codex = non_codex
@@ -904,6 +920,7 @@ fn section_activity(
     terms: &[String],
     limit: i64,
     full_codex_commands: bool,
+    full_codex_tools: bool,
 ) -> SectionResult {
     if terms.is_empty() {
         return SectionResult::ok(Vec::new());
@@ -948,12 +965,19 @@ fn section_activity(
     }
 
     let codex_tool_expr = "(tool_name || ' ' || coalesce(arguments_json, ''))";
+    let codex_tool_window = if full_codex_tools {
+        format!(
+            "WHERE tool_name NOT IN ('exec_command', 'shell') AND {}",
+            match_expr(codex_tool_expr, terms)
+        )
+    } else {
+        format!("ORDER BY called_at DESC LIMIT {RECENT_ACTIVITY_SEARCH_LIMIT}")
+    };
     let codex_sql = format!(
         "WITH recent_tools AS MATERIALIZED (
            SELECT tool_name, arguments_json, thread_id, call_record_index, called_at
            FROM codex_tool_executions
-           ORDER BY called_at DESC
-           LIMIT {recent_limit}
+           {codex_tool_window}
          )
          SELECT 'tool' AS kind, tool_name AS text, arguments_json AS target, \
                 thread_id, call_record_index, called_at AS timestamp, 1 AS count \
@@ -962,7 +986,6 @@ fn section_activity(
          ORDER BY {score} DESC, called_at DESC, call_record_index DESC LIMIT {limit}",
         matches = match_expr(codex_tool_expr, terms),
         score = score_expr(codex_tool_expr, terms),
-        recent_limit = RECENT_ACTIVITY_SEARCH_LIMIT,
     );
     match engine.query(&codex_sql) {
         Ok(mut codex_rows) => {

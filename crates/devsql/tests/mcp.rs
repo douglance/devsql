@@ -150,6 +150,7 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
         gather.to_string().contains("all_codex_commands"),
         "{gather}"
     );
+    assert!(gather.to_string().contains("all_codex_tools"), "{gather}");
 
     send(
         &mut stdin,
@@ -206,8 +207,7 @@ fn exposes_code_mode_and_executes_a_devsql_query() {
     let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
     repo.commit(Some("HEAD"), &sig, &sig, "test", &tree, &[])
         .expect("commit");
-    let args =
-        json!({"terms": "test", "repo": repo_dir.path(), "data_dir": codex.path(), "budget": 0});
+    let args = json!({"terms": "test", "repo": repo_dir.path(), "data_dir": codex.path(), "budget": 0, "all_codex_tools": true});
     send(
         &mut stdin,
         json!({"jsonrpc": "2.0", "id": 108, "method": "tools/call", "params": {

@@ -555,3 +555,59 @@ fn gather_finds_late_matches_in_codex_scripts_with_provenance() {
         assert!(target.contains("<redacted>"));
     }
 }
+
+#[test]
+fn gather_can_search_old_codex_tool_scripts_without_claiming_execution() {
+    let claude = TempDir::new().unwrap();
+    let repo = create_empty_git_repo();
+    let codex = TempDir::new().unwrap();
+    let mut journal = String::from(concat!(
+        "{\"timestamp\":\"2020-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"old-script-thread\",\"cwd\":\"/repo\"}}\n",
+        "{\"timestamp\":\"2020-01-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"call_id\":\"old-script\",\"input\":\"if (false) tools.exec_command({cmd: 'echo oldscriptneedle'})\"}}\n"
+    ));
+    for i in 0..10000 {
+        journal.push_str(&format!("{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"call_id\":\"new-{i}\",\"input\":\"unrelated\"}}}}\n"));
+    }
+    write(
+        &codex.path().join("sessions/rollout-window.jsonl"),
+        &journal,
+    );
+    for full in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("CODEX_HOME", codex.path())
+            .env("DEVSQL_CACHE_DIR", codex.path().join("cache"))
+            .args([
+                "gather",
+                "oldscriptneedle",
+                "--data-dir",
+                claude.path().to_str().unwrap(),
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--all-codex-tools",
+                if full { "true" } else { "false" },
+                "--budget",
+                "100000",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        let found = result["activity"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["thread_id"] == "old-script-thread");
+        assert_eq!(found.is_some(), full);
+        if let Some(row) = found {
+            assert_eq!(row["kind"], "tool");
+            assert_eq!(row["text"], "exec");
+            assert_eq!(row["call_record_index"], 1);
+            assert!(row["target"].as_str().unwrap().contains("if (false)"));
+            assert!(row.get("command").is_none());
+        }
+    }
+}
