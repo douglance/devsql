@@ -950,23 +950,28 @@ fn section_activity(
     let codex_tool_expr = "(tool_name || ' ' || coalesce(arguments_json, ''))";
     let codex_sql = format!(
         "WITH recent_tools AS MATERIALIZED (
-           SELECT tool_name, arguments_json
+           SELECT tool_name, arguments_json, thread_id, call_record_index, called_at
            FROM codex_tool_executions
            ORDER BY called_at DESC
            LIMIT {recent_limit}
          )
-         SELECT 'tool' AS kind, tool_name AS text, \
-                substr(arguments_json, 1, 240) AS target, COUNT(*) AS count \
+         SELECT 'tool' AS kind, tool_name AS text, arguments_json AS target, \
+                thread_id, call_record_index, called_at AS timestamp, 1 AS count \
          FROM recent_tools \
          WHERE tool_name NOT IN ('exec_command', 'shell') AND {matches} \
-         GROUP BY tool_name, arguments_json ORDER BY count DESC LIMIT {limit}",
+         ORDER BY {score} DESC, called_at DESC, call_record_index DESC LIMIT {limit}",
         matches = match_expr(codex_tool_expr, terms),
+        score = score_expr(codex_tool_expr, terms),
         recent_limit = RECENT_ACTIVITY_SEARCH_LIMIT,
     );
     match engine.query(&codex_sql) {
         Ok(mut codex_rows) => {
             for row in &mut codex_rows {
-                redact_row_field(row, "target");
+                if let Some(target) = row.get_mut("target") {
+                    if let Some(text) = target.as_str() {
+                        *target = Value::String(matched_excerpt(text, terms));
+                    }
+                }
             }
             rows.extend(codex_rows);
         }
@@ -1068,14 +1073,6 @@ fn section_activity(
     }
 
     SectionResult::ok(rows)
-}
-
-fn redact_row_field(row: &mut Value, field: &str) {
-    if let Some(value) = row.get_mut(field) {
-        if let Some(text) = value.as_str() {
-            *value = Value::String(crate::redaction::redact_sensitive_text(text));
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -485,6 +485,12 @@ devsql gather "older command" --all-codex-commands true
 
 Activity normally searches the latest 5,000 Codex tool executions. `--all-codex-commands true` searches indexed Codex commands across the full history and may take substantially longer; other source, result, and budget limits still apply. Matching Codex command rows include `thread_id` and `call_record_index`, which identify the execution in `codex_tool_executions` for a targeted follow-up query. This option searches command text and working directory, not tool output.
 
+For non-shell Codex tool calls, activity searches the latest 10,000 calls and
+returns a redacted excerpt around the first matching argument term (or the start
+of the arguments if only the tool name matches) with the same execution identifiers.
+A match in a script is evidence of submitted script text, not proof that a
+nested command ran; inspect the recorded output for its outcome.
+
 ### File context and impact
 ```bash
 devsql context src/engine.rs

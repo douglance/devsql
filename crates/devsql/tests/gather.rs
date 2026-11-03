@@ -483,3 +483,75 @@ fn gather_can_find_old_codex_commands_with_follow_up_provenance() {
         }
     }
 }
+
+#[test]
+fn gather_finds_late_matches_in_codex_scripts_with_provenance() {
+    let claude = TempDir::new().unwrap();
+    let repo = create_empty_git_repo();
+    let codex = TempDir::new().unwrap();
+    let script = format!(
+        "{} tools.exec_command({{cmd:'echo scriptneedle password=hunter2'}})",
+        "x".repeat(400)
+    );
+    let mut journal = vec![
+        serde_json::json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"script-thread","cwd":"/repo"}}),
+    ];
+    for i in 0..2 {
+        journal.push(serde_json::json!({"timestamp":format!("2026-01-01T00:00:0{}Z",i+1),"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":format!("script-{i}"),"input":script}}));
+    }
+    write(
+        &codex.path().join("sessions/rollout-script.jsonl"),
+        &(journal
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
+        .env("DEVSQL_CACHE_DIR", codex.path().join("cache"))
+        .args([
+            "gather",
+            "scriptneedle",
+            "--data-dir",
+            claude.path().to_str().unwrap(),
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--budget",
+            "100000",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: Value = serde_json::from_slice(&output).unwrap();
+    let rows: Vec<_> = parsed["activity"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["kind"] == "tool" && row["text"] == "exec")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "each script call must retain its own identity: {rows:?}"
+    );
+    let mut indexes: Vec<_> = rows
+        .iter()
+        .map(|row| row["call_record_index"].as_i64().unwrap())
+        .collect();
+    indexes.sort_unstable();
+    assert_eq!(indexes, [1, 2]);
+    for row in rows {
+        assert_eq!(row["thread_id"], "script-thread");
+        assert!(row["call_record_index"].as_i64().is_some());
+        let target = row["target"].as_str().unwrap();
+        assert!(target.contains("scriptneedle"));
+        assert!(!target.contains("hunter2"));
+        assert!(target.contains("<redacted>"));
+    }
+}
