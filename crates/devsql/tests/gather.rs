@@ -679,3 +679,71 @@ fn gather_searches_tool_outputs_only_when_requested_and_redacts_them() {
         }
     }
 }
+
+#[test]
+fn gather_reports_output_limit_without_conflating_it_with_budget_omissions() {
+    let claude = TempDir::new().unwrap();
+    let repo = create_empty_git_repo();
+    for count in [10, 11] {
+        let codex = TempDir::new().unwrap();
+        let mut records = vec![
+            serde_json::json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"limit-thread","cwd":"/repo"}}),
+        ];
+        for i in 0..count {
+            let id = format!("call-{i}");
+            records.push(serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":id,"arguments":"{}"}}));
+            records.push(serde_json::json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":id,"output":"coverage-needle"}}));
+        }
+        write(
+            &codex.path().join("sessions/rollout-limit.jsonl"),
+            &(records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+            .env("CODEX_HOME", codex.path())
+            .env("DEVSQL_CACHE_DIR", codex.path().join("cache"))
+            .args([
+                "gather",
+                "coverage-needle",
+                "--data-dir",
+                claude.path().to_str().unwrap(),
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--all-codex-outputs",
+                "true",
+                "--budget",
+                "100000",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        let activity = &result["activity"];
+        assert_eq!(
+            activity["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["kind"] == "tool_output")
+                .count(),
+            10
+        );
+        assert_eq!(activity["omitted"], 0);
+        if count == 11 {
+            assert!(activity["note"]
+                .as_str()
+                .unwrap()
+                .contains("more than 10 matches"));
+        } else {
+            assert!(activity["note"].is_null(), "{activity}");
+        }
+    }
+}

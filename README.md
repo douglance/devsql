@@ -502,7 +502,8 @@ history. Matching activity rows contain a redacted excerpt and the thread,
 call, and output record identifiers for a targeted follow-up. This scan can
 be slow, searches the indexed text representation (including JSON escapes),
 and remains subject to result and budget limits; an absent row does not prove
-an output did not exist.
+an output did not exist. If more than ten outputs match, the activity note says
+so; `activity.omitted` separately counts rows dropped to meet the token budget.
 
 ### File context and impact
 ```bash

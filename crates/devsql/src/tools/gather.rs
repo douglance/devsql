@@ -946,6 +946,7 @@ fn section_activity(
     }
 
     let mut rows = Vec::new();
+    let mut notes = Vec::new();
 
     let todos_sql = format!(
         "SELECT 'todo' AS kind, content AS text, status \
@@ -1014,16 +1015,21 @@ fn section_activity(
     }
 
     if full_codex_outputs {
+        let probe_limit = limit.saturating_add(1);
         let sql = format!(
             "SELECT 'tool_output' AS kind, tool_name AS text, output_text AS excerpt, \
                     thread_id, call_id, call_record_index, output_record_index, completed_at AS timestamp \
              FROM codex_tool_executions WHERE output_text IS NOT NULL AND {matches} \
-             ORDER BY {score} DESC, completed_at DESC, output_record_index DESC LIMIT {limit}",
+             ORDER BY {score} DESC, completed_at DESC, output_record_index DESC LIMIT {probe_limit}",
             matches = match_expr("output_text", terms),
             score = score_expr("output_text", terms),
         );
         match engine.query(&sql) {
             Ok(mut output_rows) => {
+                if output_rows.len() > limit as usize {
+                    output_rows.truncate(limit as usize);
+                    notes.push(format!("Codex tool outputs: more than {limit} matches; refine the terms or query codex_tool_executions for more."));
+                }
                 for row in &mut output_rows {
                     if let Some(excerpt) = row.get_mut("excerpt") {
                         if let Some(raw) = excerpt.as_str() {
@@ -1136,7 +1142,11 @@ fn section_activity(
         Err(e) => return SectionResult::err(format!("shell command query failed: {e}")),
     }
 
-    SectionResult::ok(rows)
+    SectionResult {
+        rows,
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+        omitted: 0,
+    }
 }
 
 fn output_strings(value: &Value) -> String {
