@@ -70,6 +70,11 @@ pub const TABLES: &[TableInfo] = &[
         about: "per-response usage records; absent in older journals",
     },
     TableInfo {
+        name: "codex_token_totals",
+        source: "Codex CLI",
+        about: "latest recorded cumulative token snapshot per thread",
+    },
+    TableInfo {
         name: "codex_tool_executions",
         source: "Codex CLI",
         about: "Codex commands with their output",

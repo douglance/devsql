@@ -83,6 +83,26 @@ fn query_reports_per_response_token_usage_without_double_counting_events() {
 }
 
 #[test]
+fn query_reports_latest_valid_legacy_cumulative_usage() {
+    let codex = TempDir::new().expect("codex");
+    write(&codex.path().join("sessions/rollout-legacy-usage.jsonl"), concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"legacy-thread\"}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"cached_input_tokens\":20,\"output_tokens\":2,\"total_tokens\":42}}}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":90,\"cached_input_tokens\":60,\"output_tokens\":7,\"total_tokens\":97}}}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_devsql"))
+        .env("CODEX_HOME", codex.path())
+        .args(["SELECT input_tokens, cached_input_tokens, output_tokens, total_tokens FROM codex_token_totals WHERE thread_id = 'legacy-thread'", "--format", "json"])
+        .assert().success().get_output().stdout.clone();
+    let rows: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(
+        rows,
+        serde_json::json!([{"input_tokens": 90, "cached_input_tokens": 60, "output_tokens": 7, "total_tokens": 97}])
+    );
+}
+
+#[test]
 fn recall_surfaces_matching_fixture() {
     let data = create_claude_data_dir();
     let codex_home = TempDir::new().expect("codex");

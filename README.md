@@ -162,6 +162,7 @@ host, so large histories require sufficient disk space and time.
 | `codex_threads` | `$CODEX_HOME/{sessions,archived_sessions}/**/rollout-*.jsonl[.zst]` | One row per Codex thread: lineage, agent identity, originator, cwd, Git branch, state, compression, journal path, timestamps, first user text, and aggregate counts |
 | `codex_events` | Same rollout journals | One row per newline-terminated journal record: thread ID, record index, timestamp, record type, payload type, role, call ID, and source path |
 | `codex_token_usage` | Same rollout journals | One row per recorded per-response usage event, including input, cached input, output, reasoning output, and total tokens |
+| `codex_token_totals` | Same rollout journals | Latest cumulative token-count snapshot per thread that has a total token count |
 | `codex_messages` | Same rollout journals | Normalized user and assistant content, including canonical-message status and source provenance |
 | `codex_tool_executions` | Same rollout journals | Tool calls paired with outputs by thread and call ID |
 | `codex_tool_calls` | Same rollout journals | Backward-compatible tool-call view with source, session, agent, cwd, and timestamp provenance |
@@ -407,7 +408,7 @@ SELECT COUNT(*) AS responses, COUNT(input_tokens) AS responses_with_input,
 FROM codex_token_usage WHERE thread_id = '<thread-id>';
 ```
 
-The table includes `token_usage_record` entries only; older journals or incomplete runs can lack them. Missing counters are NULL, not zero, and SQL sums skip NULLs, so check the counts before treating a sum as complete. Reasoning output is part of output, and cached input is part of input: do not add them a second time. This table is local and is not included in shared snapshots.
+The table includes `token_usage_record` entries only; older journals or incomplete runs can lack them. For those, `codex_token_totals` exposes the latest cumulative `token_count` event with a total, if present; it can itself be incomplete and may use different accounting. Do not sum snapshots with per-response records. Missing counters are NULL, not zero, and SQL sums skip NULLs, so check the counts before treating a sum as complete. Reasoning output is part of output, and cached input is part of input: do not add them a second time. Both tables are local and are not included in shared snapshots.
 
 ### Gather a context bundle
 ```bash
