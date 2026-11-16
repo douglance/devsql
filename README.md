@@ -95,6 +95,7 @@ Structured commands that return JSON, designed for use by AI agents and scripts:
 | Command | Description |
 |---------|-------------|
 | `devsql search <query>` | Find symbols by name across the codebase |
+| `devsql session <id> --source claude\|codex` | Read an exact native conversation, including structured tool content; `--cursor N`, `--limit 1..500`, or `--tail N` select pages |
 | `devsql context <file>` | File metadata and symbols for a given path |
 | `devsql history <file>` | Git commit history for a specific file |
 | `devsql diff <base> <head>` | Compare two Git refs with file and symbol-level stats |

@@ -49,6 +49,7 @@ tokio.workspace = true
 # Utilities
 dirs = "5.0"
 walkdir.workspace = true
+zstd.workspace = true
 ignore.workspace = true
 regex.workspace = true
 memchr.workspace = true
@@ -74,7 +75,6 @@ tempfile = "3"
 rusqlite.workspace = true
 assert_cmd = "2"
 predicates = "3"
-zstd.workspace = true
 
 [features]
 tree-sitter-ast = [

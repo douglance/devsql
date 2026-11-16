@@ -269,6 +269,7 @@ fn build_cli() -> Cli {
             "query",
             query_command("query", "Execute a SQL query against developer-local data"),
         )
+        .command("session", devsql::tools::session::build())
         .command("schema", devsql::tools::schema::build())
         .command("diff", devsql::tools::diff::build())
         .command("search", devsql::tools::search::build())
