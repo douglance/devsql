@@ -240,3 +240,6 @@ pub fn engine_from_paths(
 
     Ok((engine, repo_path))
 }
+
+/// Exact session context retrieval.
+pub mod session;
